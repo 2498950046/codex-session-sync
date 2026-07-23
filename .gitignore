@@ -1,0 +1,22 @@
+/target/
+/.tmp/
+**/node_modules/
+**/dist/
+**/.vite/
+*.log
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Tauri generated metadata
+/apps/desktop/src-tauri/gen/
+
+# Mobile and Microsoft Store icons are not used by the desktop build
+/apps/desktop/src-tauri/icons/android/
+/apps/desktop/src-tauri/icons/ios/
+/apps/desktop/src-tauri/icons/Square*Logo.png
+/apps/desktop/src-tauri/icons/StoreLogo.png

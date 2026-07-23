@@ -1,0 +1,15 @@
+# Project-local registry route for environments where Cargo's sustained sparse
+# index connection to index.crates.io times out. Crate checksums remain verified
+# by Cargo. This file does not modify the user's global Cargo configuration.
+
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[http]
+timeout = 120
+
+[net]
+retry = 3
