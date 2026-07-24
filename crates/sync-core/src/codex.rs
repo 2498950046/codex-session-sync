@@ -14,6 +14,7 @@ use crate::models::{
     ContentObject, RelatedRecords, ScanReport, ScanWarning, ScanWarningKind,
     THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, WorkspaceRef,
 };
+use crate::operation::{OperationControl, OperationProgress};
 
 const SESSION_DIRS: [(&str, bool); 2] = [("sessions", false), ("archived_sessions", true)];
 
@@ -52,7 +53,18 @@ pub fn default_codex_home() -> PathBuf {
 }
 
 pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
+    scan_codex_home_with_control(codex_home, &OperationControl::default())
+}
+
+pub fn scan_codex_home_with_control(
+    codex_home: impl AsRef<Path>,
+    control: &OperationControl,
+) -> Result<ScanReport> {
     let codex_home = codex_home.as_ref().to_path_buf();
+    control.report(OperationProgress::indeterminate(
+        "scan",
+        "正在检查 Codex 会话目录",
+    ));
     if !codex_home.exists() {
         anyhow::bail!("Codex home does not exist: {}", codex_home.display());
     }
@@ -60,11 +72,17 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
         anyhow::bail!("Codex home is not a directory: {}", codex_home.display());
     }
 
+    control.check_cancelled()?;
+    control.report(OperationProgress::indeterminate(
+        "scan_databases",
+        "正在读取 SQLite 会话索引",
+    ));
     let database_paths = discover_database_paths(&codex_home);
     let mut warnings = Vec::new();
     let db_records = load_database_records(&database_paths, &mut warnings);
 
     let mut rollouts = BTreeMap::<String, RolloutRecord>::new();
+    let mut rollout_count = 0_u64;
     for (directory, archived) in SESSION_DIRS {
         let root = codex_home.join(directory);
         if !root.exists() {
@@ -72,6 +90,7 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
         }
 
         for entry in WalkDir::new(&root).follow_links(false) {
+            control.check_cancelled()?;
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -94,12 +113,23 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
                 continue;
             }
 
+            rollout_count += 1;
+            control.report(OperationProgress {
+                phase: "scan_rollouts".to_string(),
+                message: path.to_string_lossy().into_owned(),
+                completed: rollout_count,
+                total: None,
+                unit: "files".to_string(),
+                cancellable: true,
+            });
+
             let logical_path = path
                 .strip_prefix(&codex_home)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let Some(record) = read_rollout_record(path, &logical_path, archived, &mut warnings)?
+            let Some(record) =
+                read_rollout_record(path, &logical_path, archived, &mut warnings, control)?
             else {
                 continue;
             };
@@ -186,6 +216,7 @@ fn read_rollout_record(
     logical_path: &str,
     archived: bool,
     warnings: &mut Vec<ScanWarning>,
+    control: &OperationControl,
 ) -> Result<Option<RolloutRecord>> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat rollout {}", path.display()))?;
@@ -200,7 +231,7 @@ fn read_rollout_record(
 
     let mut file =
         File::open(path).with_context(|| format!("failed to open rollout {}", path.display()))?;
-    let hash = sha256_reader(&mut file)
+    let hash = sha256_reader(&mut file, control)
         .with_context(|| format!("failed to hash rollout {}", path.display()))?;
 
     let file =
@@ -467,10 +498,11 @@ fn bool_field(value: &Value, key: &str) -> Option<bool> {
     })
 }
 
-fn sha256_reader(reader: &mut impl Read) -> Result<String> {
+fn sha256_reader(reader: &mut impl Read, control: &OperationControl) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        control.check_cancelled()?;
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -484,6 +516,7 @@ fn sha256_reader(reader: &mut impl Read) -> Result<String> {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::sync::atomic::Ordering;
     use tempfile::tempdir;
 
     fn write_rollout(root: &Path, name: &str, payload: Value, body: &str) -> PathBuf {
@@ -578,5 +611,22 @@ mod tests {
         let report = scan_codex_home(temp.path()).unwrap();
         assert_eq!(report.total_count(), 0);
         assert_eq!(report.warnings[0].kind, ScanWarningKind::InvalidUtf8);
+    }
+
+    #[test]
+    fn cancelled_scan_stops_before_reading_session_files() {
+        let temp = tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        write_rollout(
+            &sessions,
+            "rollout-thread-1.jsonl",
+            json!({"id": "thread-1"}),
+            "{\"type\":\"event\"}",
+        );
+        let control = OperationControl::default();
+        control.cancel_handle().store(true, Ordering::Relaxed);
+        let error = scan_codex_home_with_control(temp.path(), &control).unwrap_err();
+        assert!(error.to_string().contains("operation cancelled"));
     }
 }

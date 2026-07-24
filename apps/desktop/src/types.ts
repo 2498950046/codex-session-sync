@@ -21,6 +21,7 @@ export type ScanReport = {
   activeCount: number;
   archivedCount: number;
   totalRolloutBytes: number;
+  totalCount: number;
   threads: ThreadBundle[];
   warnings: ScanWarning[];
 };
@@ -57,5 +58,34 @@ export type OperationJournal = {
   snapshotId: string;
   status: string;
   backupDir: string;
+  error: string | null;
+};
+
+export type CodexProcess = {
+  pid: number;
+  name: string;
+  executable: string | null;
+  commandLine: string[];
+  kind: "desktop" | "cli";
+};
+
+export type OperationProgress = {
+  phase: string;
+  message: string;
+  completed: number;
+  total: number | null;
+  unit: string;
+  cancellable: boolean;
+};
+
+export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "failed";
+
+export type JobSnapshot = {
+  jobId: string;
+  kind: "scan" | "snapshot" | "validate" | "import" | "recovery";
+  state: JobState;
+  progress: OperationProgress;
+  cancellable: boolean;
+  resultReady: boolean;
   error: string | null;
 };

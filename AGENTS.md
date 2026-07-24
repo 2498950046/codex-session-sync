@@ -104,8 +104,18 @@ Implemented:
 - Automatic rollback after apply or post-import validation failure.
 - Restart recovery for incomplete journals, with hash-guarded file cleanup.
 - GUI actions for snapshot creation, validation, safe import, and recovery.
+- Cross-platform live Codex Desktop/CLI process detection before every local
+  write operation, with PID-level GUI status and no automatic termination.
+- Background task manager with persisted task status, progress polling, and
+  cooperative cancellation for scans, snapshots, validation, and import.
+- Import cancellation reports rollback progress and restores the local backup
+  before the task can finish.
+- GUI scan results use a compact dashboard projection; raw SQLite records stay
+  in the Rust core. Completed task results are claimed once and then released
+  from the task manager to prevent completion-time memory spikes.
 - Automated tests covering successful import, corrupt objects, conflicts,
-  transactional rollback, and restart recovery.
+  transactional rollback, restart recovery, process classification, scan
+  cancellation, and import cancellation.
 - Axum health endpoint skeleton.
 - Frontend type-check, production build, and browser visual verification.
 - Original cross-platform app icon and generated Tauri platform icon set.

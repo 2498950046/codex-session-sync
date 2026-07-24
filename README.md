@@ -19,10 +19,19 @@ crates/sync-core/   Shared models and local Codex adapters
 ## Safety
 
 The scanner opens Codex databases read-only. Snapshot creation, import, and
-recovery require explicit confirmation that Codex is fully closed. Imports
-validate all SHA-256 objects before writing, reject divergent updates to an
-existing thread UUID, create a database backup, and re-scan the target before
-marking the journal complete.
+recovery require explicit confirmation that Codex is fully closed and a live
+cross-platform process check. Imports validate all SHA-256 objects before
+writing, reject divergent updates to an existing thread UUID, create a database
+backup, and re-scan the target before marking the journal complete.
+
+Long-running operations run as cancellable background tasks. Scan, snapshot,
+and validation stop at the next safe checkpoint. Cancelling an import switches
+the task into rollback and restores the SQLite backup before it closes. Recovery
+cannot be interrupted once started.
+
+The desktop dashboard receives only a compact scan summary and up to eight
+thread previews. Full SQLite records stay in the Rust core for export/import
+work and are never retained in the task manager or React state.
 
 The default local repository is `~/.codex-session-sync`:
 

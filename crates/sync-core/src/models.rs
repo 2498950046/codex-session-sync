@@ -87,6 +87,55 @@ impl ScanReport {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadPreview {
+    pub thread_id: String,
+    pub title: String,
+    pub archived: bool,
+    pub model_provider: Option<String>,
+    pub workspace: WorkspaceRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanDashboardReport {
+    pub codex_home: PathBuf,
+    pub database_paths: Vec<PathBuf>,
+    pub active_count: usize,
+    pub archived_count: usize,
+    pub total_rollout_bytes: u64,
+    pub total_count: usize,
+    pub threads: Vec<ThreadPreview>,
+    pub warnings: Vec<ScanWarning>,
+}
+
+impl From<&ScanReport> for ScanDashboardReport {
+    fn from(report: &ScanReport) -> Self {
+        Self {
+            codex_home: report.codex_home.clone(),
+            database_paths: report.database_paths.clone(),
+            active_count: report.active_count,
+            archived_count: report.archived_count,
+            total_rollout_bytes: report.total_rollout_bytes,
+            total_count: report.total_count(),
+            threads: report
+                .threads
+                .iter()
+                .take(8)
+                .map(|thread| ThreadPreview {
+                    thread_id: thread.thread_id.clone(),
+                    title: thread.title.clone(),
+                    archived: thread.archived,
+                    model_provider: thread.model_provider.clone(),
+                    workspace: thread.workspace.clone(),
+                })
+                .collect(),
+            warnings: report.warnings.clone(),
+        }
+    }
+}
+
 pub const LOCAL_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const OPERATION_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
@@ -167,4 +216,58 @@ pub struct ImportReport {
     pub skipped_count: usize,
     pub backup_dir: PathBuf,
     pub journal_path: PathBuf,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn dashboard_projection_omits_large_sqlite_records() {
+        let payload = "x".repeat(256 * 1024);
+        let threads = (0..12)
+            .map(|index| ThreadBundle {
+                schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+                thread_id: format!("thread-{index}"),
+                title: format!("Thread {index}"),
+                archived: false,
+                created_at_ms: None,
+                updated_at_ms: None,
+                model_provider: Some("openai".to_string()),
+                workspace: WorkspaceRef::default(),
+                rollout: ContentObject {
+                    sha256:
+                        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                            .to_string(),
+                    byte_length: 0,
+                    media_type: "application/x-ndjson".to_string(),
+                    logical_path: Some(format!("sessions/rollout-{index}.jsonl")),
+                    source_path: None,
+                },
+                related_records: RelatedRecords {
+                    source_database: None,
+                    tables: BTreeMap::from([(
+                        "threads".to_string(),
+                        vec![json!({"large_sqlite_payload": payload})],
+                    )]),
+                },
+                attachments: Vec::new(),
+            })
+            .collect();
+        let report = ScanReport {
+            codex_home: PathBuf::from("/tmp/.codex"),
+            database_paths: Vec::new(),
+            active_count: 12,
+            archived_count: 0,
+            total_rollout_bytes: 0,
+            threads,
+            warnings: Vec::new(),
+        };
+
+        let dashboard = ScanDashboardReport::from(&report);
+        assert_eq!(dashboard.threads.len(), 8);
+        assert!(serde_json::to_vec(&dashboard).unwrap().len() < 16 * 1024);
+        assert!(serde_json::to_vec(&report).unwrap().len() > 3 * 1024 * 1024);
+    }
 }

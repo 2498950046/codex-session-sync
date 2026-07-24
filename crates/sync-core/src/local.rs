@@ -14,12 +14,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::codex::scan_codex_home;
+use crate::codex::scan_codex_home_with_control;
 use crate::models::{
     ImportReport, JournalRollout, LOCAL_SNAPSHOT_SCHEMA_VERSION, LocalSnapshot,
     OPERATION_JOURNAL_SCHEMA_VERSION, OperationJournal, OperationStatus, SnapshotSummary,
     SnapshotValidationReport, ThreadBundle,
 };
+use crate::operation::{OperationControl, OperationProgress};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,15 +50,38 @@ pub fn create_local_snapshot(
     repository_root: impl AsRef<Path>,
     confirmed_codex_closed: bool,
 ) -> Result<SnapshotSummary> {
+    create_local_snapshot_with_control(
+        codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        &OperationControl::default(),
+    )
+}
+
+pub fn create_local_snapshot_with_control(
+    codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    control: &OperationControl,
+) -> Result<SnapshotSummary> {
     if !confirmed_codex_closed {
         bail!("snapshot creation requires confirmation that Codex is fully closed");
     }
     let repository_root = repository_root.as_ref();
-    let report = scan_codex_home(codex_home)?;
+    let report = scan_codex_home_with_control(codex_home, control)?;
     ensure_repository_layout(repository_root)?;
 
     let mut unique_objects = BTreeSet::new();
-    for thread in &report.threads {
+    for (index, thread) in report.threads.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "snapshot_objects".to_string(),
+            message: thread.title.clone(),
+            completed: index as u64,
+            total: Some(report.threads.len() as u64),
+            unit: "threads".to_string(),
+            cancellable: true,
+        });
         let source_path = thread.rollout.source_path.as_deref().with_context(|| {
             format!(
                 "thread {} has no local rollout source path",
@@ -65,7 +89,7 @@ pub fn create_local_snapshot(
             )
         })?;
         let object_path = object_path(repository_root, &thread.rollout.sha256)?;
-        store_object(source_path, &object_path, &thread.rollout.sha256)?;
+        store_object(source_path, &object_path, &thread.rollout.sha256, control)?;
         unique_objects.insert(thread.rollout.sha256.clone());
     }
 
@@ -80,6 +104,11 @@ pub fn create_local_snapshot(
     let manifest_path = repository_root
         .join("snapshots")
         .join(format!("{snapshot_id}.json"));
+    control.check_cancelled()?;
+    control.report(OperationProgress::indeterminate(
+        "snapshot_manifest",
+        "正在写入快照清单",
+    ));
     atomic_write_json(&manifest_path, &snapshot)?;
 
     Ok(SnapshotSummary {
@@ -100,13 +129,34 @@ pub fn validate_local_snapshot(
     manifest_path: impl AsRef<Path>,
     repository_root: impl AsRef<Path>,
 ) -> Result<SnapshotValidationReport> {
+    validate_local_snapshot_with_control(
+        manifest_path,
+        repository_root,
+        &OperationControl::default(),
+    )
+}
+
+pub fn validate_local_snapshot_with_control(
+    manifest_path: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    control: &OperationControl,
+) -> Result<SnapshotValidationReport> {
     let manifest_path = manifest_path.as_ref();
     let repository_root = repository_root.as_ref();
     let snapshot: LocalSnapshot = read_json(manifest_path)?;
     validate_snapshot_structure(&snapshot)?;
 
     let mut unique_objects = BTreeSet::new();
-    for thread in &snapshot.threads {
+    for (index, thread) in snapshot.threads.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "validate_objects".to_string(),
+            message: thread.title.clone(),
+            completed: index as u64,
+            total: Some(snapshot.threads.len() as u64),
+            unit: "objects".to_string(),
+            cancellable: true,
+        });
         let object_path = object_path(repository_root, &thread.rollout.sha256)?;
         validate_object(
             &object_path,
@@ -136,6 +186,22 @@ pub fn import_local_snapshot(
     repository_root: impl AsRef<Path>,
     confirmed_codex_closed: bool,
 ) -> Result<ImportReport> {
+    import_local_snapshot_with_control(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        &OperationControl::default(),
+    )
+}
+
+pub fn import_local_snapshot_with_control(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    control: &OperationControl,
+) -> Result<ImportReport> {
     if !confirmed_codex_closed {
         bail!("import requires confirmation that Codex is fully closed");
     }
@@ -143,9 +209,15 @@ pub fn import_local_snapshot(
     let manifest_path = manifest_path.as_ref();
     let target_codex_home = target_codex_home.as_ref().to_path_buf();
     let repository_root = repository_root.as_ref().to_path_buf();
-    let validation = validate_local_snapshot(manifest_path, &repository_root)?;
+    control.report(OperationProgress::indeterminate(
+        "import_preflight",
+        "正在校验快照对象",
+    ));
+    let validation =
+        validate_local_snapshot_with_control(manifest_path, &repository_root, control)?;
     let snapshot: LocalSnapshot = read_json(manifest_path)?;
-    let target_report = scan_codex_home(&target_codex_home)?;
+    control.check_cancelled()?;
+    let target_report = scan_codex_home_with_control(&target_codex_home, control)?;
     let existing = target_report
         .threads
         .iter()
@@ -156,6 +228,7 @@ pub fn import_local_snapshot(
     let mut prepared = Vec::new();
     let mut target_paths = HashSet::new();
     for thread in &snapshot.threads {
+        control.check_cancelled()?;
         if let Some(existing_hash) = existing.get(thread.thread_id.as_str()) {
             if *existing_hash == thread.rollout.sha256 {
                 skipped_count += 1;
@@ -238,6 +311,11 @@ pub fn import_local_snapshot(
 
     let target_database = select_primary_database(&target_report.database_paths)?;
     let database_backup = backup_dir.join("threads.sqlite");
+    control.check_cancelled()?;
+    control.report(OperationProgress::indeterminate(
+        "import_backup",
+        "正在创建 SQLite 安全备份",
+    ));
     backup_database(&target_database, &database_backup)?;
     atomic_write_json(
         &backup_dir.join("manifest.json"),
@@ -258,6 +336,7 @@ pub fn import_local_snapshot(
         &target_codex_home,
         &mut journal,
         &journal_path,
+        control,
     );
     if let Err(error) = import_result {
         return rollback_and_fail(
@@ -267,13 +346,25 @@ pub fn import_local_snapshot(
             &database_backup,
             &mut journal,
             &journal_path,
+            control,
         );
     }
 
     journal.status = OperationStatus::Validating;
     journal.updated_at = Utc::now().to_rfc3339();
     write_journal(&journal_path, &journal)?;
-    let post_import = scan_codex_home(&target_codex_home);
+    if control.is_cancelled() {
+        return rollback_and_fail(
+            anyhow::anyhow!("operation cancelled"),
+            &prepared,
+            &target_database,
+            &database_backup,
+            &mut journal,
+            &journal_path,
+            control,
+        );
+    }
+    let post_import = scan_codex_home_with_control(&target_codex_home, control);
     let validation_result = post_import.and_then(|report| {
         let imported = report
             .threads
@@ -300,6 +391,7 @@ pub fn import_local_snapshot(
             &database_backup,
             &mut journal,
             &journal_path,
+            control,
         );
     }
 
@@ -392,12 +484,22 @@ fn apply_import(
     target_codex_home: &Path,
     journal: &mut OperationJournal,
     journal_path: &Path,
+    control: &OperationControl,
 ) -> Result<()> {
     journal.status = OperationStatus::Applying;
     journal.updated_at = Utc::now().to_rfc3339();
     write_journal(journal_path, journal)?;
 
-    for thread in prepared {
+    for (index, thread) in prepared.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "import_rollouts".to_string(),
+            message: thread.bundle.title.clone(),
+            completed: index as u64,
+            total: Some(prepared.len() as u64),
+            unit: "threads".to_string(),
+            cancellable: true,
+        });
         if let Some(parent) = thread.temporary_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -405,8 +507,15 @@ fn apply_import(
             &thread.object_path,
             &thread.temporary_path,
             &thread.bundle.rollout.sha256,
+            Some(control),
         )?;
     }
+
+    control.check_cancelled()?;
+    control.report(OperationProgress::indeterminate(
+        "import_database",
+        "正在写入 SQLite 事务",
+    ));
 
     let mut connection = Connection::open(target_database).with_context(|| {
         format!(
@@ -431,6 +540,7 @@ fn apply_import(
     transaction.commit()?;
 
     for thread in prepared {
+        control.check_cancelled()?;
         fs::rename(&thread.temporary_path, &thread.target_path).with_context(|| {
             format!("failed to install rollout {}", thread.target_path.display())
         })?;
@@ -445,7 +555,16 @@ fn rollback_and_fail(
     database_backup: &Path,
     journal: &mut OperationJournal,
     journal_path: &Path,
+    control: &OperationControl,
 ) -> Result<ImportReport> {
+    control.report(OperationProgress {
+        phase: "rollback".to_string(),
+        message: "正在恢复 SQLite 备份并清理导入文件".to_string(),
+        completed: 0,
+        total: None,
+        unit: "steps".to_string(),
+        cancellable: false,
+    });
     for thread in prepared {
         let _ = fs::remove_file(&thread.temporary_path);
         if thread.target_path.is_file()
@@ -628,19 +747,13 @@ fn safe_rollout_path(thread: &ThreadBundle) -> Result<PathBuf> {
     {
         bail!("unsafe rollout path in snapshot: {logical_path}");
     }
-    let expected_root = if thread.archived {
-        "archived_sessions"
-    } else {
-        "sessions"
-    };
-    if path
+    let root = path
         .components()
         .next()
-        .and_then(|component| component.as_os_str().to_str())
-        != Some(expected_root)
-    {
+        .and_then(|component| component.as_os_str().to_str());
+    if !matches!(root, Some("sessions" | "archived_sessions")) {
         bail!(
-            "thread {} rollout path must be below {expected_root}",
+            "thread {} rollout path must be below sessions or archived_sessions",
             thread.thread_id
         );
     }
@@ -668,7 +781,12 @@ fn object_path(root: &Path, sha256: &str) -> Result<PathBuf> {
         .join(&digest[2..]))
 }
 
-fn store_object(source: &Path, destination: &Path, expected_hash: &str) -> Result<()> {
+fn store_object(
+    source: &Path,
+    destination: &Path,
+    expected_hash: &str,
+    control: &OperationControl,
+) -> Result<()> {
     if destination.exists() {
         validate_object(destination, expected_hash, fs::metadata(source)?.len())?;
         return Ok(());
@@ -677,7 +795,7 @@ fn store_object(source: &Path, destination: &Path, expected_hash: &str) -> Resul
         fs::create_dir_all(parent)?;
     }
     let temporary = temporary_sibling(destination, "object");
-    copy_verified_object(source, &temporary, expected_hash)?;
+    copy_verified_object(source, &temporary, expected_hash, Some(control))?;
     match fs::rename(&temporary, destination) {
         Ok(()) => Ok(()),
         Err(error) if destination.exists() => {
@@ -689,7 +807,12 @@ fn store_object(source: &Path, destination: &Path, expected_hash: &str) -> Resul
     }
 }
 
-fn copy_verified_object(source: &Path, destination: &Path, expected_hash: &str) -> Result<()> {
+fn copy_verified_object(
+    source: &Path,
+    destination: &Path,
+    expected_hash: &str,
+    control: Option<&OperationControl>,
+) -> Result<()> {
     let input = File::open(source)?;
     let mut reader = BufReader::new(input);
     let output = OpenOptions::new()
@@ -700,6 +823,13 @@ fn copy_verified_object(source: &Path, destination: &Path, expected_hash: &str) 
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        if let Some(control) = control {
+            if control.is_cancelled() {
+                drop(writer);
+                let _ = fs::remove_file(destination);
+                bail!("operation cancelled");
+            }
+        }
         let count = reader.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -825,7 +955,12 @@ fn write_journal(path: &Path, journal: &OperationJournal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::scan_codex_home;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use tempfile::tempdir;
 
     fn create_codex_home(root: &Path, threads: &[(&str, &str, &str)]) {
@@ -876,6 +1011,58 @@ mod tests {
             validate_local_snapshot(&summary.manifest_path, repository.path()).unwrap();
         assert!(validation.valid);
         assert_eq!(validation.snapshot_id, summary.snapshot_id);
+    }
+
+    #[test]
+    fn accepts_archived_directory_when_database_state_is_not_archived() {
+        let source = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(
+            source.path(),
+            &[("thread-1", "Demo", "{\"type\":\"event\"}")],
+        );
+        let original = source
+            .path()
+            .join("sessions/2026/07/24/rollout-thread-1.jsonl");
+        let archived = source
+            .path()
+            .join("archived_sessions/rollout-thread-1.jsonl");
+        fs::create_dir_all(archived.parent().unwrap()).unwrap();
+        fs::rename(&original, &archived).unwrap();
+        let connection = Connection::open(source.path().join("state_5.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE threads SET archived = 0, rollout_path = ?1 WHERE id = 'thread-1'",
+                [archived.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let summary = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let validation =
+            validate_local_snapshot(&summary.manifest_path, repository.path()).unwrap();
+        assert!(validation.valid);
+    }
+
+    #[test]
+    fn rejects_rollout_paths_outside_codex_session_directories() {
+        let source = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(
+            source.path(),
+            &[("thread-1", "Demo", "{\"type\":\"event\"}")],
+        );
+        let summary = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let mut manifest: LocalSnapshot = read_json(&summary.manifest_path).unwrap();
+        manifest.threads[0].rollout.logical_path = Some("other/rollout-thread-1.jsonl".to_string());
+        atomic_write_json(&summary.manifest_path, &manifest).unwrap();
+
+        let error = validate_local_snapshot(&summary.manifest_path, repository.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must be below sessions or archived_sessions")
+        );
     }
 
     #[test]
@@ -1129,5 +1316,75 @@ mod tests {
         let recovered = recover_incomplete_operation(&journal_path, true).unwrap();
         assert_eq!(recovered.status, OperationStatus::RolledBack);
         assert!(!temporary_path.exists());
+    }
+
+    #[test]
+    fn cancellation_during_import_rolls_back_before_any_target_file_is_installed() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(
+            source.path(),
+            &[("thread-1", "Demo", "{\"type\":\"event\"}")],
+        );
+        create_codex_home(target.path(), &[]);
+        let snapshot = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_on_copy = cancelled.clone();
+        let control = OperationControl::new(cancelled, move |progress| {
+            if progress.phase == "import_rollouts" {
+                cancel_on_copy.store(true, Ordering::Relaxed);
+            }
+        });
+
+        let error = import_local_snapshot_with_control(
+            &snapshot.manifest_path,
+            target.path(),
+            repository.path(),
+            true,
+            &control,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("operation cancelled"));
+        assert_eq!(
+            scan_codex_home_with_control(target.path(), &OperationControl::default())
+                .unwrap()
+                .total_count(),
+            0
+        );
+        let connection = Connection::open(target.path().join("state_5.sqlite")).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn cancellation_during_snapshot_cleans_temporary_object_file() {
+        let source = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(
+            source.path(),
+            &[("thread-1", "Demo", "{\"type\":\"event\"}")],
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_on_object_copy = cancelled.clone();
+        let control = OperationControl::new(cancelled, move |progress| {
+            if progress.phase == "snapshot_objects" {
+                cancel_on_object_copy.store(true, Ordering::Relaxed);
+            }
+        });
+
+        let error =
+            create_local_snapshot_with_control(source.path(), repository.path(), true, &control)
+                .unwrap_err();
+        assert!(error.to_string().contains("operation cancelled"));
+        let temporary_files = walkdir::WalkDir::new(repository.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".object-"))
+            .count();
+        assert_eq!(temporary_files, 0);
     }
 }
