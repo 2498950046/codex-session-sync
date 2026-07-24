@@ -94,7 +94,13 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
                 continue;
             }
 
-            let Some(record) = read_rollout_record(path, archived, &mut warnings)? else {
+            let logical_path = path
+                .strip_prefix(&codex_home)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Some(record) = read_rollout_record(path, &logical_path, archived, &mut warnings)?
+            else {
                 continue;
             };
 
@@ -177,6 +183,7 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
 
 fn read_rollout_record(
     path: &Path,
+    logical_path: &str,
     archived: bool,
     warnings: &mut Vec<ScanWarning>,
 ) -> Result<Option<RolloutRecord>> {
@@ -270,11 +277,13 @@ fn read_rollout_record(
             sha256: hash,
             byte_length: metadata.len(),
             media_type: "application/x-ndjson".to_string(),
+            logical_path: Some(logical_path.to_string()),
+            source_path: Some(path.to_path_buf()),
         },
     }))
 }
 
-fn discover_database_paths(codex_home: &Path) -> Vec<PathBuf> {
+pub(crate) fn discover_database_paths(codex_home: &Path) -> Vec<PathBuf> {
     let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_dir())

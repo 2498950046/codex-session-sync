@@ -85,7 +85,7 @@ npm run build
 
 ## Current Status
 
-Phase 1 is complete.
+Phase 2 is complete.
 
 Implemented:
 
@@ -95,6 +95,17 @@ Implemented:
   and structured skipped-file warnings.
 - Tests for valid, empty, malformed JSON, and invalid UTF-8 rollouts.
 - Tauri command boundary and React scan dashboard.
+- Content-addressed local object storage and immutable snapshot manifests.
+- Explicit closed-Codex safety confirmation for snapshot, import, and recovery.
+- SHA-256 and byte-length validation before any import write.
+- Per-operation SQLite online backups and atomic JSON operation journals.
+- Transactional thread-row insertion and temporary-file rollout installation.
+- Pre-write rejection of divergent content for an existing thread UUID.
+- Automatic rollback after apply or post-import validation failure.
+- Restart recovery for incomplete journals, with hash-guarded file cleanup.
+- GUI actions for snapshot creation, validation, safe import, and recovery.
+- Automated tests covering successful import, corrupt objects, conflicts,
+  transactional rollback, and restart recovery.
 - Axum health endpoint skeleton.
 - Frontend type-check, production build, and browser visual verification.
 - Original cross-platform app icon and generated Tauri platform icon set.
@@ -117,8 +128,9 @@ Latest real-data read-only scan:
 - 2 discovered thread databases.
 - 1 skipped zero-byte rollout warning.
 
-No Codex local data is modified by phase 1.
+Phase 2 automated write tests use temporary Codex homes. The current machine's
+real Codex data has not been modified by development or verification.
 
-Next implementation phase: local operation journal, backup creation, and a
-tested import adapter. Do not add server push/pull writes before local rollback
-and validation paths are proven.
+Next implementation phase: server object storage, namespaces, immutable
+revisions, and fast-forward push/pull. Keep server writes disabled until their
+hash validation and authorization paths have automated tests.

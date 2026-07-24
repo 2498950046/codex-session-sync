@@ -24,3 +24,38 @@ export type ScanReport = {
   threads: ThreadBundle[];
   warnings: ScanWarning[];
 };
+
+export type SnapshotSummary = {
+  snapshotId: string;
+  manifestPath: string;
+  threadCount: number;
+  objectCount: number;
+  totalBytes: number;
+  warningCount: number;
+};
+
+export type SnapshotValidationReport = {
+  snapshotId: string;
+  manifestPath: string;
+  threadCount: number;
+  objectCount: number;
+  totalBytes: number;
+  valid: boolean;
+};
+
+export type ImportReport = {
+  operationId: string;
+  snapshotId: string;
+  importedCount: number;
+  skippedCount: number;
+  backupDir: string;
+  journalPath: string;
+};
+
+export type OperationJournal = {
+  operationId: string;
+  snapshotId: string;
+  status: string;
+  backupDir: string;
+  error: string | null;
+};
