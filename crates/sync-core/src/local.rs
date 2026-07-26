@@ -21,6 +21,7 @@ use crate::models::{
     SnapshotValidationReport, ThreadBundle,
 };
 use crate::operation::{OperationControl, OperationProgress};
+use crate::protocol::{ObjectDescriptor, validate_sha256};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +76,154 @@ pub fn default_repository_root() -> PathBuf {
     directories::BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".codex-session-sync"))
         .unwrap_or_else(|| PathBuf::from(".codex-session-sync"))
+}
+
+pub fn load_local_snapshot(manifest_path: impl AsRef<Path>) -> Result<LocalSnapshot> {
+    let snapshot: LocalSnapshot = read_json(manifest_path.as_ref())?;
+    validate_snapshot_structure(&snapshot)?;
+    Ok(snapshot)
+}
+
+pub fn store_local_snapshot(
+    snapshot: &LocalSnapshot,
+    repository_root: impl AsRef<Path>,
+) -> Result<PathBuf> {
+    validate_snapshot_structure(snapshot)?;
+    let repository_root = repository_root.as_ref();
+    ensure_repository_layout(repository_root)?;
+    let manifest_path = repository_root
+        .join("snapshots")
+        .join(format!("{}.json", snapshot.snapshot_id));
+    atomic_write_json(&manifest_path, snapshot)?;
+    Ok(manifest_path)
+}
+
+pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<ObjectDescriptor>> {
+    let mut objects = BTreeMap::new();
+    for object in threads
+        .iter()
+        .flat_map(|thread| std::iter::once(&thread.rollout).chain(thread.attachments.iter()))
+    {
+        validate_sha256(&object.sha256)
+            .map_err(|_| anyhow::anyhow!("invalid content object hash {}", object.sha256))?;
+        match objects.insert(object.sha256.clone(), object.byte_length) {
+            Some(existing) if existing != object.byte_length => bail!(
+                "content object {} has conflicting lengths {} and {}",
+                object.sha256,
+                existing,
+                object.byte_length
+            ),
+            _ => {}
+        }
+    }
+    Ok(objects
+        .into_iter()
+        .map(|(sha256, byte_length)| ObjectDescriptor {
+            sha256,
+            byte_length,
+        })
+        .collect())
+}
+
+pub fn repository_object_path(repository_root: impl AsRef<Path>, sha256: &str) -> Result<PathBuf> {
+    object_path(repository_root.as_ref(), sha256)
+}
+
+pub fn validate_repository_object(
+    repository_root: impl AsRef<Path>,
+    descriptor: &ObjectDescriptor,
+) -> Result<()> {
+    let path = object_path(repository_root.as_ref(), &descriptor.sha256)?;
+    validate_object(&path, &descriptor.sha256, descriptor.byte_length)
+}
+
+pub fn install_repository_object<R: Read>(
+    repository_root: impl AsRef<Path>,
+    descriptor: &ObjectDescriptor,
+    mut reader: R,
+    control: &OperationControl,
+) -> Result<bool> {
+    validate_sha256(&descriptor.sha256)
+        .map_err(|_| anyhow::anyhow!("invalid content object hash {}", descriptor.sha256))?;
+    let repository_root = repository_root.as_ref();
+    ensure_repository_layout(repository_root)?;
+    let destination = object_path(repository_root, &descriptor.sha256)?;
+    if destination.exists() {
+        validate_object(&destination, &descriptor.sha256, descriptor.byte_length)?;
+        return Ok(false);
+    }
+
+    let temporary = repository_root
+        .join("objects")
+        .join("tmp")
+        .join(format!("{}.download.tmp", Uuid::now_v7()));
+    let install_result = (|| -> Result<()> {
+        let output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        let mut writer = BufWriter::new(output);
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            control.check_cancelled()?;
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            total = total
+                .checked_add(count as u64)
+                .context("downloaded object length overflow")?;
+            if total > descriptor.byte_length {
+                bail!(
+                    "content object length mismatch for {}: expected {}, received more",
+                    descriptor.sha256,
+                    descriptor.byte_length
+                );
+            }
+            hasher.update(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+        if total != descriptor.byte_length {
+            bail!(
+                "content object length mismatch for {}: expected {}, got {}",
+                descriptor.sha256,
+                descriptor.byte_length,
+                total
+            );
+        }
+        let actual = format!("sha256:{}", hex::encode(hasher.finalize()));
+        if actual != descriptor.sha256 {
+            bail!(
+                "content object hash mismatch: expected {}, got {}",
+                descriptor.sha256,
+                actual
+            );
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::rename(&temporary, &destination) {
+            Ok(()) => Ok(()),
+            Err(error) if destination.exists() => {
+                fs::remove_file(&temporary)?;
+                validate_object(&destination, &descriptor.sha256, descriptor.byte_length)
+                    .context(error)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to install content object {}", destination.display())
+            }),
+        }
+    })();
+    if install_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    install_result?;
+    Ok(true)
 }
 
 pub fn create_local_snapshot(
@@ -185,23 +334,20 @@ pub fn validate_local_snapshot_with_control(
     validate_snapshot_structure(&snapshot)?;
 
     let mut unique_objects = BTreeSet::new();
-    for (index, thread) in snapshot.threads.iter().enumerate() {
+    let descriptors = collect_object_descriptors(&snapshot.threads)?;
+    for (index, descriptor) in descriptors.iter().enumerate() {
         control.check_cancelled()?;
         control.report(OperationProgress {
             phase: "validate_objects".to_string(),
-            message: thread.title.clone(),
+            message: descriptor.sha256.clone(),
             completed: index as u64,
-            total: Some(snapshot.threads.len() as u64),
+            total: Some(descriptors.len() as u64),
             unit: "objects".to_string(),
             cancellable: true,
         });
-        let object_path = object_path(repository_root, &thread.rollout.sha256)?;
-        validate_object(
-            &object_path,
-            &thread.rollout.sha256,
-            thread.rollout.byte_length,
-        )?;
-        unique_objects.insert(thread.rollout.sha256.clone());
+        let object_path = object_path(repository_root, &descriptor.sha256)?;
+        validate_object(&object_path, &descriptor.sha256, descriptor.byte_length)?;
+        unique_objects.insert(descriptor.sha256.clone());
     }
 
     Ok(SnapshotValidationReport {
@@ -575,6 +721,9 @@ fn apply_import(
             target_codex_home,
         )?;
     }
+    for thread in prepared {
+        insert_related_records(&transaction, &thread.bundle)?;
+    }
     transaction.commit()?;
 
     for thread in prepared {
@@ -628,7 +777,7 @@ fn rollback_and_fail(
     Err(error)
 }
 
-fn insert_thread_row(
+pub(crate) fn insert_thread_row(
     connection: &Connection,
     target_columns: &[String],
     thread: &ThreadBundle,
@@ -682,18 +831,83 @@ fn insert_thread_row(
     Ok(())
 }
 
-fn thread_table_columns(connection: &Connection) -> Result<Vec<String>> {
-    let mut statement = connection.prepare("PRAGMA table_info(threads)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+pub(crate) fn insert_related_records(connection: &Connection, thread: &ThreadBundle) -> Result<()> {
+    for (table, rows) in &thread.related_records.tables {
+        if table == "threads" {
+            continue;
+        }
+        let columns = table_columns(connection, table)?;
+        if columns.is_empty() {
+            bail!(
+                "target database has no related table {table} required by thread {}",
+                thread.thread_id
+            );
+        }
+        for row in rows {
+            let row = row.as_object().with_context(|| {
+                format!(
+                    "thread {} contains a non-object record for table {table}",
+                    thread.thread_id
+                )
+            })?;
+            let mut selected_columns = Vec::new();
+            let mut values = Vec::new();
+            for column in &columns {
+                if let Some(value) = row.get(column) {
+                    selected_columns.push(column.clone());
+                    values.push(json_to_sql_value(value)?);
+                }
+            }
+            if selected_columns.is_empty() {
+                bail!(
+                    "thread {} record for table {table} has no compatible columns",
+                    thread.thread_id
+                );
+            }
+            let column_sql = selected_columns
+                .iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let placeholders = (1..=values.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "INSERT INTO {} ({column_sql}) VALUES ({placeholders})",
+                quote_identifier(table)
+            );
+            connection
+                .execute(&sql, params_from_iter(values.iter()))
+                .with_context(|| {
+                    format!(
+                        "failed to insert related {table} record for thread {}",
+                        thread.thread_id
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn thread_table_columns(connection: &Connection) -> Result<Vec<String>> {
+    let columns = table_columns(connection, "threads")?;
     if columns.is_empty() {
         bail!("target database has no threads table");
     }
     Ok(columns)
 }
 
-fn select_primary_database(paths: &[PathBuf]) -> Result<PathBuf> {
+fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut statement =
+        connection.prepare(&format!("PRAGMA table_info({})", quote_identifier(table)))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns)
+}
+
+pub(crate) fn select_primary_database(paths: &[PathBuf]) -> Result<PathBuf> {
     let mut candidates = Vec::new();
     for path in paths {
         let connection = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
@@ -716,14 +930,14 @@ fn select_primary_database(paths: &[PathBuf]) -> Result<PathBuf> {
         .context("target Codex home has no writable threads database")
 }
 
-fn backup_database(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn backup_database(source: &Path, destination: &Path) -> Result<()> {
     let connection = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     connection
         .backup(MAIN_DB, destination, None)
         .with_context(|| format!("failed to back up database {}", source.display()))
 }
 
-fn restore_database(target: &Path, source_backup: &Path) -> Result<()> {
+pub(crate) fn restore_database(target: &Path, source_backup: &Path) -> Result<()> {
     let mut connection = Connection::open(target)?;
     connection
         .restore(
@@ -734,7 +948,7 @@ fn restore_database(target: &Path, source_backup: &Path) -> Result<()> {
         .with_context(|| format!("failed to restore database {}", target.display()))
 }
 
-fn validate_snapshot_structure(snapshot: &LocalSnapshot) -> Result<()> {
+pub(crate) fn validate_snapshot_structure(snapshot: &LocalSnapshot) -> Result<()> {
     if snapshot.schema_version != LOCAL_SNAPSHOT_SCHEMA_VERSION {
         bail!(
             "unsupported snapshot schema version {}; expected {}",
@@ -767,7 +981,7 @@ fn ensure_importable_thread(thread: &ThreadBundle) -> Result<()> {
     Ok(())
 }
 
-fn safe_rollout_path(thread: &ThreadBundle) -> Result<PathBuf> {
+pub(crate) fn safe_rollout_path(thread: &ThreadBundle) -> Result<PathBuf> {
     let logical_path = thread
         .rollout
         .logical_path
@@ -798,7 +1012,7 @@ fn safe_rollout_path(thread: &ThreadBundle) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn ensure_repository_layout(root: &Path) -> Result<()> {
+pub(crate) fn ensure_repository_layout(root: &Path) -> Result<()> {
     for directory in [
         "objects/sha256",
         "objects/tmp",
@@ -855,12 +1069,10 @@ fn source_fingerprint(source: &Path) -> Result<SourceFingerprint> {
 }
 
 fn object_path(root: &Path, sha256: &str) -> Result<PathBuf> {
+    validate_sha256(sha256).map_err(|_| anyhow::anyhow!("invalid SHA-256 identifier {sha256}"))?;
     let digest = sha256
         .strip_prefix("sha256:")
         .context("content hash must start with sha256:")?;
-    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("invalid SHA-256 digest {sha256}");
-    }
     Ok(root
         .join("objects")
         .join("sha256")
@@ -972,7 +1184,7 @@ fn store_snapshot_object(
     Ok(sha256)
 }
 
-fn copy_verified_object(
+pub(crate) fn copy_verified_object(
     source: &Path,
     destination: &Path,
     expected_hash: &str,
@@ -1036,7 +1248,7 @@ fn validate_object(path: &Path, expected_hash: &str, expected_length: u64) -> Re
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
@@ -1087,7 +1299,7 @@ fn temporary_sibling(path: &Path, purpose: &str) -> PathBuf {
     path.with_file_name(format!(".{file_name}.{purpose}-{}.tmp", Uuid::now_v7()))
 }
 
-fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1107,7 +1319,7 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     serde_json::from_reader(BufReader::new(file))
         .with_context(|| format!("failed to parse {}", path.display()))

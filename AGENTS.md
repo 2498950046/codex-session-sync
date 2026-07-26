@@ -85,8 +85,9 @@ npm run build
 
 ## Current Status
 
-Phase 3A (trusted server foundation) is complete. Desktop push/pull is not yet
-wired to the server.
+Phase 3A (trusted server foundation) is complete. Phase 3B is in progress: the
+HTTP transport and GUI are not wired yet, but the client-side tracking, merge,
+and exact-checkout foundation is implemented.
 
 Implemented:
 
@@ -144,6 +145,20 @@ Implemented:
   size rejection, object idempotency, missing objects, first commit,
   fast-forward, idempotent retries, concurrent stale-head rejection, hidden
   orphan revisions, and server restart persistence.
+- Client tracking SQLite keyed by Codex home, remote, and namespace, with
+  generation compare-and-swap and a separate active-namespace binding.
+- Pure three-way thread-set planning that merges independent UUID changes and
+  reports modify/modify and delete/modify conflicts without writing.
+- Snapshot/Revision conversion with machine-local database paths removed from
+  the remote semantic view.
+- Streaming installation of downloaded objects into the local content store,
+  with length/hash verification, cancellation cleanup, and atomic immutable
+  installation.
+- Exact local checkout with staged rollout directories, online backups of all
+  affected thread databases, same-filesystem directory swaps, post-apply
+  validation, durable journals, rollback, and restart recovery.
+- Discovery and round-trip preservation of direct SQLite child records whose
+  foreign keys reference `threads`.
 - Frontend type-check, production build, and browser visual verification.
 - Original cross-platform app icon and generated Tauri platform icon set.
 - Rust formatting, Clippy with warnings denied, full workspace tests, Tauri
@@ -169,7 +184,8 @@ All server tests use temporary data directories, and Phase 2 automated local
 write tests use temporary Codex homes. The current machine's real Codex data
 has not been modified by development or verification.
 
-Next implementation phase: Phase 3B desktop-side HTTP transport, local remote
-tracking state, and fast-forward push/pull orchestration. Reuse the existing
-safe local snapshot/import paths, keep Codex-closed checks around local writes,
-and do not add force-push or automatic same-thread conflict resolution.
+Next Phase 3B increment: desktop-side authenticated HTTP transport,
+credential-store integration, fast-forward push/pull orchestration, and the
+remote-sync GUI. Reuse the exact-checkout path, keep Codex-closed checks around
+all local writes, and do not add force-push or automatic same-thread conflict
+resolution.

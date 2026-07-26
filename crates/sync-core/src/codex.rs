@@ -88,7 +88,7 @@ pub(crate) struct MetadataScanReport {
 #[derive(Debug, Clone)]
 struct DbThreadRecord {
     database: PathBuf,
-    row: Value,
+    tables: BTreeMap<String, Vec<Value>>,
     title: Option<String>,
     archived: Option<bool>,
     created_at_ms: Option<i64>,
@@ -312,7 +312,7 @@ pub(crate) fn scan_codex_home_metadata_with_control(
 
         let related_records = db.map_or_else(RelatedRecords::default, |record| RelatedRecords {
             source_database: Some(record.database.clone()),
-            tables: BTreeMap::from([("threads".to_string(), vec![record.row.clone()])]),
+            tables: record.tables.clone(),
         });
 
         threads.push(ScannedThread {
@@ -520,6 +520,7 @@ fn load_database_records(
                 }
             };
 
+        let related = load_direct_thread_records(&connection, database, warnings);
         let mut statement = match connection.prepare("SELECT * FROM threads") {
             Ok(statement) => statement,
             Err(error) => {
@@ -585,12 +586,125 @@ fn load_database_records(
                     updated_at_ms: integer_field(&row, "updated_at_ms"),
                     model_provider: string_field(&row, "model_provider"),
                     cwd: string_field(&row, "cwd"),
-                    row,
+                    tables: {
+                        let mut tables = related.get(id).cloned().unwrap_or_default();
+                        tables.insert("threads".to_string(), vec![row]);
+                        tables
+                    },
                 },
             );
         }
     }
     records
+}
+
+fn load_direct_thread_records(
+    connection: &Connection,
+    database: &Path,
+    warnings: &mut Vec<ScanWarning>,
+) -> HashMap<String, BTreeMap<String, Vec<Value>>> {
+    let mut records = HashMap::<String, BTreeMap<String, Vec<Value>>>::new();
+    let mut tables = match connection.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'threads'
+         ORDER BY name",
+    ) {
+        Ok(statement) => statement,
+        Err(error) => {
+            warnings.push(ScanWarning {
+                kind: ScanWarningKind::DatabaseSchemaUnsupported,
+                path: database.to_path_buf(),
+                message: format!("Cannot enumerate related tables: {error}"),
+            });
+            return records;
+        }
+    };
+    let table_names = match tables.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
+        Err(error) => {
+            warnings.push(ScanWarning {
+                kind: ScanWarningKind::DatabaseSchemaUnsupported,
+                path: database.to_path_buf(),
+                message: format!("Cannot enumerate related tables: {error}"),
+            });
+            return records;
+        }
+    };
+
+    for table in table_names {
+        let pragma = format!("PRAGMA foreign_key_list({})", quote_identifier(&table));
+        let mut foreign_keys = match connection.prepare(&pragma) {
+            Ok(statement) => statement,
+            Err(_) => continue,
+        };
+        let references = match foreign_keys.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        }) {
+            Ok(rows) => rows.filter_map(Result::ok).collect::<Vec<_>>(),
+            Err(_) => continue,
+        };
+        let Some((_, thread_column, _)) = references.into_iter().find(|(target, _, column)| {
+            target == "threads" && column.as_deref().is_none_or(|column| column == "id")
+        }) else {
+            continue;
+        };
+        let sql = format!("SELECT * FROM {}", quote_identifier(&table));
+        let mut statement = match connection.prepare(&sql) {
+            Ok(statement) => statement,
+            Err(error) => {
+                warnings.push(ScanWarning {
+                    kind: ScanWarningKind::DatabaseUnavailable,
+                    path: database.to_path_buf(),
+                    message: format!("Cannot read related table {table}: {error}"),
+                });
+                continue;
+            }
+        };
+        let columns = statement
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let Some(thread_index) = columns.iter().position(|column| column == &thread_column) else {
+            continue;
+        };
+        let rows = match statement.query_map([], |row| {
+            let thread_id = match row.get_ref(thread_index)? {
+                ValueRef::Text(value) => Some(String::from_utf8_lossy(value).into_owned()),
+                _ => None,
+            };
+            Ok((thread_id, row_to_json(row, &columns)?))
+        }) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warnings.push(ScanWarning {
+                    kind: ScanWarningKind::DatabaseUnavailable,
+                    path: database.to_path_buf(),
+                    message: format!("Cannot enumerate related table {table}: {error}"),
+                });
+                continue;
+            }
+        };
+        for row in rows.flatten() {
+            if let Some(thread_id) = row.0 {
+                records
+                    .entry(thread_id)
+                    .or_default()
+                    .entry(table.clone())
+                    .or_default()
+                    .push(row.1);
+            }
+        }
+    }
+    records
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn row_to_json(row: &Row<'_>, columns: &[String]) -> rusqlite::Result<Value> {

@@ -1,0 +1,576 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::models::{LOCAL_SNAPSHOT_SCHEMA_VERSION, LocalSnapshot, ThreadBundle};
+use crate::protocol::{
+    REVISION_SCHEMA_VERSION, RevisionManifest, RevisionPayload, validate_sha256,
+};
+
+const TRACKING_SCHEMA_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackingRecord {
+    pub remote_id: Uuid,
+    pub namespace_id: Uuid,
+    pub codex_home_key: String,
+    pub integrated_head: Option<String>,
+    pub generation: u64,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveNamespaceBinding {
+    pub remote_id: Uuid,
+    pub namespace_id: Uuid,
+    pub codex_home_key: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadConflictKind {
+    BothModified,
+    LocalDeletedRemoteModified,
+    RemoteDeletedLocalModified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadConflict {
+    pub thread_id: String,
+    pub title: String,
+    pub kind: ThreadConflictKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMergeOutcome {
+    pub threads: Vec<ThreadBundle>,
+    pub conflicts: Vec<ThreadConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackingStore {
+    path: PathBuf,
+}
+
+impl TrackingStore {
+    pub fn open(repository_root: impl AsRef<Path>) -> Result<Self> {
+        let config_dir = repository_root.as_ref().join("config");
+        fs::create_dir_all(&config_dir).with_context(|| {
+            format!(
+                "failed to create tracking directory {}",
+                config_dir.display()
+            )
+        })?;
+        let store = Self {
+            path: config_dir.join("tracking.sqlite"),
+        };
+        store.initialize()?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(
+        &self,
+        codex_home: impl AsRef<Path>,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+    ) -> Result<Option<TrackingRecord>> {
+        let key = codex_home_key(codex_home.as_ref())?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT integrated_head, generation, updated_at
+                 FROM namespace_tracking
+                 WHERE codex_home_key = ?1 AND remote_id = ?2 AND namespace_id = ?3",
+                params![key, remote_id.to_string(), namespace_id.to_string()],
+                |row| {
+                    let generation = row.get::<_, i64>(1)?;
+                    Ok(TrackingRecord {
+                        remote_id,
+                        namespace_id,
+                        codex_home_key: key.clone(),
+                        integrated_head: row.get(0)?,
+                        generation: generation as u64,
+                        updated_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("failed to read namespace tracking state")
+    }
+
+    pub fn compare_and_set(
+        &self,
+        codex_home: impl AsRef<Path>,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+        expected_generation: Option<u64>,
+        integrated_head: Option<&str>,
+    ) -> Result<TrackingRecord> {
+        if let Some(head) = integrated_head {
+            validate_sha256(head).map_err(|_| anyhow::anyhow!("invalid integrated head {head}"))?;
+        }
+        let key = codex_home_key(codex_home.as_ref())?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to lock tracking database")?;
+        let current = transaction
+            .query_row(
+                "SELECT generation FROM namespace_tracking
+                 WHERE codex_home_key = ?1 AND remote_id = ?2 AND namespace_id = ?3",
+                params![key, remote_id.to_string(), namespace_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let expected = expected_generation.map(|value| value as i64);
+        if current != expected {
+            bail!(
+                "tracking state changed concurrently: expected generation {:?}, current {:?}",
+                expected_generation,
+                current
+            );
+        }
+        let generation = current.unwrap_or(0) + 1;
+        transaction.execute(
+            "INSERT INTO namespace_tracking (
+                 codex_home_key, remote_id, namespace_id, integrated_head, generation, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(codex_home_key, remote_id, namespace_id) DO UPDATE SET
+                 integrated_head = excluded.integrated_head,
+                 generation = excluded.generation,
+                 updated_at = excluded.updated_at",
+            params![
+                key,
+                remote_id.to_string(),
+                namespace_id.to_string(),
+                integrated_head,
+                generation,
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(TrackingRecord {
+            remote_id,
+            namespace_id,
+            codex_home_key: key,
+            integrated_head: integrated_head.map(str::to_string),
+            generation: generation as u64,
+            updated_at: now,
+        })
+    }
+
+    pub fn active(&self, codex_home: impl AsRef<Path>) -> Result<Option<ActiveNamespaceBinding>> {
+        let key = codex_home_key(codex_home.as_ref())?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT remote_id, namespace_id, updated_at
+                 FROM active_namespace WHERE codex_home_key = ?1",
+                [&key],
+                |row| {
+                    let remote_id: String = row.get(0)?;
+                    let namespace_id: String = row.get(1)?;
+                    Ok((remote_id, namespace_id, row.get::<_, String>(2)?))
+                },
+            )
+            .optional()?
+            .map(|(remote_id, namespace_id, updated_at)| {
+                Ok(ActiveNamespaceBinding {
+                    remote_id: Uuid::parse_str(&remote_id)
+                        .context("tracking database contains an invalid remote ID")?,
+                    namespace_id: Uuid::parse_str(&namespace_id)
+                        .context("tracking database contains an invalid namespace ID")?,
+                    codex_home_key: key,
+                    updated_at,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn set_active(
+        &self,
+        codex_home: impl AsRef<Path>,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+    ) -> Result<ActiveNamespaceBinding> {
+        let key = codex_home_key(codex_home.as_ref())?;
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO active_namespace (codex_home_key, remote_id, namespace_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(codex_home_key) DO UPDATE SET
+                 remote_id = excluded.remote_id,
+                 namespace_id = excluded.namespace_id,
+                 updated_at = excluded.updated_at",
+            params![key, remote_id.to_string(), namespace_id.to_string(), now],
+        )?;
+        Ok(ActiveNamespaceBinding {
+            remote_id,
+            namespace_id,
+            codex_home_key: key,
+            updated_at: now,
+        })
+    }
+
+    fn initialize(&self) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to initialize tracking database")?;
+        let has_schema_info = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_info'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_schema_info {
+            let actual = transaction.query_row(
+                "SELECT version FROM schema_info WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            if actual != TRACKING_SCHEMA_VERSION {
+                bail!("unsupported tracking schema version {actual}");
+            }
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_info (
+                 id INTEGER PRIMARY KEY CHECK(id = 1),
+                 version INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS namespace_tracking (
+                 codex_home_key TEXT NOT NULL,
+                 remote_id TEXT NOT NULL,
+                 namespace_id TEXT NOT NULL,
+                 integrated_head TEXT,
+                 generation INTEGER NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 PRIMARY KEY(codex_home_key, remote_id, namespace_id)
+             );
+             CREATE TABLE IF NOT EXISTS active_namespace (
+                 codex_home_key TEXT PRIMARY KEY,
+                 remote_id TEXT NOT NULL,
+                 namespace_id TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );",
+        )?;
+        if !has_schema_info {
+            transaction.execute(
+                "INSERT INTO schema_info (id, version) VALUES (1, ?1)",
+                [TRACKING_SCHEMA_VERSION],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn connection(&self) -> Result<Connection> {
+        let connection = Connection::open(&self.path)
+            .with_context(|| format!("failed to open tracking database {}", self.path.display()))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(connection)
+    }
+}
+
+pub fn codex_home_key(path: &Path) -> Result<String> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("failed to resolve Codex home {}", path.display()))?;
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    Ok(normalized)
+}
+
+pub fn snapshot_to_revision(
+    snapshot: &LocalSnapshot,
+    namespace_id: Uuid,
+    parent_revision: Option<String>,
+) -> Result<RevisionManifest> {
+    if snapshot.schema_version != LOCAL_SNAPSHOT_SCHEMA_VERSION {
+        bail!(
+            "unsupported local snapshot schema version {}",
+            snapshot.schema_version
+        );
+    }
+    RevisionManifest::from_payload(RevisionPayload {
+        schema_version: REVISION_SCHEMA_VERSION,
+        namespace_id,
+        parent_revision,
+        created_at: snapshot.created_at.clone(),
+        threads: snapshot.threads.iter().map(remote_thread_view).collect(),
+        warning_count: snapshot.warning_count,
+    })
+    .map_err(Into::into)
+}
+
+pub fn revision_to_snapshot(revision: &RevisionManifest) -> Result<LocalSnapshot> {
+    revision.validate()?;
+    Ok(LocalSnapshot {
+        schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: Uuid::now_v7().to_string(),
+        created_at: revision.payload.created_at.clone(),
+        threads: revision.payload.threads.clone(),
+        warning_count: revision.payload.warning_count,
+    })
+}
+
+pub fn merge_thread_sets(
+    base: &[ThreadBundle],
+    local: &[ThreadBundle],
+    remote: &[ThreadBundle],
+) -> Result<ThreadMergeOutcome> {
+    let base = thread_map(base)?;
+    let local = thread_map(local)?;
+    let remote = thread_map(remote)?;
+    let ids = base
+        .keys()
+        .chain(local.keys())
+        .chain(remote.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut threads = Vec::new();
+    let mut conflicts = Vec::new();
+
+    for id in ids {
+        let base_thread = base.get(&id);
+        let local_thread = local.get(&id);
+        let remote_thread = remote.get(&id);
+        let local_changed = !semantic_option_eq(local_thread, base_thread)?;
+        let remote_changed = !semantic_option_eq(remote_thread, base_thread)?;
+
+        let selected = match (local_changed, remote_changed) {
+            (false, false) => local_thread.or(remote_thread),
+            (true, false) => local_thread,
+            (false, true) => remote_thread,
+            (true, true) if semantic_option_eq(local_thread, remote_thread)? => local_thread,
+            (true, true) => {
+                let kind = match (local_thread, remote_thread) {
+                    (None, Some(_)) => ThreadConflictKind::LocalDeletedRemoteModified,
+                    (Some(_), None) => ThreadConflictKind::RemoteDeletedLocalModified,
+                    _ => ThreadConflictKind::BothModified,
+                };
+                let title = local_thread
+                    .or(remote_thread)
+                    .or(base_thread)
+                    .map(|thread| thread.title.clone())
+                    .unwrap_or_else(|| id.clone());
+                conflicts.push(ThreadConflict {
+                    thread_id: id,
+                    title,
+                    kind,
+                });
+                None
+            }
+        };
+        if let Some(thread) = selected {
+            threads.push((*thread).clone());
+        }
+    }
+    threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    Ok(ThreadMergeOutcome { threads, conflicts })
+}
+
+pub fn semantic_thread_hash(thread: &ThreadBundle) -> Result<String> {
+    let bytes = serde_json::to_vec(&remote_thread_view(thread))
+        .context("failed to serialize thread bundle")?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+}
+
+pub fn remote_thread_view(thread: &ThreadBundle) -> ThreadBundle {
+    let mut thread = thread.clone();
+    thread.rollout.source_path = None;
+    for attachment in &mut thread.attachments {
+        attachment.source_path = None;
+    }
+    thread.related_records.source_database = None;
+    for rows in thread.related_records.tables.values_mut() {
+        for row in rows {
+            if let Some(row) = row.as_object_mut() {
+                row.remove("rollout_path");
+                row.remove("codex_home");
+            }
+        }
+    }
+    thread
+}
+
+fn semantic_option_eq(left: Option<&&ThreadBundle>, right: Option<&&ThreadBundle>) -> Result<bool> {
+    match (left, right) {
+        (None, None) => Ok(true),
+        (Some(left), Some(right)) => {
+            Ok(semantic_thread_hash(left)? == semantic_thread_hash(right)?)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn thread_map(threads: &[ThreadBundle]) -> Result<BTreeMap<String, &ThreadBundle>> {
+    let mut map = BTreeMap::new();
+    for thread in threads {
+        if map.insert(thread.thread_id.clone(), thread).is_some() {
+            bail!("duplicate thread ID {}", thread.thread_id);
+        }
+    }
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::models::{
+        ContentObject, RelatedRecords, THREAD_BUNDLE_SCHEMA_VERSION, WorkspaceRef,
+    };
+
+    fn thread(id: &str, content: char) -> ThreadBundle {
+        ThreadBundle {
+            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+            thread_id: id.to_string(),
+            title: format!("Thread {id}"),
+            archived: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            model_provider: Some("openai".to_string()),
+            workspace: WorkspaceRef::default(),
+            rollout: ContentObject {
+                sha256: format!("sha256:{}", content.to_string().repeat(64)),
+                byte_length: 1,
+                media_type: "application/x-ndjson".to_string(),
+                logical_path: Some(format!("sessions/rollout-{id}.jsonl")),
+                source_path: None,
+            },
+            related_records: RelatedRecords {
+                source_database: None,
+                tables: BTreeMap::from([("threads".to_string(), vec![json!({"id": id})])]),
+            },
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tracking_isolated_by_home_remote_and_namespace_and_uses_cas() {
+        let temp = tempdir().unwrap();
+        let first_home = temp.path().join("first-home");
+        let second_home = temp.path().join("second-home");
+        fs::create_dir_all(&first_home).unwrap();
+        fs::create_dir_all(&second_home).unwrap();
+        let remote = Uuid::now_v7();
+        let namespace = Uuid::now_v7();
+        let store = TrackingStore::open(temp.path()).unwrap();
+        assert!(
+            store
+                .load(&first_home, remote, namespace)
+                .unwrap()
+                .is_none()
+        );
+
+        let first = store
+            .compare_and_set(&first_home, remote, namespace, None, None)
+            .unwrap();
+        assert_eq!(first.generation, 1);
+        assert!(
+            store
+                .compare_and_set(&first_home, remote, namespace, None, None)
+                .is_err()
+        );
+        let head = format!("sha256:{}", "a".repeat(64));
+        let second = store
+            .compare_and_set(
+                &first_home,
+                remote,
+                namespace,
+                Some(first.generation),
+                Some(&head),
+            )
+            .unwrap();
+        assert_eq!(second.integrated_head.as_deref(), Some(head.as_str()));
+        assert!(
+            store
+                .load(&second_home, remote, namespace)
+                .unwrap()
+                .is_none()
+        );
+
+        store.set_active(&first_home, remote, namespace).unwrap();
+        assert_eq!(
+            store.active(&first_home).unwrap().unwrap().namespace_id,
+            namespace
+        );
+        assert!(store.active(&second_home).unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_combines_independent_changes_and_reports_same_thread_conflicts() {
+        let base = vec![thread("base", 'a')];
+        let mut local_base = thread("base", 'a');
+        local_base.title = "local".to_string();
+        let local = vec![local_base, thread("local-only", 'b')];
+        let remote = vec![thread("base", 'a'), thread("remote-only", 'c')];
+        let merged = merge_thread_sets(&base, &local, &remote).unwrap();
+        assert!(merged.conflicts.is_empty());
+        assert_eq!(
+            merged
+                .threads
+                .iter()
+                .map(|thread| thread.thread_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base", "local-only", "remote-only"]
+        );
+
+        let mut remote_changed = thread("base", 'a');
+        remote_changed.archived = true;
+        let conflict = merge_thread_sets(&base, &local, &[remote_changed]).unwrap();
+        assert_eq!(conflict.conflicts.len(), 1);
+        assert_eq!(conflict.conflicts[0].kind, ThreadConflictKind::BothModified);
+    }
+
+    #[test]
+    fn merge_handles_delete_modify_conflicts() {
+        let base = vec![thread("thread", 'a')];
+        let mut remote = thread("thread", 'a');
+        remote.title = "remote changed".to_string();
+        let outcome = merge_thread_sets(&base, &[], &[remote]).unwrap();
+        assert_eq!(
+            outcome.conflicts[0].kind,
+            ThreadConflictKind::LocalDeletedRemoteModified
+        );
+    }
+
+    #[test]
+    fn snapshot_revision_round_trip_preserves_remote_view() {
+        let snapshot = LocalSnapshot {
+            schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: Uuid::now_v7().to_string(),
+            created_at: "2026-07-26T10:30:00Z".to_string(),
+            threads: vec![thread("one", 'a')],
+            warning_count: 0,
+        };
+        let manifest = snapshot_to_revision(&snapshot, Uuid::now_v7(), None).unwrap();
+        let restored = revision_to_snapshot(&manifest).unwrap();
+        assert_eq!(restored.threads, snapshot.threads);
+        assert_eq!(restored.warning_count, snapshot.warning_count);
+    }
+}

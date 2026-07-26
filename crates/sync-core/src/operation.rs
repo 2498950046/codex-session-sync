@@ -69,4 +69,11 @@ impl OperationControl {
             reporter(progress);
         }
     }
+
+    pub fn non_cancellable(&self) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            reporter: self.reporter.clone(),
+        }
+    }
 }
