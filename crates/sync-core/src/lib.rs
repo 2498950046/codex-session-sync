@@ -3,6 +3,7 @@ pub mod local;
 pub mod models;
 pub mod operation;
 pub mod process;
+pub mod protocol;
 
 pub use codex::{
     default_codex_home, scan_codex_home, scan_codex_home_dashboard,
@@ -16,3 +17,4 @@ pub use local::{
 pub use models::*;
 pub use operation::{OperationControl, OperationProgress};
 pub use process::{CodexProcess, CodexProcessKind, detect_codex_processes};
+pub use protocol::*;
