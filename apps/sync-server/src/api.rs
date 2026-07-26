@@ -13,8 +13,9 @@ use axum::{Json, Router};
 use serde::Serialize;
 use sync_core::{
     CommitRevisionRequest, CommitRevisionResponse, CreateNamespaceRequest, MissingObjectsRequest,
-    MissingObjectsResponse, NamespaceHeadResponse, NamespaceListResponse, REMOTE_PROTOCOL_VERSION,
-    RenameNamespaceRequest, RevisionManifest, validate_sha256,
+    MissingObjectsResponse, NamespaceHeadResponse, NamespaceListResponse, ProtocolInfoResponse,
+    PutObjectResponse, REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RevisionManifest,
+    validate_sha256,
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
@@ -74,22 +75,6 @@ struct HealthResponse {
     version: &'static str,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InfoResponse {
-    service: &'static str,
-    version: &'static str,
-    protocol_version: u32,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PutObjectResponse {
-    sha256: String,
-    byte_length: u64,
-    created: bool,
-}
-
 pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
     let json_limit = usize::try_from(
         config
@@ -130,10 +115,10 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn info() -> Json<InfoResponse> {
-    Json(InfoResponse {
-        service: "codex-session-sync",
-        version: env!("CARGO_PKG_VERSION"),
+async fn info() -> Json<ProtocolInfoResponse> {
+    Json(ProtocolInfoResponse {
+        service: "codex-session-sync".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: REMOTE_PROTOCOL_VERSION,
     })
 }

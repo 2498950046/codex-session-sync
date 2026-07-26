@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -17,7 +17,8 @@ use crate::local::{
 };
 use crate::models::{LocalSnapshot, ThreadBundle};
 use crate::operation::{OperationControl, OperationProgress};
-use crate::sync::semantic_thread_hash;
+use crate::protocol::validate_sha256;
+use crate::sync::{TrackingStore, semantic_thread_hash};
 
 pub const CHECKOUT_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
@@ -52,11 +53,23 @@ pub struct CheckoutDirectorySwap {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CheckoutTrackingUpdate {
+    pub remote_id: Uuid,
+    pub namespace_id: Uuid,
+    pub expected_generation: Option<u64>,
+    pub integrated_head: Option<String>,
+    pub activate_namespace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckoutJournal {
     pub schema_version: u32,
     pub operation_id: String,
     pub snapshot_id: String,
     pub target_codex_home: PathBuf,
+    #[serde(default)]
+    pub repository_root: PathBuf,
     pub repository_backup_dir: PathBuf,
     pub status: CheckoutStatus,
     pub started_at: String,
@@ -64,6 +77,8 @@ pub struct CheckoutJournal {
     pub database_backups: Vec<CheckoutDatabaseBackup>,
     pub directory_swaps: Vec<CheckoutDirectorySwap>,
     pub expected_thread_hashes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracking_update: Option<CheckoutTrackingUpdate>,
     pub error: Option<String>,
 }
 
@@ -100,8 +115,64 @@ pub fn checkout_local_snapshot_with_control(
     confirmed_codex_closed: bool,
     control: &OperationControl,
 ) -> Result<CheckoutReport> {
+    checkout_local_snapshot_internal(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        None,
+        control,
+    )
+}
+
+pub fn checkout_local_snapshot_with_tracking(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    tracking_update: CheckoutTrackingUpdate,
+) -> Result<CheckoutReport> {
+    checkout_local_snapshot_internal(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        Some(tracking_update),
+        &OperationControl::default(),
+    )
+}
+
+pub fn checkout_local_snapshot_with_tracking_control(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    tracking_update: CheckoutTrackingUpdate,
+    control: &OperationControl,
+) -> Result<CheckoutReport> {
+    checkout_local_snapshot_internal(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        Some(tracking_update),
+        control,
+    )
+}
+
+fn checkout_local_snapshot_internal(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    tracking_update: Option<CheckoutTrackingUpdate>,
+    control: &OperationControl,
+) -> Result<CheckoutReport> {
     if !confirmed_codex_closed {
         bail!("checkout requires confirmation that Codex is fully closed");
+    }
+    if let Some(update) = &tracking_update {
+        validate_tracking_update(update)?;
     }
     let manifest_path = manifest_path.as_ref();
     let target_codex_home = target_codex_home.as_ref().to_path_buf();
@@ -123,9 +194,11 @@ pub fn checkout_local_snapshot_with_control(
     if current.database_paths.is_empty() {
         bail!("target Codex home has no writable threads database");
     }
+    let catalog_databases = discover_local_thread_catalog_databases(&target_codex_home)?;
     control.check_cancelled()?;
 
     ensure_repository_layout(&repository_root)?;
+    ensure_no_incomplete_checkout_journal(&repository_root, &target_codex_home)?;
     let operation_id = Uuid::now_v7().to_string();
     let repository_backup_dir = repository_root.join("backups").join(&operation_id);
     let journal_path = repository_root
@@ -162,6 +235,7 @@ pub fn checkout_local_snapshot_with_control(
         operation_id: operation_id.clone(),
         snapshot_id: snapshot.snapshot_id.clone(),
         target_codex_home: target_codex_home.clone(),
+        repository_root: repository_root.clone(),
         repository_backup_dir: repository_backup_dir.clone(),
         status: CheckoutStatus::Preparing,
         started_at: now.clone(),
@@ -169,6 +243,7 @@ pub fn checkout_local_snapshot_with_control(
         database_backups: Vec::new(),
         directory_swaps,
         expected_thread_hashes,
+        tracking_update,
         error: None,
     };
     write_checkout_journal(&journal_path, &journal)?;
@@ -182,7 +257,13 @@ pub fn checkout_local_snapshot_with_control(
         ));
         let database_dir = repository_backup_dir.join("databases");
         fs::create_dir_all(&database_dir)?;
-        for (index, database) in current.database_paths.iter().enumerate() {
+        let mut databases_to_backup = current.database_paths.clone();
+        for database in &catalog_databases {
+            if !databases_to_backup.contains(database) {
+                databases_to_backup.push(database.clone());
+            }
+        }
+        for (index, database) in databases_to_backup.iter().enumerate() {
             let backup = database_dir.join(format!("{index}.sqlite"));
             backup_database(database, &backup)?;
             journal.database_backups.push(CheckoutDatabaseBackup {
@@ -214,6 +295,7 @@ pub fn checkout_local_snapshot_with_control(
             &snapshot.threads,
             &target_codex_home,
         )?;
+        invalidate_local_thread_catalogs(&catalog_databases)?;
 
         journal.status = CheckoutStatus::Validating;
         journal.updated_at = Utc::now().to_rfc3339();
@@ -223,6 +305,7 @@ pub fn checkout_local_snapshot_with_control(
         journal.status = CheckoutStatus::LocalApplied;
         journal.updated_at = Utc::now().to_rfc3339();
         write_checkout_journal(&journal_path, &journal)?;
+        apply_tracking_update(&journal)?;
         Ok(())
     })();
 
@@ -265,12 +348,119 @@ pub fn recover_checkout_operation(
     ) {
         return Ok(journal);
     }
+    if journal.status == CheckoutStatus::LocalApplied {
+        if let Err(error) = validate_checkout_journal_result(&journal) {
+            return reject_local_applied_recovery(
+                journal_path,
+                &mut journal,
+                error.context(
+                    "live Codex Home does not match the journal target; refusing recovery without modifying local data",
+                ),
+            );
+        }
+        if journal.tracking_update.is_some()
+            && let Err(error) = apply_tracking_update(&journal)
+        {
+            return reject_local_applied_recovery(
+                journal_path,
+                &mut journal,
+                error.context(
+                    "failed to reconcile applied checkout tracking; refusing recovery without rolling back local data",
+                ),
+            );
+        }
+        journal.status = CheckoutStatus::Completed;
+        journal.updated_at = Utc::now().to_rfc3339();
+        journal.error = None;
+        write_checkout_journal(journal_path, &journal)?;
+        return Ok(journal);
+    }
     rollback_checkout(
         journal_path,
         &mut journal,
         Some("Recovered an incomplete checkout operation".to_string()),
     )?;
     Ok(journal)
+}
+
+fn ensure_no_incomplete_checkout_journal(
+    repository_root: &Path,
+    target_codex_home: &Path,
+) -> Result<()> {
+    let journal_dir = repository_root.join("journal");
+    for entry in fs::read_dir(&journal_dir).with_context(|| {
+        format!(
+            "failed to scan checkout journals in {}",
+            journal_dir.display()
+        )
+    })? {
+        let path = entry?.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !file_name.starts_with("checkout-") || !file_name.ends_with(".json") {
+            continue;
+        }
+        let journal: CheckoutJournal = read_json(&path).with_context(|| {
+            format!(
+                "cannot verify whether checkout journal {} is complete",
+                path.display()
+            )
+        })?;
+        validate_checkout_journal(&journal)?;
+        if matches!(
+            journal.status,
+            CheckoutStatus::Completed | CheckoutStatus::RolledBack
+        ) {
+            continue;
+        }
+        if checkout_targets_same_home(target_codex_home, &journal.target_codex_home)? {
+            bail!(
+                "checkout is blocked by unfinished checkout operation {} at {}; recover it before starting another checkout for this Codex Home",
+                journal.operation_id,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn checkout_targets_same_home(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    let left = fs::canonicalize(left)
+        .with_context(|| format!("failed to normalize Codex Home {}", left.display()))?;
+    let right = match fs::canonicalize(right) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to normalize Codex Home {}", right.display()));
+        }
+    };
+    let left = normalized_path_identity(&left);
+    let right = normalized_path_identity(&right);
+    Ok(left == right)
+}
+
+fn normalized_path_identity(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    normalized
+}
+
+fn reject_local_applied_recovery(
+    journal_path: &Path,
+    journal: &mut CheckoutJournal,
+    error: anyhow::Error,
+) -> Result<CheckoutJournal> {
+    journal.updated_at = Utc::now().to_rfc3339();
+    journal.error = Some(format!("{error:#}"));
+    write_checkout_journal(journal_path, journal)
+        .context("failed to persist rejected checkout recovery state")?;
+    Err(error)
 }
 
 fn stage_rollouts(
@@ -376,6 +566,101 @@ fn replace_databases(
     Ok(())
 }
 
+fn discover_local_thread_catalog_databases(codex_home: &Path) -> Result<Vec<PathBuf>> {
+    let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| codex_home.to_path_buf());
+    let candidates = [
+        sqlite_home.join("sqlite").join("codex-dev.db"),
+        sqlite_home.join("codex-dev.db"),
+    ];
+    let mut databases = Vec::new();
+    for path in candidates {
+        if !path.is_file() || databases.contains(&path) {
+            continue;
+        }
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| {
+                format!("failed to inspect Codex thread catalog {}", path.display())
+            })?;
+        let table_count: u32 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                 'local_thread_catalog',
+                 'local_thread_catalog_sync_state',
+                 'local_thread_catalog_metadata'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if table_count == 3 {
+            databases.push(path);
+        }
+    }
+    Ok(databases)
+}
+
+fn invalidate_local_thread_catalogs(databases: &[PathBuf]) -> Result<()> {
+    for database in databases {
+        let mut connection = Connection::open(database).with_context(|| {
+            format!("failed to open Codex thread catalog {}", database.display())
+        })?;
+        connection.busy_timeout(std::time::Duration::from_millis(250))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("cannot lock the Codex thread catalog; make sure Codex is fully closed")?;
+        let sync_state_columns = table_columns(&transaction, "local_thread_catalog_sync_state")?;
+        for required in ["host_id", "watermark_updated_at", "initial_build_complete"] {
+            if !sync_state_columns.contains(required) {
+                bail!(
+                    "Codex thread catalog {} is missing required column {required}",
+                    database.display()
+                );
+            }
+        }
+        transaction.execute(
+            "DELETE FROM local_thread_catalog WHERE host_id = 'local'",
+            [],
+        )?;
+        if sync_state_columns.contains("last_full_reconciled_at") {
+            transaction.execute(
+                "UPDATE local_thread_catalog_sync_state
+                 SET watermark_updated_at = NULL,
+                     initial_build_complete = 0,
+                     last_full_reconciled_at = NULL
+                 WHERE host_id = 'local'",
+                [],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE local_thread_catalog_sync_state
+                 SET watermark_updated_at = NULL,
+                     initial_build_complete = 0
+                 WHERE host_id = 'local'",
+                [],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO local_thread_catalog_metadata (id, catalog_revision)
+             VALUES (1, 1)
+             ON CONFLICT(id) DO UPDATE SET
+                 catalog_revision = local_thread_catalog_metadata.catalog_revision + 1",
+            [],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn table_columns(transaction: &rusqlite::Transaction<'_>, table: &str) -> Result<BTreeSet<String>> {
+    let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(columns)
+}
+
 fn validate_checkout_result(
     snapshot: &LocalSnapshot,
     target_codex_home: &Path,
@@ -388,27 +673,80 @@ fn validate_checkout_result(
             actual.warnings.len()
         );
     }
-    let expected = snapshot
-        .threads
-        .iter()
-        .map(|thread| (thread.thread_id.as_str(), thread.rollout.sha256.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let actual = actual
-        .threads
-        .iter()
-        .map(|thread| (thread.thread_id.as_str(), thread.rollout.sha256.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    if actual != expected {
-        let expected_ids = expected.keys().copied().collect::<BTreeSet<_>>();
-        let actual_ids = actual.keys().copied().collect::<BTreeSet<_>>();
+    let expected = semantic_thread_hashes(&snapshot.threads)?;
+    let actual = semantic_thread_hashes(&actual.threads)?;
+    validate_thread_hashes(&expected, &actual)
+}
+
+fn validate_checkout_journal_result(journal: &CheckoutJournal) -> Result<()> {
+    let actual =
+        scan_codex_home_with_control(&journal.target_codex_home, &OperationControl::default())?;
+    if !actual.warnings.is_empty() {
         bail!(
-            "post-checkout validation mismatch: expected {} threads, found {}; missing {:?}; unexpected {:?}",
+            "recovered checkout scan returned {} warning(s)",
+            actual.warnings.len()
+        );
+    }
+    let actual = semantic_thread_hashes(&actual.threads)?;
+    validate_thread_hashes(&journal.expected_thread_hashes, &actual)
+}
+
+fn semantic_thread_hashes(threads: &[ThreadBundle]) -> Result<BTreeMap<String, String>> {
+    let mut hashes = BTreeMap::new();
+    for thread in threads {
+        if hashes
+            .insert(thread.thread_id.clone(), semantic_thread_hash(thread)?)
+            .is_some()
+        {
+            bail!("checkout contains duplicate thread ID {}", thread.thread_id);
+        }
+    }
+    Ok(hashes)
+}
+
+fn validate_thread_hashes(
+    expected: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, String>,
+) -> Result<()> {
+    if actual != expected {
+        let expected_ids = expected.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let actual_ids = actual.keys().map(String::as_str).collect::<BTreeSet<_>>();
+        let changed = expected
+            .iter()
+            .filter_map(|(thread_id, expected_hash)| {
+                actual
+                    .get(thread_id)
+                    .filter(|actual_hash| *actual_hash != expected_hash)
+                    .map(|_| thread_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        bail!(
+            "post-checkout validation mismatch: expected {} threads, found {}; missing {:?}; unexpected {:?}; changed {:?}",
             expected.len(),
             actual.len(),
             expected_ids.difference(&actual_ids).collect::<Vec<_>>(),
-            actual_ids.difference(&expected_ids).collect::<Vec<_>>()
+            actual_ids.difference(&expected_ids).collect::<Vec<_>>(),
+            changed
         );
     }
+    Ok(())
+}
+
+fn apply_tracking_update(journal: &CheckoutJournal) -> Result<()> {
+    let Some(update) = &journal.tracking_update else {
+        return Ok(());
+    };
+    let tracking = TrackingStore::open(&journal.repository_root)?;
+    tracking
+        .reconcile_checkout(
+            &journal.target_codex_home,
+            update.remote_id,
+            update.namespace_id,
+            update.expected_generation,
+            update.integrated_head.as_deref(),
+            update.activate_namespace,
+        )
+        .context("failed to reconcile checkout tracking state")?;
     Ok(())
 }
 
@@ -506,6 +844,29 @@ fn validate_checkout_journal(journal: &CheckoutJournal) -> Result<()> {
     if journal.operation_id.trim().is_empty() {
         bail!("checkout journal has no operation ID");
     }
+    if let Some(update) = &journal.tracking_update {
+        if journal.repository_root.as_os_str().is_empty() {
+            bail!("checkout tracking update has no repository root");
+        }
+        validate_tracking_update(update)?;
+    }
+    Ok(())
+}
+
+fn validate_tracking_update(update: &CheckoutTrackingUpdate) -> Result<()> {
+    if update.remote_id.get_version_num() != 7 {
+        bail!("checkout tracking remote ID must be a UUIDv7");
+    }
+    if update.namespace_id.get_version_num() != 7 {
+        bail!("checkout tracking namespace ID must be a UUIDv7");
+    }
+    if let Some(head) = &update.integrated_head {
+        validate_sha256(head)
+            .map_err(|_| anyhow::anyhow!("invalid checkout tracking head {head}"))?;
+    }
+    if update.expected_generation == Some(u64::MAX) {
+        bail!("checkout tracking generation cannot be incremented");
+    }
     Ok(())
 }
 
@@ -554,7 +915,382 @@ mod tests {
     }
 
     #[test]
-    fn recovery_restores_original_directories_and_database() {
+    fn checkout_invalidates_only_the_rebuildable_local_thread_catalog() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let catalog_path = create_fixture_thread_catalog(&codex_home);
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+
+        let report = checkout_local_snapshot(&manifest, &codex_home, &repository, true).unwrap();
+
+        let connection = Connection::open(&catalog_path).unwrap();
+        let local_entries: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remote_entries: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id = 'ssh-host'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let local_state: (Option<f64>, i64, i64, Option<i64>) = connection
+            .query_row(
+                "SELECT watermark_updated_at, initial_build_complete,
+                        observation_sequence, last_full_reconciled_at
+                 FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let revision: u64 = connection
+            .query_row(
+                "SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let timeline_rows: u64 = connection
+            .query_row("SELECT COUNT(*) FROM thread_timeline_ledger", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let automation_rows: u64 = connection
+            .query_row("SELECT COUNT(*) FROM automations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(local_entries, 0);
+        assert_eq!(remote_entries, 1);
+        assert_eq!(local_state, (None, 0, 42, None));
+        assert_eq!(revision, 8);
+        assert_eq!(timeline_rows, 1);
+        assert_eq!(automation_rows, 1);
+
+        let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        let backup = journal
+            .database_backups
+            .iter()
+            .find(|backup| backup.target == catalog_path)
+            .expect("thread catalog was not included in the checkout backup");
+        assert!(backup.backup.is_file());
+    }
+
+    #[test]
+    fn tracked_checkout_commits_tracking_and_active_namespace() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let old_head = format!("sha256:{}", "a".repeat(64));
+        let target_head = format!("sha256:{}", "b".repeat(64));
+        let tracking = TrackingStore::open(&repository).unwrap();
+        let previous = tracking
+            .compare_and_set(&codex_home, remote_id, namespace_id, None, Some(&old_head))
+            .unwrap();
+
+        let report = checkout_local_snapshot_with_tracking(
+            &manifest,
+            &codex_home,
+            &repository,
+            true,
+            CheckoutTrackingUpdate {
+                remote_id,
+                namespace_id,
+                expected_generation: Some(previous.generation),
+                integrated_head: Some(target_head.clone()),
+                activate_namespace: true,
+            },
+        )
+        .unwrap();
+
+        let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        assert_eq!(journal.status, CheckoutStatus::Completed);
+        let record = tracking
+            .load(&codex_home, remote_id, namespace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.integrated_head.as_deref(),
+            Some(target_head.as_str())
+        );
+        assert_eq!(record.generation, previous.generation + 1);
+        let active = tracking.active(&codex_home).unwrap().unwrap();
+        assert_eq!(
+            (active.remote_id, active.namespace_id),
+            (remote_id, namespace_id)
+        );
+    }
+
+    #[test]
+    fn checkout_rejects_nonterminal_journal_for_the_same_home() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let first = snapshot_with_object(&repository, "first", b"first rollout");
+        let first_manifest = store_local_snapshot(&first, &repository).unwrap();
+        let first_report =
+            checkout_local_snapshot(&first_manifest, &codex_home, &repository, true).unwrap();
+        let mut first_journal: CheckoutJournal = read_json(&first_report.journal_path).unwrap();
+        first_journal.status = CheckoutStatus::LocalApplied;
+        write_checkout_journal(&first_report.journal_path, &first_journal).unwrap();
+
+        let second = snapshot_with_object(&repository, "second", b"second rollout");
+        let second_manifest = store_local_snapshot(&second, &repository).unwrap();
+        let error =
+            checkout_local_snapshot(&second_manifest, &codex_home, &repository, true).unwrap_err();
+
+        assert!(error.to_string().contains("unfinished checkout operation"));
+        let scanned = crate::scan_codex_home(&codex_home).unwrap();
+        assert_eq!(scanned.threads[0].thread_id, "first");
+    }
+
+    #[test]
+    fn tracking_conflict_rolls_back_the_thread_catalog_invalidation() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let catalog_path = create_fixture_thread_catalog(&codex_home);
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let old_head = format!("sha256:{}", "a".repeat(64));
+        let target_head = format!("sha256:{}", "b".repeat(64));
+        TrackingStore::open(&repository)
+            .unwrap()
+            .compare_and_set(&codex_home, remote_id, namespace_id, None, Some(&old_head))
+            .unwrap();
+
+        let error = checkout_local_snapshot_with_tracking(
+            &manifest,
+            &codex_home,
+            &repository,
+            true,
+            CheckoutTrackingUpdate {
+                remote_id,
+                namespace_id,
+                expected_generation: None,
+                integrated_head: Some(target_head),
+                activate_namespace: true,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("tracking state changed concurrently")
+        }));
+        let scanned = crate::scan_codex_home(&codex_home).unwrap();
+        assert_eq!(scanned.threads[0].thread_id, "old");
+        let connection = Connection::open(catalog_path).unwrap();
+        let local_entries: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id = 'local'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let local_state: (Option<f64>, i64, i64, Option<i64>) = connection
+            .query_row(
+                "SELECT watermark_updated_at, initial_build_complete,
+                        observation_sequence, last_full_reconciled_at
+                 FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let revision: u64 = connection
+            .query_row(
+                "SELECT catalog_revision FROM local_thread_catalog_metadata WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_entries, 1);
+        assert_eq!(local_state, (Some(100.0), 1, 42, Some(100)));
+        assert_eq!(revision, 7);
+    }
+
+    #[test]
+    fn recovery_reconciles_tracking_after_local_checkout_was_applied() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let old_head = format!("sha256:{}", "a".repeat(64));
+        let target_head = format!("sha256:{}", "b".repeat(64));
+        let tracking = TrackingStore::open(&repository).unwrap();
+        let previous = tracking
+            .compare_and_set(&codex_home, remote_id, namespace_id, None, Some(&old_head))
+            .unwrap();
+
+        let report = checkout_local_snapshot(&manifest, &codex_home, &repository, true).unwrap();
+        let mut journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        journal.status = CheckoutStatus::LocalApplied;
+        journal.tracking_update = Some(CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: Some(previous.generation),
+            integrated_head: Some(target_head.clone()),
+            activate_namespace: true,
+        });
+        write_checkout_journal(&report.journal_path, &journal).unwrap();
+
+        let recovered = recover_checkout_operation(&report.journal_path, true).unwrap();
+
+        assert_eq!(recovered.status, CheckoutStatus::Completed);
+        let scanned = crate::scan_codex_home(&codex_home).unwrap();
+        assert_eq!(scanned.threads[0].thread_id, "new");
+        let record = tracking
+            .load(&codex_home, remote_id, namespace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.integrated_head.as_deref(),
+            Some(target_head.as_str())
+        );
+        assert_eq!(record.generation, previous.generation + 1);
+        let active = tracking.active(&codex_home).unwrap().unwrap();
+        assert_eq!(active.remote_id, remote_id);
+        assert_eq!(active.namespace_id, namespace_id);
+    }
+
+    #[test]
+    fn recovery_rejects_stale_local_applied_journal_without_overwriting_newer_checkout() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+
+        let first = snapshot_with_object(&repository, "first", b"first rollout");
+        let first_manifest = store_local_snapshot(&first, &repository).unwrap();
+        let first_report =
+            checkout_local_snapshot(&first_manifest, &codex_home, &repository, true).unwrap();
+
+        let newer = snapshot_with_object(&repository, "newer", b"newer rollout");
+        let newer_manifest = store_local_snapshot(&newer, &repository).unwrap();
+        checkout_local_snapshot(&newer_manifest, &codex_home, &repository, true).unwrap();
+
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let target_head = format!("sha256:{}", "b".repeat(64));
+        let mut stale_journal: CheckoutJournal = read_json(&first_report.journal_path).unwrap();
+        stale_journal.status = CheckoutStatus::LocalApplied;
+        stale_journal.tracking_update = Some(CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: None,
+            integrated_head: Some(target_head),
+            activate_namespace: true,
+        });
+        stale_journal.error = None;
+        write_checkout_journal(&first_report.journal_path, &stale_journal).unwrap();
+        let tracking = TrackingStore::open(&repository).unwrap();
+
+        for _ in 0..2 {
+            let error = recover_checkout_operation(&first_report.journal_path, true).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match the journal target")
+            );
+
+            let scanned = crate::scan_codex_home(&codex_home).unwrap();
+            assert_eq!(scanned.threads[0].thread_id, "newer");
+            let retained: CheckoutJournal = read_json(&first_report.journal_path).unwrap();
+            assert_eq!(retained.status, CheckoutStatus::LocalApplied);
+            assert!(
+                retained
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("does not match the journal target"))
+            );
+            assert!(
+                tracking
+                    .load(&codex_home, remote_id, namespace_id)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_tracking_conflict_without_rolling_back_local_state() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let old_head = format!("sha256:{}", "a".repeat(64));
+        let target_head = format!("sha256:{}", "b".repeat(64));
+        let concurrent_head = format!("sha256:{}", "c".repeat(64));
+        let tracking = TrackingStore::open(&repository).unwrap();
+        let previous = tracking
+            .compare_and_set(&codex_home, remote_id, namespace_id, None, Some(&old_head))
+            .unwrap();
+        let report = checkout_local_snapshot(&manifest, &codex_home, &repository, true).unwrap();
+        let mut journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        journal.status = CheckoutStatus::LocalApplied;
+        journal.tracking_update = Some(CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: Some(previous.generation),
+            integrated_head: Some(target_head),
+            activate_namespace: true,
+        });
+        write_checkout_journal(&report.journal_path, &journal).unwrap();
+        let concurrent = tracking
+            .compare_and_set(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                Some(previous.generation),
+                Some(&concurrent_head),
+            )
+            .unwrap();
+
+        let error = recover_checkout_operation(&report.journal_path, true).unwrap_err();
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("tracking state changed concurrently")
+        }));
+        let retained: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        assert_eq!(retained.status, CheckoutStatus::LocalApplied);
+        assert!(retained.error.is_some());
+        let scanned = crate::scan_codex_home(&codex_home).unwrap();
+        assert_eq!(scanned.threads[0].thread_id, "new");
+        let unchanged = tracking
+            .load(&codex_home, remote_id, namespace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged, concurrent);
+        assert!(tracking.active(&codex_home).unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_completes_untracked_local_applied_checkout_without_rollback() {
         let temp = tempdir().unwrap();
         let codex_home = temp.path().join("codex");
         let repository = temp.path().join("repository");
@@ -564,12 +1300,12 @@ mod tests {
         let report = checkout_local_snapshot(&manifest, &codex_home, &repository, true).unwrap();
 
         let mut journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
-        journal.status = CheckoutStatus::Applying;
+        journal.status = CheckoutStatus::LocalApplied;
         write_checkout_journal(&report.journal_path, &journal).unwrap();
         let recovered = recover_checkout_operation(&report.journal_path, true).unwrap();
-        assert_eq!(recovered.status, CheckoutStatus::RolledBack);
+        assert_eq!(recovered.status, CheckoutStatus::Completed);
         let scanned = crate::scan_codex_home(&codex_home).unwrap();
-        assert_eq!(scanned.threads[0].thread_id, "old");
+        assert_eq!(scanned.threads[0].thread_id, "new");
     }
 
     #[test]
@@ -597,6 +1333,7 @@ mod tests {
             operation_id,
             snapshot_id: Uuid::now_v7().to_string(),
             target_codex_home: codex_home.clone(),
+            repository_root: repository.clone(),
             repository_backup_dir: repository.join("backups/test"),
             status: CheckoutStatus::Preparing,
             started_at: now.clone(),
@@ -612,6 +1349,7 @@ mod tests {
                 })
                 .collect(),
             expected_thread_hashes: BTreeMap::new(),
+            tracking_update: None,
             error: None,
         };
         write_checkout_journal(&journal_path, &journal).unwrap();
@@ -667,6 +1405,64 @@ mod tests {
                 params![thread_id, rollout.to_string_lossy().as_ref()],
             )
             .unwrap();
+    }
+
+    fn create_fixture_thread_catalog(codex_home: &Path) -> PathBuf {
+        let database = codex_home.join("sqlite/codex-dev.db");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog (
+                     host_id TEXT NOT NULL,
+                     thread_id TEXT NOT NULL,
+                     display_title TEXT NOT NULL,
+                     source_updated_at REAL NOT NULL,
+                     PRIMARY KEY (host_id, thread_id)
+                 );
+                 CREATE TABLE local_thread_catalog_sync_state (
+                     host_id TEXT PRIMARY KEY,
+                     watermark_updated_at REAL,
+                     initial_build_complete INTEGER NOT NULL DEFAULT 0,
+                     observation_sequence INTEGER NOT NULL DEFAULT 0,
+                     last_full_reconciled_at INTEGER
+                 );
+                 CREATE TABLE local_thread_catalog_hosts (
+                     host_id TEXT PRIMARY KEY,
+                     host_kind TEXT NOT NULL
+                 );
+                 CREATE TABLE local_thread_catalog_metadata (
+                     id INTEGER PRIMARY KEY,
+                     catalog_revision INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE thread_timeline_ledger (
+                     host_id TEXT NOT NULL,
+                     thread_id TEXT NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     record_id TEXT NOT NULL,
+                     payload_json TEXT NOT NULL,
+                     PRIMARY KEY (host_id, thread_id, sequence)
+                 );
+                 CREATE TABLE automations (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO local_thread_catalog
+                     (host_id, thread_id, display_title, source_updated_at)
+                     VALUES ('local', 'stale-local', 'stale', 100),
+                            ('ssh-host', 'remote-thread', 'remote', 100);
+                 INSERT INTO local_thread_catalog_sync_state
+                     (host_id, watermark_updated_at, initial_build_complete,
+                      observation_sequence, last_full_reconciled_at)
+                     VALUES ('local', 100, 1, 42, 100),
+                            ('ssh-host', 100, 1, 8, 100);
+                 INSERT INTO local_thread_catalog_hosts
+                     (host_id, host_kind) VALUES ('local', 'local'), ('ssh-host', 'ssh');
+                 INSERT INTO local_thread_catalog_metadata (id, catalog_revision) VALUES (1, 7);
+                 INSERT INTO thread_timeline_ledger
+                     (host_id, thread_id, sequence, record_id, payload_json)
+                     VALUES ('local', 'stale-local', 1, 'record', '{}');
+                 INSERT INTO automations (id, name) VALUES ('automation', 'preserved');",
+            )
+            .unwrap();
+        database
     }
 
     fn snapshot_with_object(repository: &Path, thread_id: &str, content: &[u8]) -> LocalSnapshot {

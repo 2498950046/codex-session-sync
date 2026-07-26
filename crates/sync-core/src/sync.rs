@@ -176,6 +176,130 @@ impl TrackingStore {
         })
     }
 
+    pub fn reconcile_checkout(
+        &self,
+        codex_home: impl AsRef<Path>,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+        expected_generation: Option<u64>,
+        integrated_head: Option<&str>,
+        activate_namespace: bool,
+    ) -> Result<TrackingRecord> {
+        if let Some(head) = integrated_head {
+            validate_sha256(head).map_err(|_| anyhow::anyhow!("invalid integrated head {head}"))?;
+        }
+        let key = codex_home_key(codex_home.as_ref())?;
+        let remote_id_text = remote_id.to_string();
+        let namespace_id_text = namespace_id.to_string();
+        let expected = expected_generation
+            .map(i64::try_from)
+            .transpose()
+            .context("tracking generation exceeds SQLite integer range")?;
+        let next_generation = expected
+            .unwrap_or(0)
+            .checked_add(1)
+            .context("tracking generation overflow")?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to lock tracking database")?;
+        let current = transaction
+            .query_row(
+                "SELECT integrated_head, generation, updated_at
+                 FROM namespace_tracking
+                 WHERE codex_home_key = ?1 AND remote_id = ?2 AND namespace_id = ?3",
+                params![key, remote_id_text, namespace_id_text],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let already_applied = current.as_ref().is_some_and(|(head, generation, _)| {
+            *generation == next_generation && head.as_deref() == integrated_head
+        });
+
+        if already_applied {
+            if activate_namespace {
+                let active = transaction
+                    .query_row(
+                        "SELECT remote_id, namespace_id FROM active_namespace
+                         WHERE codex_home_key = ?1",
+                        [&key],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                    .optional()?;
+                if active
+                    .as_ref()
+                    .map(|(remote, namespace)| (remote.as_str(), namespace.as_str()))
+                    != Some((remote_id_text.as_str(), namespace_id_text.as_str()))
+                {
+                    bail!("tracking checkout was committed without the expected active namespace");
+                }
+            }
+            let (head, generation, updated_at) = current.expect("checked above");
+            transaction.commit()?;
+            return Ok(TrackingRecord {
+                remote_id,
+                namespace_id,
+                codex_home_key: key,
+                integrated_head: head,
+                generation: generation as u64,
+                updated_at,
+            });
+        }
+
+        let current_generation = current.as_ref().map(|(_, generation, _)| *generation);
+        if current_generation != expected {
+            bail!(
+                "tracking state changed concurrently: expected generation {:?}, current {:?}",
+                expected_generation,
+                current_generation
+            );
+        }
+        transaction.execute(
+            "INSERT INTO namespace_tracking (
+                 codex_home_key, remote_id, namespace_id, integrated_head, generation, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(codex_home_key, remote_id, namespace_id) DO UPDATE SET
+                 integrated_head = excluded.integrated_head,
+                 generation = excluded.generation,
+                 updated_at = excluded.updated_at",
+            params![
+                key,
+                remote_id_text,
+                namespace_id_text,
+                integrated_head,
+                next_generation,
+                now
+            ],
+        )?;
+        if activate_namespace {
+            transaction.execute(
+                "INSERT INTO active_namespace (codex_home_key, remote_id, namespace_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(codex_home_key) DO UPDATE SET
+                     remote_id = excluded.remote_id,
+                     namespace_id = excluded.namespace_id,
+                     updated_at = excluded.updated_at",
+                params![key, remote_id_text, namespace_id_text, now],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(TrackingRecord {
+            remote_id,
+            namespace_id,
+            codex_home_key: key,
+            integrated_head: integrated_head.map(str::to_string),
+            generation: next_generation as u64,
+            updated_at: now,
+        })
+    }
+
     pub fn active(&self, codex_home: impl AsRef<Path>) -> Result<Option<ActiveNamespaceBinding>> {
         let key = codex_home_key(codex_home.as_ref())?;
         let connection = self.connection()?;
@@ -520,6 +644,76 @@ mod tests {
             namespace
         );
         assert!(store.active(&second_home).unwrap().is_none());
+    }
+
+    #[test]
+    fn checkout_reconciliation_is_atomic_idempotent_and_conflict_safe() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let store = TrackingStore::open(temp.path()).unwrap();
+        let old_head = format!("sha256:{}", "a".repeat(64));
+        let target_head = format!("sha256:{}", "b".repeat(64));
+        let conflicting_head = format!("sha256:{}", "c".repeat(64));
+        let previous = store
+            .compare_and_set(&codex_home, remote_id, namespace_id, None, Some(&old_head))
+            .unwrap();
+
+        let applied = store
+            .reconcile_checkout(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                Some(previous.generation),
+                Some(&target_head),
+                true,
+            )
+            .unwrap();
+        assert_eq!(applied.generation, previous.generation + 1);
+        let active = store.active(&codex_home).unwrap().unwrap();
+        assert_eq!(
+            (active.remote_id, active.namespace_id),
+            (remote_id, namespace_id)
+        );
+
+        let retried = store
+            .reconcile_checkout(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                Some(previous.generation),
+                Some(&target_head),
+                true,
+            )
+            .unwrap();
+        assert_eq!(retried, applied);
+
+        assert!(
+            store
+                .reconcile_checkout(
+                    &codex_home,
+                    remote_id,
+                    namespace_id,
+                    Some(previous.generation),
+                    Some(&conflicting_head),
+                    true,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load(&codex_home, remote_id, namespace_id)
+                .unwrap()
+                .unwrap(),
+            applied
+        );
+        let active = store.active(&codex_home).unwrap().unwrap();
+        assert_eq!(
+            (active.remote_id, active.namespace_id),
+            (remote_id, namespace_id)
+        );
     }
 
     #[test]

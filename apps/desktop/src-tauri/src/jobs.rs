@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -34,6 +35,7 @@ pub struct JobSnapshot {
 #[derive(Clone)]
 pub struct JobManager {
     jobs: Arc<Mutex<HashMap<String, JobEntry>>>,
+    active_codex_homes: Arc<Mutex<HashSet<String>>>,
 }
 
 struct JobEntry {
@@ -42,15 +44,70 @@ struct JobEntry {
     result: Option<Value>,
 }
 
+#[derive(Debug)]
+pub(crate) struct CodexHomeWriteLease {
+    key: String,
+    active_codex_homes: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for CodexHomeWriteLease {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active_codex_homes.lock() {
+            active.remove(&self.key);
+        }
+    }
+}
+
 impl Default for JobManager {
     fn default() -> Self {
         Self {
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            active_codex_homes: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
 
 impl JobManager {
+    pub(crate) fn try_acquire_codex_home(
+        &self,
+        codex_home: &Path,
+    ) -> Result<CodexHomeWriteLease, String> {
+        let key = normalized_codex_home(codex_home)?;
+        let mut active = self
+            .active_codex_homes
+            .lock()
+            .map_err(|_| "Codex Home write-lock registry is unavailable".to_string())?;
+        if !active.insert(key.clone()) {
+            return Err(format!(
+                "Codex Home {} already has an active write operation",
+                codex_home.display()
+            ));
+        }
+        drop(active);
+        Ok(CodexHomeWriteLease {
+            key,
+            active_codex_homes: self.active_codex_homes.clone(),
+        })
+    }
+
+    pub(crate) fn start_exclusive<R, F>(
+        &self,
+        codex_home: &Path,
+        kind: impl Into<String>,
+        cancellable: bool,
+        operation: F,
+    ) -> Result<JobSnapshot, String>
+    where
+        R: Serialize + Send + 'static,
+        F: FnOnce(OperationControl) -> anyhow::Result<R> + Send + 'static,
+    {
+        let lease = self.try_acquire_codex_home(codex_home)?;
+        Ok(self.start(kind, cancellable, move |control| {
+            let _lease = lease;
+            operation(control)
+        }))
+    }
+
     pub fn start<R, F>(
         &self,
         kind: impl Into<String>,
@@ -91,6 +148,7 @@ impl JobManager {
                 .expect("job manager lock poisoned")
                 .get_mut(&reporter_job_id)
             {
+                entry.snapshot.cancellable = progress.cancellable;
                 entry.snapshot.progress = progress;
             }
         });
@@ -179,5 +237,52 @@ impl JobManager {
             .expect("existing job disappeared")
             .result
             .ok_or_else(|| "任务结果已领取".to_string())
+    }
+}
+
+fn normalized_codex_home(path: &Path) -> Result<String, String> {
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|error| format!("failed to normalize Codex Home {}: {error}", path.display()))?;
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn normalized_codex_home_write_leases_are_exclusive_and_release_on_drop() {
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let equivalent_home = home.join(".");
+        let jobs = JobManager::default();
+
+        let first = jobs.try_acquire_codex_home(&home).unwrap();
+        let error = jobs.try_acquire_codex_home(&equivalent_home).unwrap_err();
+        assert!(error.contains("already has an active write operation"));
+
+        drop(first);
+        assert!(jobs.try_acquire_codex_home(&equivalent_home).is_ok());
+    }
+
+    #[test]
+    fn different_codex_homes_can_hold_write_leases_concurrently() {
+        let directory = tempdir().unwrap();
+        let first_home = directory.path().join("first-home");
+        let second_home = directory.path().join("second-home");
+        std::fs::create_dir_all(&first_home).unwrap();
+        std::fs::create_dir_all(&second_home).unwrap();
+        let jobs = JobManager::default();
+
+        let first = jobs.try_acquire_codex_home(&first_home).unwrap();
+        let second = jobs.try_acquire_codex_home(&second_home).unwrap();
+
+        drop((first, second));
     }
 }

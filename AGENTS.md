@@ -61,6 +61,17 @@ Codex SQLite files.
 - Treat server objects and revisions as immutable and SHA-256 verified.
 - Use atomic filesystem replacement where possible; bridge filesystem and
   SQLite operations with a recoverable operation journal.
+- Serialize every operation that can write or snapshot a normalized Codex Home
+  through the desktop backend's per-home lease. The React busy state is not a
+  synchronization boundary.
+- Keep remote bearer tokens in the operating system credential backend. Remote
+  profile JSON may contain the server URL and display metadata, but never the
+  token itself.
+- Treat `codex-dev.db` as a machine-local catalog: invalidate only rebuildable
+  local catalog state after exact checkout. Preserve remote-host rows,
+  automations, inbox data, feature state, and `thread_timeline_ledger`.
+- `thread_timeline_ledger` is deliberately preserved but is not part of the
+  synchronized semantic thread model in the current version.
 - Prefer read-only inspection before any destructive or mutating action.
 - Add unit tests for data parsing, hash validation, merge decisions, and
   unsupported-data handling before wiring UI behavior.
@@ -73,6 +84,7 @@ Codex SQLite files.
 cargo fmt --all -- --check
 cargo test --workspace
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 For the Tauri UI (once initialized):
@@ -83,11 +95,18 @@ npm run check
 npm run build
 ```
 
+The native credential smoke test is ignored by default because it briefly
+creates a uniquely named operating-system credential and then deletes it:
+
+```powershell
+cargo test -p codex-session-sync-desktop --lib remote_config::tests::system_credential_store_round_trip_uses_native_backend_and_cleans_up -- --ignored --exact
+```
+
 ## Current Status
 
-Phase 3A (trusted server foundation) is complete. Phase 3B is in progress: the
-HTTP transport and GUI are not wired yet, but the client-side tracking, merge,
-and exact-checkout foundation is implemented.
+Phase 3B (desktop remote synchronization) is complete. The authenticated HTTP
+transport, native credential storage, Push/Pull/exact namespace checkout
+orchestration, durable Tracking reconciliation, and remote-sync GUI are wired.
 
 Implemented:
 
@@ -147,6 +166,19 @@ Implemented:
   orphan revisions, and server restart persistence.
 - Client tracking SQLite keyed by Codex home, remote, and namespace, with
   generation compare-and-swap and a separate active-namespace binding.
+- Authenticated desktop HTTP client with redirect rejection, bounded JSON and
+  error responses, streamed object transfer, and download length/hash
+  verification before immutable installation.
+- Remote profiles stored as token-free JSON and bearer tokens stored through
+  native Windows Credential Manager, macOS Keychain, or persistent Linux
+  keyring backends. An ignored native-backend smoke test verifies round-trip
+  storage and cleanup.
+- GUI workflows for remote profile creation/verification, namespace creation,
+  selection and rename, plus Push, Pull, and exact namespace switching.
+- Tauri backend leases keyed by normalized Codex Home cover direct and job
+  snapshot, import, recovery, Push, Pull, and namespace-switch entry points.
+  Concurrent writes to one home are rejected while different homes can run in
+  parallel; RAII release covers completion, failure, and cancellation.
 - Pure three-way thread-set planning that merges independent UUID changes and
   reports modify/modify and delete/modify conflicts without writing.
 - Snapshot/Revision conversion with machine-local database paths removed from
@@ -157,9 +189,27 @@ Implemented:
 - Exact local checkout with staged rollout directories, online backups of all
   affected thread databases, same-filesystem directory swaps, post-apply
   validation, durable journals, rollback, and restart recovery.
+- Checkout journals persist the intended remote, namespace, expected Tracking
+  generation, and target revision. After local apply, Tracking CAS and the
+  active-namespace binding commit in one SQLite transaction before the journal
+  becomes complete. Another checkout using the same repository and Home is
+  blocked while a non-terminal journal exists. Restart recovery may restore a
+  pre-apply state, but a `LocalApplied` journal is never automatically rolled
+  back: it completes only when the live semantic hashes match and Tracking
+  reconciles; otherwise recovery preserves both live data and Tracking and
+  reports explicit action.
+- Push atomically updates Tracking and the active namespace after a successful
+  commit. If the server commit outlives the client process, a retry accepts only
+  semantically identical remote thread content before repairing local Tracking.
+- Exact checkout also backs up `codex-dev.db`, removes only the rebuildable
+  local-host thread catalog rows, resets its full-scan watermark, and increments
+  its catalog revision. Remote-host catalogs and non-rebuildable tables,
+  including `thread_timeline_ledger`, remain local and untouched.
 - Discovery and round-trip preservation of direct SQLite child records whose
   foreign keys reference `threads`.
 - Frontend type-check, production build, and browser visual verification.
+- Real loopback HTTP integration coverage, including an A Push → B checkout →
+  B Push → A Pull merge flow across two temporary Codex homes.
 - Original cross-platform app icon and generated Tauri platform icon set.
 - Rust formatting, Clippy with warnings denied, full workspace tests, Tauri
   backend check, frontend type-check/build, server health smoke test, and a
@@ -180,12 +230,12 @@ Latest real-data read-only scan:
 - 2 discovered thread databases.
 - 1 skipped zero-byte rollout warning.
 
-All server tests use temporary data directories, and Phase 2 automated local
-write tests use temporary Codex homes. The current machine's real Codex data
-has not been modified by development or verification.
+All server tests use temporary data directories, and all automated local-write
+and remote-sync tests use temporary Codex homes. The current machine's real
+Codex data has not been modified by development or verification.
 
-Next Phase 3B increment: desktop-side authenticated HTTP transport,
-credential-store integration, fast-forward push/pull orchestration, and the
-remote-sync GUI. Reuse the exact-checkout path, keep Codex-closed checks around
-all local writes, and do not add force-push or automatic same-thread conflict
-resolution.
+Next phase: expose the existing three-way conflict model in the GUI and add
+explicit user resolution for divergent changes to the same thread UUID. After
+that, add optional API-key/provider/path mappings and namespace-selection
+automation. Keep fingerprints local/HMAC-derived, retain manual overrides, and
+do not add force-push or silent same-thread conflict resolution.

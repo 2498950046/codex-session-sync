@@ -14,6 +14,14 @@ pub const REVISION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ProtocolInfoResponse {
+    pub service: String,
+    pub version: String,
+    pub protocol_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Namespace {
     pub id: Uuid,
     pub display_name: String,
@@ -64,6 +72,14 @@ pub struct MissingObjectsRequest {
 #[serde(rename_all = "camelCase")]
 pub struct MissingObjectsResponse {
     pub missing: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PutObjectResponse {
+    pub sha256: String,
+    pub byte_length: u64,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
