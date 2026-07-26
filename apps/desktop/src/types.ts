@@ -95,6 +95,7 @@ export type RemoteProfile = {
   displayName: string;
   serverUrl: string;
   selectedNamespaceId: string | null;
+  automaticNamespaceSelection: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -133,6 +134,45 @@ export type RemoteNamespaceStatus = {
   integratedHead: string | null;
   remoteHead: string | null;
   generation: number | null;
+};
+
+export type ApiKeySource = "transient_input" | "provider_environment" | "auth_json";
+
+export type LocalIdentitySummary = {
+  codexHomeKey: string;
+  provider: string | null;
+  apiKeyAvailable: boolean;
+  apiKeyFingerprintHint: string | null;
+  apiKeySource: ApiKeySource | null;
+  warnings: string[];
+};
+
+export type NamespaceMappingSummary = {
+  id: string;
+  remoteId: string;
+  namespaceId: string;
+  label: string;
+  matchesApiKey: boolean;
+  apiKeyFingerprintHint: string | null;
+  provider: string | null;
+  codexHomeKey: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type NamespaceSelectionSource = "manual_override" | "mapping" | "profile_default" | "ambiguous" | "none";
+
+export type NamespaceMappingState = {
+  remoteId: string;
+  automaticEnabled: boolean;
+  context: LocalIdentitySummary;
+  mappings: NamespaceMappingSummary[];
+  selection: {
+    selectedNamespaceId: string | null;
+    source: NamespaceSelectionSource;
+    matchedMappingId: string | null;
+    ambiguousMappingIds: string[];
+  };
 };
 
 export type ThreadConflictVersion = {

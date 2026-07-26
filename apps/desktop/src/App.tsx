@@ -4,6 +4,7 @@ import type {
   CodexProcess,
   ImportReport,
   JobSnapshot,
+  NamespaceMappingState,
   OperationJournal,
   RemoteConnectionStatus,
   RemoteNamespace,
@@ -54,6 +55,21 @@ function ConflictVersionDetails({ version }: { version: ThreadConflictVersion | 
   </>;
 }
 
+function selectionSourceLabel(source: NamespaceMappingState["selection"]["source"]): string {
+  if (source === "mapping") return "自动映射";
+  if (source === "manual_override") return "手动覆盖";
+  if (source === "profile_default") return "默认选择";
+  if (source === "ambiguous") return "映射冲突";
+  return "未选择";
+}
+
+function apiKeySourceLabel(source: NamespaceMappingState["context"]["apiKeySource"]): string {
+  if (source === "provider_environment") return "provider 环境变量";
+  if (source === "auth_json") return "auth.json";
+  if (source === "transient_input") return "临时输入";
+  return "未检测到";
+}
+
 export default function App() {
   const isTauriRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const [codexHome, setCodexHome] = useState("");
@@ -84,6 +100,11 @@ export default function App() {
   const [selectedNamespaceId, setSelectedNamespaceId] = useState("");
   const [namespaceName, setNamespaceName] = useState("");
   const [namespaceStatus, setNamespaceStatus] = useState<RemoteNamespaceStatus | null>(null);
+  const [mappingState, setMappingState] = useState<NamespaceMappingState | null>(null);
+  const [mappingLabel, setMappingLabel] = useState("");
+  const [matchApiKey, setMatchApiKey] = useState(true);
+  const [matchProvider, setMatchProvider] = useState(false);
+  const [matchCodexHome, setMatchCodexHome] = useState(false);
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [remoteLoading, setRemoteLoading] = useState(false);
 
@@ -92,6 +113,11 @@ export default function App() {
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
   const selectedProfile = profiles.find((profile) => profile.id === selectedRemoteId) ?? null;
   const selectedNamespace = namespaces.find((namespace) => namespace.id === selectedNamespaceId) ?? null;
+  const mappingCriteriaValid = Boolean(
+    (matchApiKey && mappingState?.context.apiKeyAvailable)
+    || (matchProvider && mappingState?.context.provider)
+    || matchCodexHome,
+  );
   const replaceTargetKey = codexHome.trim() && selectedRemoteId && selectedNamespaceId
     ? JSON.stringify([codexHome.trim(), selectedRemoteId, selectedNamespaceId])
     : null;
@@ -132,27 +158,71 @@ export default function App() {
     if (next && loaded.some((profile) => profile.id === next)) setSelectedRemoteId(next);
   }
 
+  function applyMappingSelection(state: NamespaceMappingState, available: RemoteNamespace[]) {
+    const selected = state.selection.selectedNamespaceId;
+    if (selected && available.some((namespace) => namespace.id === selected)) {
+      setSelectedNamespaceId(selected);
+      return;
+    }
+    if (selected) {
+      setSelectedNamespaceId("");
+      setNamespaceStatus(null);
+      setError("当前自动选择目标对应的命名空间已不存在，请删除规则或恢复自动选择。");
+      return;
+    }
+    if (state.automaticEnabled) {
+      setSelectedNamespaceId("");
+      setNamespaceStatus(null);
+      return;
+    }
+    setSelectedNamespaceId(available[0]?.id ?? "");
+  }
+
   async function refreshNamespaces(remoteId = selectedRemoteId) {
-    if (!remoteId || !isTauriRuntime) return;
+    if (!remoteId || !isTauriRuntime || !codexHome.trim()) return;
     setRemoteLoading(true);
     try {
-      const loaded = await invoke<RemoteNamespace[]>("list_remote_namespaces", {
-        repositoryRoot: repositoryRoot.trim(),
-        remoteId,
-      });
+      const [loaded, mappings] = await Promise.all([
+        invoke<RemoteNamespace[]>("list_remote_namespaces", {
+          repositoryRoot: repositoryRoot.trim(),
+          remoteId,
+        }),
+        invoke<NamespaceMappingState>("get_namespace_mapping_state", {
+          repositoryRoot: repositoryRoot.trim(),
+          codexHome: codexHome.trim(),
+          remoteId,
+        }),
+      ]);
       setNamespaces(loaded);
-      const profile = profiles.find((candidate) => candidate.id === remoteId);
-      const preferred = profile?.selectedNamespaceId;
-      const next = preferred && loaded.some((namespace) => namespace.id === preferred)
-        ? preferred
-        : loaded[0]?.id ?? "";
-      setSelectedNamespaceId(next);
-      if (!next) setNamespaceStatus(null);
+      setMappingState(mappings);
+      applyMappingSelection(mappings, loaded);
+      if (mappings.mappings.length === 0) {
+        setMatchApiKey(mappings.context.apiKeyAvailable);
+        setMatchCodexHome(!mappings.context.apiKeyAvailable);
+      }
+      if (!mappings.selection.selectedNamespaceId && mappings.automaticEnabled) {
+        setNamespaceStatus(null);
+      }
     } catch (reason) {
       setError(String(reason));
     } finally {
       setRemoteLoading(false);
     }
+  }
+
+  async function refreshMappingState(
+    remoteId = selectedRemoteId,
+    availableNamespaces = namespaces,
+  ) {
+    if (!remoteId || !isTauriRuntime || !codexHome.trim()) return null;
+    const state = await invoke<NamespaceMappingState>("get_namespace_mapping_state", {
+      repositoryRoot: repositoryRoot.trim(),
+      codexHome: codexHome.trim(),
+      remoteId,
+    });
+    setMappingState(state);
+    applyMappingSelection(state, availableNamespaces);
+    return state;
   }
 
   async function refreshNamespaceStatus(namespaceId = selectedNamespaceId) {
@@ -192,6 +262,7 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedProfile) return;
+    setMappingState(null);
     setRemoteName(selectedProfile.displayName);
     setRemoteUrl(selectedProfile.serverUrl);
     setRemoteToken("");
@@ -203,8 +274,19 @@ export default function App() {
     if (!selectedNamespaceId) return;
     const namespace = namespaces.find((candidate) => candidate.id === selectedNamespaceId);
     setNamespaceName(namespace?.displayName ?? "");
+    setMappingLabel((current) => current || `${namespace?.displayName ?? "命名空间"} 自动映射`);
     void refreshNamespaceStatus(selectedNamespaceId);
   }, [selectedNamespaceId, codexHome]);
+
+  useEffect(() => {
+    if (!selectedRemoteId || !codexHome.trim() || !isTauriRuntime) return;
+    void refreshMappingState().catch((reason) => setError(String(reason)));
+  }, [codexHome]);
+
+  useEffect(() => {
+    if (!mappingState?.context.apiKeyAvailable) setMatchApiKey(false);
+    if (!mappingState?.context.provider) setMatchProvider(false);
+  }, [mappingState?.context.apiKeyAvailable, mappingState?.context.provider]);
 
   useEffect(() => {
     setConfirmedReplaceTarget(null);
@@ -331,6 +413,7 @@ export default function App() {
       setNamespaces(result.namespaces);
       await refreshProfiles(result.profile.id);
       setSelectedRemoteId(result.profile.id);
+      await refreshMappingState(result.profile.id, result.namespaces);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -349,6 +432,7 @@ export default function App() {
       });
       setConnectionMessage(`连接正常 · ${result.namespaces.length} 个命名空间 · 协议 v${result.protocol.protocolVersion}`);
       setNamespaces(result.namespaces);
+      await refreshMappingState(selectedRemoteId, result.namespaces);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -365,8 +449,9 @@ export default function App() {
         remoteId: selectedRemoteId,
         displayName: namespaceName.trim(),
       });
-      await refreshNamespaces();
-      await chooseNamespace(created.id);
+      const available = [...namespaces.filter((namespace) => namespace.id !== created.id), created];
+      setNamespaces(available);
+      await chooseNamespace(created.id, available);
     } catch (reason) {
       setError(String(reason));
     } finally {
@@ -392,19 +477,111 @@ export default function App() {
     }
   }
 
-  async function chooseNamespace(namespaceId: string) {
+  async function chooseNamespace(
+    namespaceId: string,
+    availableNamespaces = namespaces,
+  ) {
     if (!selectedRemoteId) return;
     setSelectedNamespaceId(namespaceId);
     try {
       await invoke("select_remote_namespace", {
         repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
         remoteId: selectedRemoteId,
         namespaceId,
       });
       await refreshProfiles(selectedRemoteId);
+      await refreshMappingState(selectedRemoteId, availableNamespaces);
       await refreshNamespaceStatus(namespaceId);
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function setAutomaticSelection(enabled: boolean) {
+    if (!selectedRemoteId) return;
+    setRemoteLoading(true);
+    setError(null);
+    try {
+      const state = await invoke<NamespaceMappingState>("set_automatic_namespace_selection", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        enabled,
+      });
+      setMappingState(state);
+      applyMappingSelection(state, namespaces);
+      await refreshProfiles(selectedRemoteId);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
+
+  async function createMapping() {
+    if (!selectedRemoteId || !selectedNamespaceId || !mappingLabel.trim()) return;
+    setRemoteLoading(true);
+    setError(null);
+    try {
+      const state = await invoke<NamespaceMappingState>("create_namespace_mapping", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        request: {
+          remoteId: selectedRemoteId,
+          namespaceId: selectedNamespaceId,
+          label: mappingLabel.trim(),
+          matchApiKey,
+          matchProvider,
+          matchCodexHome,
+        },
+      });
+      setMappingState(state);
+      applyMappingSelection(state, namespaces);
+      setMappingLabel("");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
+
+  async function deleteMapping(mappingId: string) {
+    if (!selectedRemoteId) return;
+    setRemoteLoading(true);
+    setError(null);
+    try {
+      const state = await invoke<NamespaceMappingState>("delete_namespace_mapping", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        mappingId,
+      });
+      setMappingState(state);
+      applyMappingSelection(state, namespaces);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
+
+  async function clearManualOverride() {
+    if (!selectedRemoteId) return;
+    setRemoteLoading(true);
+    setError(null);
+    try {
+      const state = await invoke<NamespaceMappingState>("clear_manual_namespace_override", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+      });
+      setMappingState(state);
+      applyMappingSelection(state, namespaces);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
     }
   }
 
@@ -420,7 +597,7 @@ export default function App() {
     <main className="app-shell">
       <header className="hero">
         <div>
-          <span className="eyebrow">PHASE 4 · CONFLICT RESOLUTION</span>
+          <span className="eyebrow">PHASE 6 · NAMESPACE MAPPINGS</span>
           <h1>Codex Session Sync</h1>
           <p>通过自托管服务器在命名空间之间安全推送、拉取和 checkout Codex 会话。</p>
         </div>
@@ -449,7 +626,7 @@ export default function App() {
         <div className="section-heading"><div><h2>远端服务器</h2><p>Token 仅保存到操作系统凭据库，前端不会读回明文。</p></div><span>{remoteLoading ? "连接中…" : `${profiles.length} 个配置`}</span></div>
         <div className="profile-tabs">
           {profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : "secondary-button"} onClick={() => setSelectedRemoteId(profile.id)} disabled={busy}>{profile.displayName}</button>)}
-          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); }} disabled={busy}>＋ 新建远端</button>
+          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); setMappingState(null); }} disabled={busy}>＋ 新建远端</button>
         </div>
         <div className="remote-form">
           <div className="field"><label htmlFor="remote-name">配置名称</label><input id="remote-name" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div>
@@ -475,6 +652,30 @@ export default function App() {
           <div className="field"><label htmlFor="namespace-name">命名空间名称</label><input id="namespace-name" value={namespaceName} onChange={(event) => setNamespaceName(event.target.value)} /></div>
           <div className="action-row compact-actions"><button onClick={() => void createNamespace()} disabled={busy || !namespaceName.trim()}>创建</button><button className="secondary-button" onClick={() => void renameNamespace()} disabled={busy || !selectedNamespaceId || !namespaceName.trim()}>重命名选中项</button></div>
         </div>
+
+        {mappingState && <div className="mapping-console">
+          <div className="mapping-heading"><div><h3>自动命名空间映射</h3><p>规则和 HMAC 指纹只保存在本机；自动匹配仅选择目标，不会自动 checkout。</p></div><label className="toggle-row"><input type="checkbox" checked={mappingState.automaticEnabled} onChange={(event) => void setAutomaticSelection(event.target.checked)} disabled={busy} /><span>{mappingState.automaticEnabled ? "已启用" : "已关闭"}</span></label></div>
+          <div className="identity-grid">
+            <article><span>当前 Provider</span><strong>{mappingState.context.provider ?? "未检测到"}</strong><small>来自 config.toml</small></article>
+            <article><span>API Key 指纹</span><strong>{mappingState.context.apiKeyFingerprintHint ?? "不可用"}</strong><small>{apiKeySourceLabel(mappingState.context.apiKeySource)} · 不返回原始 Key</small></article>
+            <article><span>Codex Home</span><strong>{mappingState.context.codexHomeKey}</strong><small>规范化精确匹配</small></article>
+          </div>
+          <div className={`mapping-resolution ${mappingState.selection.source === "ambiguous" ? "mapping-ambiguous" : ""}`}><div><span>当前选择来源</span><strong>{selectionSourceLabel(mappingState.selection.source)}</strong><small>{mappingState.selection.selectedNamespaceId ? namespaces.find((namespace) => namespace.id === mappingState.selection.selectedNamespaceId)?.displayName ?? mappingState.selection.selectedNamespaceId : mappingState.selection.source === "ambiguous" ? `${mappingState.selection.ambiguousMappingIds.length} 条同优先级规则指向不同命名空间` : "没有可用目标"}</small></div>{mappingState.selection.source === "manual_override" && <button className="secondary-button" onClick={() => void clearManualOverride()} disabled={busy}>恢复自动选择</button>}</div>
+          {mappingState.context.warnings.length > 0 && <div className="mapping-warnings">{mappingState.context.warnings.map((warning, index) => <span key={`${warning}-${index}`}>{warning}</span>)}</div>}
+          <div className="mapping-builder">
+            <div className="field"><label htmlFor="mapping-label">规则名称</label><input id="mapping-label" value={mappingLabel} onChange={(event) => setMappingLabel(event.target.value)} placeholder="例如：工作账号" /></div>
+            <div className="mapping-criteria">
+              <label><input type="checkbox" checked={matchApiKey} onChange={(event) => setMatchApiKey(event.target.checked)} disabled={busy || !mappingState.context.apiKeyAvailable} /><span>API Key {mappingState.context.apiKeyAvailable ? `· ${mappingState.context.apiKeyFingerprintHint}` : "· 当前不可检测"}</span></label>
+              <label><input type="checkbox" checked={matchProvider} onChange={(event) => setMatchProvider(event.target.checked)} disabled={busy || !mappingState.context.provider} /><span>Provider {mappingState.context.provider ? `· ${mappingState.context.provider}` : "· 当前不可检测"}</span></label>
+              <label><input type="checkbox" checked={matchCodexHome} onChange={(event) => setMatchCodexHome(event.target.checked)} disabled={busy} /><span>Codex Home</span></label>
+            </div>
+            <button onClick={() => void createMapping()} disabled={busy || !selectedNamespace || !mappingLabel.trim() || !mappingCriteriaValid}>映射到{selectedNamespace ? `“${selectedNamespace.displayName}”` : "选中的命名空间"}</button>
+          </div>
+          <div className="mapping-list">{mappingState.mappings.map((mapping) => {
+            const target = namespaces.find((namespace) => namespace.id === mapping.namespaceId);
+            return <article className="mapping-card" key={mapping.id}><div><strong>{mapping.label}</strong><span>→ {target?.displayName ?? mapping.namespaceId}</span></div><div className="mapping-tags">{mapping.matchesApiKey && <code>KEY {mapping.apiKeyFingerprintHint}</code>}{mapping.provider && <code>PROVIDER {mapping.provider}</code>}{mapping.codexHomeKey && <code>HOME {mapping.codexHomeKey}</code>}</div><button className="danger-button" onClick={() => void deleteMapping(mapping.id)} disabled={busy}>删除</button></article>;
+          })}{mappingState.mappings.length === 0 && <p className="muted-copy">还没有本机映射规则。至少选择一个匹配条件后创建。</p>}</div>
+        </div>}
 
         {selectedNamespace && namespaceStatus && <div className="sync-console">
           <div className="sync-status-grid">

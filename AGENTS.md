@@ -104,10 +104,11 @@ cargo test -p codex-session-sync-desktop --lib remote_config::tests::system_cred
 
 ## Current Status
 
-Phase 4 (three-way conflict resolution) is complete. The authenticated HTTP
-transport, native credential storage, Push/Pull/exact namespace checkout,
-durable Tracking reconciliation, same-thread conflict workbench, and explicit
-resolution orchestration are wired.
+Phase 6 (local identity mappings and automatic namespace selection) is
+complete. The authenticated HTTP transport, native credential storage,
+Push/Pull/exact namespace checkout, durable Tracking reconciliation,
+same-thread conflict workbench, explicit resolution orchestration, and local
+API-key/provider/Codex-Home mapping workflow are wired.
 
 Implemented:
 
@@ -174,6 +175,22 @@ Implemented:
   native Windows Credential Manager, macOS Keychain, or persistent Linux
   keyring backends. An ignored native-backend smoke test verifies round-trip
   storage and cleanup.
+- Local identity detection for `config.toml` model providers and provider
+  `env_key` values plus the explicit `OPENAI_API_KEY`/`api_key` fields in
+  `auth.json`. Malformed or unavailable optional inputs produce structured GUI
+  warnings instead of exposing secret content.
+- API-key identities persisted only as local HMAC-SHA256 fingerprints bound to
+  the normalized synchronization-server URL. Raw API keys are never saved,
+  returned across IPC, or uploaded.
+- Per-remote namespace mapping rules that may combine API-key, provider, and
+  normalized Codex-Home conditions. Matching uses deterministic 4/2/1 weights
+  and fails closed on equal-priority rules targeting different namespaces.
+- Optional automatic target selection with per-remote/per-Home manual
+  overrides. Automatic selection changes the GUI target only and never starts
+  checkout or another local write.
+- Backward-compatible remote-profile loading, bounded local mapping-config
+  parsing, and command-level tests covering automatic matches, manual
+  overrides, override clearing, disabled fallback, and re-enabling.
 - GUI workflows for remote profile creation/verification, namespace creation,
   selection and rename, plus Push, Pull, and exact namespace switching.
 - Tauri backend leases keyed by normalized Codex Home cover direct and job
@@ -231,6 +248,9 @@ Implemented:
   the resolved version back to A.
 - A Vite-development-only `?preview=conflict` IPC mock for repeatable browser
   visual and interaction QA; production builds exclude the preview module.
+- A Vite-development-only `?preview=mapping` IPC mock covering automatic
+  selection toggling, manual override restoration, and mapping deletion, with
+  desktop and narrow-screen browser verification.
 - Original cross-platform app icon and generated Tauri platform icon set.
 - Rust formatting, Clippy with warnings denied, full workspace tests, Tauri
   backend check, frontend type-check/build, server health smoke test, and a
@@ -255,7 +275,5 @@ All server tests use temporary data directories, and all automated local-write
 and remote-sync tests use temporary Codex homes. The current machine's real
 Codex data has not been modified by development or verification.
 
-Next phase: add optional API-key/provider/path mappings and namespace-selection
-automation. Keep API-key fingerprints local and HMAC-derived, retain manual
-namespace overrides, and never upload raw API keys. After that, complete
-cross-platform packaging and the Windows/macOS/Linux compatibility matrix.
+Next phase: complete cross-platform packaging and the Windows/macOS/Linux
+compatibility matrix. Do not begin it as part of Phase 6 cleanup or verification.

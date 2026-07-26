@@ -20,6 +20,8 @@ pub struct RemoteProfile {
     pub display_name: String,
     pub server_url: String,
     pub selected_namespace_id: Option<Uuid>,
+    #[serde(default)]
+    pub automatic_namespace_selection: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -119,6 +121,7 @@ impl RemoteProfileStore {
                 display_name: display_name.to_string(),
                 server_url,
                 selected_namespace_id: None,
+                automatic_namespace_selection: false,
                 created_at: now.clone(),
                 updated_at: now,
             };
@@ -140,6 +143,24 @@ impl RemoteProfileStore {
             .find(|profile| profile.id == remote_id)
             .with_context(|| format!("remote profile {remote_id} was not found"))?;
         profile.selected_namespace_id = Some(namespace_id);
+        profile.updated_at = Utc::now().to_rfc3339();
+        let profile = profile.clone();
+        self.save(&config)?;
+        Ok(profile)
+    }
+
+    pub fn set_automatic_namespace_selection(
+        &self,
+        remote_id: Uuid,
+        enabled: bool,
+    ) -> Result<RemoteProfile> {
+        let mut config = self.load()?;
+        let profile = config
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == remote_id)
+            .with_context(|| format!("remote profile {remote_id} was not found"))?;
+        profile.automatic_namespace_selection = enabled;
         profile.updated_at = Utc::now().to_rfc3339();
         let profile = profile.clone();
         self.save(&config)?;
@@ -371,7 +392,43 @@ mod tests {
             profiles[0].profile.selected_namespace_id,
             Some(namespace_id)
         );
+        assert!(!profiles[0].profile.automatic_namespace_selection);
+        store
+            .set_automatic_namespace_selection(profile.id, true)
+            .unwrap();
+        assert!(store.get(profile.id).unwrap().automatic_namespace_selection);
         let raw = fs::read_to_string(temp.path().join("config/remotes-v1.json")).unwrap();
         assert!(!raw.contains(token.expose()));
+    }
+
+    #[test]
+    fn profiles_created_before_automatic_selection_load_with_it_disabled() {
+        let temp = tempdir().unwrap();
+        let remote_id = Uuid::now_v7();
+        let created_at = "2026-07-27T00:00:00Z";
+        let path = temp.path().join("config/remotes-v1.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": REMOTE_CONFIG_SCHEMA_VERSION,
+                "profiles": [{
+                    "id": remote_id,
+                    "displayName": "Legacy remote",
+                    "serverUrl": "https://example.test/",
+                    "selectedNamespaceId": null,
+                    "createdAt": created_at,
+                    "updatedAt": created_at
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = RemoteProfileStore::new(temp.path());
+        let profile = store.get(remote_id).unwrap();
+
+        assert!(!profile.automatic_namespace_selection);
+        assert_eq!(profile.display_name, "Legacy remote");
     }
 }

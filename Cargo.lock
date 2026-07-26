@@ -569,6 +569,7 @@ dependencies = [
  "axum",
  "chrono",
  "hex",
+ "hmac",
  "keyring",
  "reqwest 0.12.28",
  "rusqlite",
@@ -581,6 +582,7 @@ dependencies = [
  "tauri-build",
  "tempfile",
  "tokio",
+ "toml 0.8.2",
  "url",
  "uuid",
 ]

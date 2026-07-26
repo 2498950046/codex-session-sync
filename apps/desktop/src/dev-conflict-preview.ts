@@ -1,8 +1,9 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { JobSnapshot, ScanReport, SyncReport } from "./types";
+import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport } from "./types";
 
 const remoteId = "019fa1a0-1111-7111-8111-111111111111";
 const namespaceId = "019fa1a0-2222-7222-8222-222222222222";
+const workNamespaceId = "019fa1a0-4444-7444-8444-444444444444";
 const remoteHead = `sha256:${"c".repeat(64)}`;
 const baseHash = `sha256:${"a".repeat(64)}`;
 const localHash = `sha256:${"b".repeat(64)}`;
@@ -79,7 +80,79 @@ const scanReport: ScanReport = {
   warnings: [],
 };
 
-export async function installConflictPreview() {
+const namespaceMappingState: NamespaceMappingState = {
+  remoteId,
+  automaticEnabled: true,
+  context: {
+    codexHomeKey: "c:/users/demo/.codex",
+    provider: "openai",
+    apiKeyAvailable: true,
+    apiKeyFingerprintHint: "5a91d4c2e731",
+    apiKeySource: "auth_json",
+    warnings: [],
+  },
+  mappings: [{
+    id: "019fa1a0-3333-7333-8333-333333333333",
+    remoteId,
+    namespaceId: workNamespaceId,
+    label: "工作账号",
+    matchesApiKey: true,
+    apiKeyFingerprintHint: "5a91d4c2e731",
+    provider: "openai",
+    codexHomeKey: null,
+    createdAt: "2026-07-27T00:00:00Z",
+    updatedAt: "2026-07-27T00:00:00Z",
+  }],
+  selection: {
+    selectedNamespaceId: workNamespaceId,
+    source: "mapping",
+    matchedMappingId: "019fa1a0-3333-7333-8333-333333333333",
+    ambiguousMappingIds: [],
+  },
+};
+
+export async function installDevelopmentPreview(_preview: "conflict" | "mapping") {
+  let automaticEnabled = true;
+  let selectedProfileNamespaceId = namespaceId;
+  let manualOverrideNamespaceId: string | null = null;
+  let mappings = [...namespaceMappingState.mappings];
+
+  function currentMappingState(): NamespaceMappingState {
+    const mappedNamespaceId = mappings[0]?.namespaceId ?? null;
+    return {
+      ...namespaceMappingState,
+      automaticEnabled,
+      mappings,
+      selection: automaticEnabled
+        ? manualOverrideNamespaceId
+          ? {
+              selectedNamespaceId: manualOverrideNamespaceId,
+              source: "manual_override",
+              matchedMappingId: null,
+              ambiguousMappingIds: [],
+            }
+          : mappedNamespaceId
+            ? {
+                selectedNamespaceId: mappedNamespaceId,
+                source: "mapping",
+                matchedMappingId: mappings[0].id,
+                ambiguousMappingIds: [],
+              }
+            : {
+                selectedNamespaceId: selectedProfileNamespaceId,
+                source: "profile_default",
+                matchedMappingId: null,
+                ambiguousMappingIds: [],
+              }
+        : {
+            selectedNamespaceId: selectedProfileNamespaceId,
+            source: "profile_default",
+            matchedMappingId: null,
+            ambiguousMappingIds: [],
+          },
+    };
+  }
+
   mockIPC((command, args) => {
     if (command === "get_default_codex_home") return "C:/Users/demo/.codex";
     if (command === "get_default_repository_root") return "C:/Users/demo/.codex-session-sync";
@@ -88,7 +161,8 @@ export async function installConflictPreview() {
       id: remoteId,
       displayName: "个人服务器",
       serverUrl: "https://sync.example.test",
-      selectedNamespaceId: namespaceId,
+      selectedNamespaceId: selectedProfileNamespaceId,
+      automaticNamespaceSelection: automaticEnabled,
       createdAt: "2026-07-27T00:00:00Z",
       updatedAt: "2026-07-27T00:00:00Z",
       credentialConfigured: true,
@@ -97,20 +171,45 @@ export async function installConflictPreview() {
     if (command === "list_remote_namespaces") return [{
       id: namespaceId,
       displayName: "个人会话",
+      head: baseHash,
+      createdAt: "2026-07-27T00:00:00Z",
+      updatedAt: "2026-07-27T00:00:00Z",
+    }, {
+      id: workNamespaceId,
+      displayName: "工作会话",
       head: remoteHead,
       createdAt: "2026-07-27T00:00:00Z",
       updatedAt: "2026-07-27T00:00:00Z",
     }];
-    if (command === "get_remote_namespace_status") return {
+    if (command === "get_remote_namespace_status") {
+      const requestedNamespaceId = String((args as { namespaceId?: string } | undefined)?.namespaceId);
+      return {
       remoteId,
-      namespaceId,
-      active: true,
+      namespaceId: requestedNamespaceId,
+      active: requestedNamespaceId === namespaceId,
       activeRemoteId: remoteId,
       activeNamespaceId: namespaceId,
       integratedHead: baseHash,
-      remoteHead,
+      remoteHead: requestedNamespaceId === workNamespaceId ? remoteHead : baseHash,
       generation: 2,
-    };
+      };
+    }
+    if (command === "get_namespace_mapping_state") return currentMappingState();
+    if (command === "set_automatic_namespace_selection") {
+      automaticEnabled = Boolean((args as { enabled?: boolean } | undefined)?.enabled);
+      if (automaticEnabled) manualOverrideNamespaceId = null;
+      return currentMappingState();
+    }
+    if (command === "clear_manual_namespace_override") {
+      manualOverrideNamespaceId = null;
+      return currentMappingState();
+    }
+    if (command === "create_namespace_mapping") return currentMappingState();
+    if (command === "delete_namespace_mapping") {
+      const mappingId = String((args as { mappingId?: string } | undefined)?.mappingId);
+      mappings = mappings.filter((mapping) => mapping.id !== mappingId);
+      return currentMappingState();
+    }
     if (command === "start_pull_job") return job("preview-pull", "pull", "running");
     if (command === "start_scan_job") return job("preview-scan", "scan", "running");
     if (command === "get_job") {
@@ -122,7 +221,12 @@ export async function installConflictPreview() {
         ? scanReport
         : conflictReport;
     }
-    if (command === "select_remote_namespace") return null;
+    if (command === "select_remote_namespace") {
+      const selected = String((args as { namespaceId?: string } | undefined)?.namespaceId);
+      selectedProfileNamespaceId = selected;
+      if (automaticEnabled) manualOverrideNamespaceId = selected;
+      return null;
+    }
     throw new Error(`Conflict preview does not implement command: ${command}`);
   });
 }

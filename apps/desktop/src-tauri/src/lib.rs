@@ -1,4 +1,5 @@
 mod jobs;
+mod namespace_mapping;
 mod remote;
 mod remote_config;
 mod remote_sync;
@@ -9,11 +10,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use jobs::{JobManager, JobSnapshot};
+use namespace_mapping::{
+    NamespaceMappingState, NamespaceMappingStore, build_mapping_state, detect_local_identity,
+};
 use remote::{RemoteClient, SecretToken};
 use remote_config::{
     CredentialStore, RemoteProfile, RemoteProfileStore, RemoteProfileSummary, SystemCredentialStore,
 };
 use remote_sync::{pull_namespace, push_namespace, resolve_pull_conflicts, switch_namespace};
+use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
     CheckoutJournal, ImportReport, OperationJournal, ScanDashboardReport, SnapshotSummary,
@@ -46,6 +51,17 @@ struct RemoteNamespaceStatus {
     integrated_head: Option<String>,
     remote_head: Option<String>,
     generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateNamespaceMappingRequest {
+    remote_id: String,
+    namespace_id: String,
+    label: String,
+    match_api_key: bool,
+    match_provider: bool,
+    match_codex_home: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -389,16 +405,155 @@ async fn rename_remote_namespace(
 #[tauri::command]
 fn select_remote_namespace(
     repository_root: Option<String>,
+    codex_home: Option<String>,
     remote_id: String,
     namespace_id: String,
 ) -> Result<RemoteProfile, String> {
     let repository = resolve_repository_root(repository_root);
-    RemoteProfileStore::new(repository)
-        .select_namespace(
-            parse_uuid(&remote_id).map_err(|error| error.to_string())?,
-            parse_uuid(&namespace_id).map_err(|error| error.to_string())?,
-        )
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let store = RemoteProfileStore::new(&repository);
+    let current = store.get(remote_id).map_err(|error| error.to_string())?;
+    if current.automatic_namespace_selection {
+        let home_key = sync_core::codex_home_key(&codex_home).map_err(|error| error.to_string())?;
+        NamespaceMappingStore::new(&repository)
+            .set_manual_override(remote_id, namespace_id, home_key)
+            .map_err(|error| error.to_string())?;
+    }
+    store
+        .select_namespace(remote_id, namespace_id)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_namespace_mapping_state(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+) -> Result<NamespaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        namespace_mapping_state(&repository, &codex_home, parse_uuid(&remote_id)?)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_namespace_mapping(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    request: CreateNamespaceMappingRequest,
+) -> Result<NamespaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_id = parse_uuid(&request.remote_id)?;
+        let namespace_id = parse_uuid(&request.namespace_id)?;
+        let profile = RemoteProfileStore::new(&repository).get(remote_id)?;
+        let identity = detect_local_identity(&codex_home, &profile.server_url, None)?;
+        let api_key_fingerprint = if request.match_api_key {
+            Some(
+                identity
+                    .api_key_fingerprint
+                    .clone()
+                    .context("the current API key could not be detected safely")?,
+            )
+        } else {
+            None
+        };
+        let provider = if request.match_provider {
+            Some(
+                identity
+                    .provider
+                    .clone()
+                    .context("the current model provider could not be detected")?,
+            )
+        } else {
+            None
+        };
+        let codex_home_key = request
+            .match_codex_home
+            .then(|| identity.codex_home_key.clone());
+        NamespaceMappingStore::new(&repository).create(
+            remote_id,
+            namespace_id,
+            request.label,
+            api_key_fingerprint,
+            provider,
+            codex_home_key,
+        )?;
+        namespace_mapping_state(&repository, &codex_home, remote_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_namespace_mapping(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    mapping_id: String,
+) -> Result<NamespaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_id = parse_uuid(&remote_id)?;
+        NamespaceMappingStore::new(&repository).delete(remote_id, parse_uuid(&mapping_id)?)?;
+        namespace_mapping_state(&repository, &codex_home, remote_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_automatic_namespace_selection(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    enabled: bool,
+) -> Result<NamespaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_id = parse_uuid(&remote_id)?;
+        let home_key = sync_core::codex_home_key(&codex_home)?;
+        let mappings = NamespaceMappingStore::new(&repository);
+        if enabled {
+            mappings.clear_manual_override(remote_id, &home_key)?;
+        }
+        RemoteProfileStore::new(&repository)
+            .set_automatic_namespace_selection(remote_id, enabled)?;
+        namespace_mapping_state(&repository, &codex_home, remote_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn clear_manual_namespace_override(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+) -> Result<NamespaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_id = parse_uuid(&remote_id)?;
+        let home_key = sync_core::codex_home_key(&codex_home)?;
+        NamespaceMappingStore::new(&repository).clear_manual_override(remote_id, &home_key)?;
+        namespace_mapping_state(&repository, &codex_home, remote_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -708,6 +863,26 @@ fn connection_status(
     })
 }
 
+fn namespace_mapping_state(
+    repository_root: &std::path::Path,
+    codex_home: &std::path::Path,
+    remote_id: Uuid,
+) -> anyhow::Result<NamespaceMappingState> {
+    let profile = RemoteProfileStore::new(repository_root).get(remote_id)?;
+    let identity = detect_local_identity(codex_home, &profile.server_url, None)?;
+    let mappings = NamespaceMappingStore::new(repository_root);
+    let rules = mappings.list(remote_id)?;
+    let manual_override = mappings.manual_override(remote_id, &identity.codex_home_key)?;
+    Ok(build_mapping_state(
+        remote_id,
+        profile.automatic_namespace_selection,
+        profile.selected_namespace_id,
+        &identity,
+        &rules,
+        manual_override,
+    ))
+}
+
 fn resolve_codex_home(value: Option<String>) -> std::path::PathBuf {
     value
         .filter(|value| !value.trim().is_empty())
@@ -750,6 +925,11 @@ pub fn run() {
             create_remote_namespace,
             rename_remote_namespace,
             select_remote_namespace,
+            get_namespace_mapping_state,
+            create_namespace_mapping,
+            delete_namespace_mapping,
+            set_automatic_namespace_selection,
+            clear_manual_namespace_override,
             get_remote_namespace_status,
             start_push_job,
             start_pull_job,
@@ -869,5 +1049,126 @@ mod tests {
         let error = recover_local_operation(&journal_path, true).unwrap_err();
 
         assert!(error.to_string().contains("ambiguous recovery journal"));
+    }
+
+    #[tokio::test]
+    async fn namespace_mapping_commands_restore_automatic_selection_after_manual_override() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let codex_home = directory.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_provider = \"openai\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("auth.json"),
+            r#"{"OPENAI_API_KEY":"integration-secret"}"#,
+        )
+        .unwrap();
+
+        let remote_id = Uuid::now_v7();
+        let mapped_namespace = Uuid::now_v7();
+        let manual_namespace = Uuid::now_v7();
+        let profiles = RemoteProfileStore::new(&repository);
+        let profile = profiles
+            .upsert(
+                remote_id,
+                "Personal".to_string(),
+                "https://sync.example.test".to_string(),
+            )
+            .unwrap();
+        let identity = detect_local_identity(&codex_home, &profile.server_url, None).unwrap();
+        NamespaceMappingStore::new(&repository)
+            .create(
+                remote_id,
+                mapped_namespace,
+                "API key mapping".to_string(),
+                identity.api_key_fingerprint.clone(),
+                None,
+                None,
+            )
+            .unwrap();
+        profiles
+            .set_automatic_namespace_selection(remote_id, true)
+            .unwrap();
+
+        let automatic = namespace_mapping_state(&repository, &codex_home, remote_id).unwrap();
+        assert_eq!(
+            automatic.selection.source,
+            namespace_mapping::NamespaceSelectionSource::Mapping
+        );
+        assert_eq!(
+            automatic.selection.selected_namespace_id,
+            Some(mapped_namespace)
+        );
+
+        select_remote_namespace(
+            Some(repository.to_string_lossy().into_owned()),
+            Some(codex_home.to_string_lossy().into_owned()),
+            remote_id.to_string(),
+            manual_namespace.to_string(),
+        )
+        .unwrap();
+        let overridden = namespace_mapping_state(&repository, &codex_home, remote_id).unwrap();
+        assert_eq!(
+            overridden.selection.source,
+            namespace_mapping::NamespaceSelectionSource::ManualOverride
+        );
+        assert_eq!(
+            overridden.selection.selected_namespace_id,
+            Some(manual_namespace)
+        );
+
+        let restored = clear_manual_namespace_override(
+            Some(repository.to_string_lossy().into_owned()),
+            Some(codex_home.to_string_lossy().into_owned()),
+            remote_id.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored.selection.source,
+            namespace_mapping::NamespaceSelectionSource::Mapping
+        );
+        assert_eq!(
+            restored.selection.selected_namespace_id,
+            Some(mapped_namespace)
+        );
+
+        let disabled = set_automatic_namespace_selection(
+            Some(repository.to_string_lossy().into_owned()),
+            Some(codex_home.to_string_lossy().into_owned()),
+            remote_id.to_string(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disabled.selection.source,
+            namespace_mapping::NamespaceSelectionSource::ProfileDefault
+        );
+        assert_eq!(
+            disabled.selection.selected_namespace_id,
+            Some(manual_namespace)
+        );
+
+        let reenabled = set_automatic_namespace_selection(
+            Some(repository.to_string_lossy().into_owned()),
+            Some(codex_home.to_string_lossy().into_owned()),
+            remote_id.to_string(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reenabled.selection.source,
+            namespace_mapping::NamespaceSelectionSource::Mapping
+        );
+        assert_eq!(
+            reenabled.selection.selected_namespace_id,
+            Some(mapped_namespace)
+        );
     }
 }

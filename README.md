@@ -4,11 +4,12 @@ A personal, self-hosted, Git-like synchronization system for Codex
 conversations. The repository contains a cross-platform Tauri desktop client,
 a Rust synchronization core, and an Axum server.
 
-Phase 4 is implemented: the desktop client can securely store a server token,
+Phase 6 is implemented: the desktop client can securely store a server token,
 manage remote namespaces, perform Push, Pull, and exact namespace checkout,
-and explicitly resolve divergent changes to the same thread UUID. Remote
-operations run in the Tauri Rust backend; the React webview never receives the
-stored token or talks to the server directly.
+explicitly resolve divergent changes to the same thread UUID, and select a
+namespace from local API-key/provider/Codex-Home mappings. Remote operations
+and identity detection run in the Tauri Rust backend; the React webview never
+receives the stored token, a raw API key, or direct server access.
 
 ## Repository layout
 
@@ -66,6 +67,21 @@ in that local synchronization repository. If a `LocalApplied` journal no longer
 matches the live conversations or its Tracking compare-and-swap conflicts,
 recovery refuses to overwrite either side and leaves the journal for explicit
 resolution.
+
+Optional automatic namespace selection reads only the selected Codex Home's
+`config.toml`, the explicit `OPENAI_API_KEY`/`api_key` fields in `auth.json`,
+and a configured provider `env_key`. The raw API key is never saved, returned
+to React, or uploaded. The backend stores only a local HMAC-SHA256 fingerprint
+derived from the key and the normalized synchronization-server URL in
+`config/namespace-mappings-v1.json`. Mapping rules can combine API-key,
+provider, and exact normalized Codex-Home conditions; API-key matches have the
+highest weight, followed by provider and path. Equal best matches that point to
+different namespaces are reported as ambiguous instead of choosing silently.
+
+Clicking a namespace while automatic selection is enabled creates a local
+manual override for that remote and Codex Home. **恢复自动选择** clears it.
+Automatic selection changes only the target highlighted in the GUI: it never
+starts checkout, Pull, Push, or any local write on its own.
 
 Conflict choices are bound to immutable fingerprints derived from the base,
 local, and remote semantic thread hashes. The backend re-scans the local Codex
@@ -125,6 +141,8 @@ actions. In the GUI:
    select **应用选择并完成合并**. A deleted side is also an explicit choice.
 6. Use namespace switch only after reviewing and accepting the exact local
    replacement confirmation. A recoverable backup is always created first.
+7. Optionally enable automatic namespace selection and create local rules for
+   the current API key, provider, Codex Home, or a combination of them.
 
 Push never force-updates a remote namespace. If its Head is ahead of local
 Tracking and the thread content differs, the client rejects Push and requires
@@ -177,9 +195,10 @@ npm run check
 npm run build
 ```
 
-For repeatable browser-only visual QA of the conflict workbench, run
-`npm run dev` and open `http://127.0.0.1:1420/?preview=conflict`. This mock is
-loaded only by the Vite development build and is removed from production
+For repeatable browser-only visual QA, run `npm run dev` and open either
+`http://127.0.0.1:1420/?preview=conflict` for the conflict workbench or
+`http://127.0.0.1:1420/?preview=mapping` for namespace mappings. These mocks
+are loaded only by the Vite development build and are removed from production
 bundles.
 
 The native credential-store smoke test is intentionally ignored during normal
