@@ -5,9 +5,14 @@ import type {
   ImportReport,
   JobSnapshot,
   OperationJournal,
+  RemoteConnectionStatus,
+  RemoteNamespace,
+  RemoteNamespaceStatus,
+  RemoteProfileSummary,
   ScanReport,
   SnapshotSummary,
   SnapshotValidationReport,
+  SyncReport,
 } from "./types";
 
 function formatBytes(bytes: number): string {
@@ -15,6 +20,10 @@ function formatBytes(bytes: number): string {
   const units = ["B", "KB", "MB", "GB"];
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function shortHead(head: string | null): string {
+  return head ? head.replace("sha256:", "").slice(0, 12) : "空";
 }
 
 function isActive(job: JobSnapshot | null): boolean {
@@ -28,6 +37,7 @@ export default function App() {
   const [manifestPath, setManifestPath] = useState("");
   const [journalPath, setJournalPath] = useState("");
   const [confirmedClosed, setConfirmedClosed] = useState(false);
+  const [confirmedReplaceTarget, setConfirmedReplaceTarget] = useState<string | null>(null);
   const [processes, setProcesses] = useState<CodexProcess[]>([]);
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [report, setReport] = useState<ScanReport | null>(null);
@@ -35,10 +45,31 @@ export default function App() {
   const [validation, setValidation] = useState<SnapshotValidationReport | null>(null);
   const [importReport, setImportReport] = useState<ImportReport | null>(null);
   const [recoveredJournal, setRecoveredJournal] = useState<OperationJournal | null>(null);
+  const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const busy = isActive(job);
+  const [profiles, setProfiles] = useState<RemoteProfileSummary[]>([]);
+  const [selectedRemoteId, setSelectedRemoteId] = useState("");
+  const [remoteName, setRemoteName] = useState("个人服务器");
+  const [remoteUrl, setRemoteUrl] = useState("http://127.0.0.1:8787");
+  const [remoteToken, setRemoteToken] = useState("");
+  const [namespaces, setNamespaces] = useState<RemoteNamespace[]>([]);
+  const [selectedNamespaceId, setSelectedNamespaceId] = useState("");
+  const [namespaceName, setNamespaceName] = useState("");
+  const [namespaceStatus, setNamespaceStatus] = useState<RemoteNamespaceStatus | null>(null);
+  const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+
+  const busy = isActive(job) || remoteLoading;
+  const canWrite = confirmedClosed && processes.length === 0 && isTauriRuntime;
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
+  const selectedProfile = profiles.find((profile) => profile.id === selectedRemoteId) ?? null;
+  const selectedNamespace = namespaces.find((namespace) => namespace.id === selectedNamespaceId) ?? null;
+  const replaceTargetKey = codexHome.trim() && selectedRemoteId && selectedNamespaceId
+    ? JSON.stringify([codexHome.trim(), selectedRemoteId, selectedNamespaceId])
+    : null;
+  const confirmedReplace = replaceTargetKey !== null
+    && confirmedReplaceTarget === replaceTargetKey;
   const progressPercent = job?.progress.total && job.progress.total > 0
     ? Math.min(100, Math.round((job.progress.completed / job.progress.total) * 100))
     : null;
@@ -47,6 +78,53 @@ export default function App() {
     if (!isTauriRuntime) return;
     try {
       setProcesses(await invoke<CodexProcess[]>("list_codex_processes"));
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function refreshProfiles(preferredId?: string) {
+    if (!isTauriRuntime || !repositoryRoot.trim()) return;
+    const loaded = await invoke<RemoteProfileSummary[]>("list_remote_profiles", {
+      repositoryRoot: repositoryRoot.trim(),
+    });
+    setProfiles(loaded);
+    const next = preferredId || selectedRemoteId || loaded[0]?.id || "";
+    if (next && loaded.some((profile) => profile.id === next)) setSelectedRemoteId(next);
+  }
+
+  async function refreshNamespaces(remoteId = selectedRemoteId) {
+    if (!remoteId || !isTauriRuntime) return;
+    setRemoteLoading(true);
+    try {
+      const loaded = await invoke<RemoteNamespace[]>("list_remote_namespaces", {
+        repositoryRoot: repositoryRoot.trim(),
+        remoteId,
+      });
+      setNamespaces(loaded);
+      const profile = profiles.find((candidate) => candidate.id === remoteId);
+      const preferred = profile?.selectedNamespaceId;
+      const next = preferred && loaded.some((namespace) => namespace.id === preferred)
+        ? preferred
+        : loaded[0]?.id ?? "";
+      setSelectedNamespaceId(next);
+      if (!next) setNamespaceStatus(null);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
+
+  async function refreshNamespaceStatus(namespaceId = selectedNamespaceId) {
+    if (!selectedRemoteId || !namespaceId || !isTauriRuntime) return;
+    try {
+      setNamespaceStatus(await invoke<RemoteNamespaceStatus>("get_remote_namespace_status", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId,
+      }));
     } catch (reason) {
       setError(String(reason));
     }
@@ -69,6 +147,31 @@ export default function App() {
   }, [isTauriRuntime]);
 
   useEffect(() => {
+    if (!repositoryRoot.trim() || !isTauriRuntime) return;
+    void refreshProfiles().catch((reason) => setError(String(reason)));
+  }, [repositoryRoot, isTauriRuntime]);
+
+  useEffect(() => {
+    if (!selectedProfile) return;
+    setRemoteName(selectedProfile.displayName);
+    setRemoteUrl(selectedProfile.serverUrl);
+    setRemoteToken("");
+    setConnectionMessage(null);
+    void refreshNamespaces(selectedProfile.id);
+  }, [selectedRemoteId]);
+
+  useEffect(() => {
+    if (!selectedNamespaceId) return;
+    const namespace = namespaces.find((candidate) => candidate.id === selectedNamespaceId);
+    setNamespaceName(namespace?.displayName ?? "");
+    void refreshNamespaceStatus(selectedNamespaceId);
+  }, [selectedNamespaceId, codexHome]);
+
+  useEffect(() => {
+    setConfirmedReplaceTarget(null);
+  }, [codexHome, selectedRemoteId, selectedNamespaceId]);
+
+  useEffect(() => {
     if (!job || !isActive(job)) return;
     const timer = window.setInterval(() => {
       invoke<JobSnapshot>("get_job", { jobId: job.jobId })
@@ -87,18 +190,18 @@ export default function App() {
       return;
     }
     if (!completed.resultReady) {
-      setError("任务未提供可领取的结果");
+      setError("任务没有可领取的结果");
       return;
     }
     try {
       const result = await invoke<unknown>("take_job_result", { jobId: completed.jobId });
-      applyJobResult(completed, result);
+      await applyJobResult(completed, result);
     } catch (reason) {
       setError(String(reason));
     }
   }
 
-  function applyJobResult(completed: JobSnapshot, result: unknown) {
+  async function applyJobResult(completed: JobSnapshot, result: unknown) {
     if (completed.kind === "scan") setReport(result as ScanReport);
     if (completed.kind === "snapshot") {
       const summary = result as SnapshotSummary;
@@ -108,19 +211,30 @@ export default function App() {
     }
     if (completed.kind === "validate") setValidation(result as SnapshotValidationReport);
     if (completed.kind === "import") {
-      const report = result as ImportReport;
-      setImportReport(report);
-      setJournalPath(report.journalPath);
+      const imported = result as ImportReport;
+      setImportReport(imported);
+      setJournalPath(imported.journalPath);
     }
     if (completed.kind === "recovery") setRecoveredJournal(result as OperationJournal);
+    if (["push", "pull", "switch"].includes(completed.kind)) {
+      const synced = result as SyncReport;
+      setSyncReport(synced);
+      if (synced.checkout) setJournalPath(synced.checkout.journalPath);
+      await refreshNamespaces();
+      await refreshNamespaceStatus();
+      if (completed.kind !== "push") {
+        const scanned = await invoke<JobSnapshot>("start_scan_job", { codexHome: codexHome.trim() });
+        setJob(scanned);
+      }
+    }
   }
 
   async function start(command: string, payload: Record<string, unknown>) {
     if (busy) return;
+    if (command === "start_namespace_switch_job") setConfirmedReplaceTarget(null);
     setError(null);
     try {
-      const started = await invoke<JobSnapshot>(command, payload);
-      setJob(started);
+      setJob(await invoke<JobSnapshot>(command, payload));
     } catch (reason) {
       setError(String(reason));
       await refreshProcesses();
@@ -136,48 +250,115 @@ export default function App() {
     }
   }
 
-  function startScan() {
-    void start("start_scan_job", { codexHome: codexHome.trim() || null });
+  async function saveRemote() {
+    if (!remoteName.trim() || !remoteUrl.trim()) return;
+    setRemoteLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<RemoteConnectionStatus>("save_remote_profile", {
+        repositoryRoot: repositoryRoot.trim(),
+        remoteId: selectedRemoteId || null,
+        displayName: remoteName.trim(),
+        serverUrl: remoteUrl.trim(),
+        token: remoteToken.trim() || null,
+      });
+      setConnectionMessage(`连接成功 · 协议 v${result.protocol.protocolVersion} · 服务端 ${result.protocol.version}`);
+      setRemoteToken("");
+      setNamespaces(result.namespaces);
+      await refreshProfiles(result.profile.id);
+      setSelectedRemoteId(result.profile.id);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
   }
 
-  function startSnapshot() {
-    void start("start_snapshot_job", {
-      codexHome: codexHome.trim() || null,
-      repositoryRoot: repositoryRoot.trim() || null,
-      confirmedCodexClosed: confirmedClosed,
-    });
+  async function testConnection() {
+    if (!selectedRemoteId) return;
+    setRemoteLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<RemoteConnectionStatus>("test_remote_connection", {
+        repositoryRoot: repositoryRoot.trim(),
+        remoteId: selectedRemoteId,
+      });
+      setConnectionMessage(`连接正常 · ${result.namespaces.length} 个命名空间 · 协议 v${result.protocol.protocolVersion}`);
+      setNamespaces(result.namespaces);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
   }
 
-  function startValidation() {
-    void start("start_validation_job", {
-      manifestPath: manifestPath.trim(),
-      repositoryRoot: repositoryRoot.trim() || null,
-    });
+  async function createNamespace() {
+    if (!selectedRemoteId || !namespaceName.trim()) return;
+    setRemoteLoading(true);
+    try {
+      const created = await invoke<RemoteNamespace>("create_remote_namespace", {
+        repositoryRoot: repositoryRoot.trim(),
+        remoteId: selectedRemoteId,
+        displayName: namespaceName.trim(),
+      });
+      await refreshNamespaces();
+      await chooseNamespace(created.id);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
   }
 
-  function startImport() {
-    void start("start_import_job", {
-      manifestPath: manifestPath.trim(),
-      codexHome: codexHome.trim() || null,
-      repositoryRoot: repositoryRoot.trim() || null,
-      confirmedCodexClosed: confirmedClosed,
-    });
+  async function renameNamespace() {
+    if (!selectedRemoteId || !selectedNamespaceId || !namespaceName.trim()) return;
+    setRemoteLoading(true);
+    try {
+      await invoke("rename_remote_namespace", {
+        repositoryRoot: repositoryRoot.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+        displayName: namespaceName.trim(),
+      });
+      await refreshNamespaces();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
   }
 
-  function startRecovery() {
-    void start("start_recovery_job", {
-      journalPath: journalPath.trim(),
-      confirmedCodexClosed: confirmedClosed,
-    });
+  async function chooseNamespace(namespaceId: string) {
+    if (!selectedRemoteId) return;
+    setSelectedNamespaceId(namespaceId);
+    try {
+      await invoke("select_remote_namespace", {
+        repositoryRoot: repositoryRoot.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId,
+      });
+      await refreshProfiles(selectedRemoteId);
+      await refreshNamespaceStatus(namespaceId);
+    } catch (reason) {
+      setError(String(reason));
+    }
   }
+
+  const syncPayload = {
+    repositoryRoot: repositoryRoot.trim(),
+    codexHome: codexHome.trim(),
+    remoteId: selectedRemoteId,
+    namespaceId: selectedNamespaceId,
+    confirmedCodexClosed: confirmedClosed,
+  };
 
   return (
     <main className="app-shell">
       <header className="hero">
         <div>
-          <span className="eyebrow">PHASE 2 · SAFE LOCAL SYNC</span>
+          <span className="eyebrow">PHASE 3B · REMOTE SYNC</span>
           <h1>Codex Session Sync</h1>
-          <p>扫描、快照和导入都在独立后台任务中执行，可显示真实状态并在安全点中断。</p>
+          <p>通过自托管服务器在命名空间之间安全推送、拉取和 checkout Codex 会话。</p>
         </div>
         <div className={`status-pill ${processes.length ? "status-warning" : ""}`}>
           {processes.length ? `检测到 ${processes.length} 个 Codex 进程` : "未检测到 Codex 进程"}
@@ -185,42 +366,83 @@ export default function App() {
       </header>
 
       <section className="process-banner">
-        <div>
-          <strong>Codex 进程检测</strong>
-          <span>{processes.length ? "关闭下列进程后才能创建快照、导入或恢复。" : "可以执行写入型同步操作。"}</span>
-        </div>
+        <div><strong>写入安全检查</strong><span>Push、Pull 与命名空间切换前必须完全退出 Codex。</span></div>
         <button className="secondary-button" onClick={() => void refreshProcesses()} disabled={busy || !isTauriRuntime}>重新检测</button>
       </section>
-      {processes.length > 0 && (
-        <div className="process-list">
-          {processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}
-        </div>
-      )}
+      {processes.length > 0 && <div className="process-list">{processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}</div>}
 
       <section className="panel workspace-panel">
         <div className="field"><label htmlFor="codex-home">Codex Home</label><input id="codex-home" value={codexHome} onChange={(event) => setCodexHome(event.target.value)} /></div>
         <div className="field"><label htmlFor="repository-root">本地同步仓库</label><input id="repository-root" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} /></div>
         <div className="action-row">
-          <button className="secondary-button" onClick={startScan} disabled={busy || !codexHome.trim() || !isTauriRuntime}>扫描本机会话</button>
-          <button onClick={startSnapshot} disabled={busy || !confirmedClosed || processes.length > 0 || !isTauriRuntime}>创建本地快照</button>
+          <button className="secondary-button" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}>扫描本机会话</button>
+          <button onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !canWrite}>创建本地快照</button>
         </div>
-        <label className="safety-check"><input type="checkbox" checked={confirmedClosed} onChange={(event) => setConfirmedClosed(event.target.checked)} /><span>我已完全退出 Codex；快照和导入期间不会重新启动</span></label>
+        <label className="safety-check"><input type="checkbox" checked={confirmedClosed} onChange={(event) => setConfirmedClosed(event.target.checked)} /><span>我已完全退出 Codex；同步期间不会重新启动</span></label>
       </section>
 
-      <section className="panel operation-panel">
-        <div className="section-heading"><div><h2>快照验证与导入</h2><p>导入前校验对象；同 UUID 内容分叉时不会覆盖。</p></div></div>
-        <div className="field"><label htmlFor="manifest-path">快照清单路径</label><input id="manifest-path" value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} placeholder="~/.codex-session-sync/snapshots/<id>.json" /></div>
-        <div className="action-row compact-actions">
-          <button className="secondary-button" onClick={startValidation} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button>
-          <button className="danger-button" onClick={startImport} disabled={busy || !manifestPath.trim() || !confirmedClosed || processes.length > 0 || !isTauriRuntime}>导入到当前 Codex Home</button>
+      <section className="panel remote-panel">
+        <div className="section-heading"><div><h2>远端服务器</h2><p>Token 仅保存到操作系统凭据库，前端不会读回明文。</p></div><span>{remoteLoading ? "连接中…" : `${profiles.length} 个配置`}</span></div>
+        <div className="profile-tabs">
+          {profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : "secondary-button"} onClick={() => setSelectedRemoteId(profile.id)}>{profile.displayName}</button>)}
+          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); }}>＋ 新建远端</button>
         </div>
-        <div className="recovery-row">
-          <div className="field"><label htmlFor="journal-path">未完成操作的 Journal 路径</label><input id="journal-path" value={journalPath} onChange={(event) => setJournalPath(event.target.value)} placeholder="~/.codex-session-sync/journal/<operation-id>.json" /></div>
-          <button className="recovery-button" onClick={startRecovery} disabled={busy || !journalPath.trim() || !confirmedClosed || processes.length > 0 || !isTauriRuntime}>从备份恢复</button>
+        <div className="remote-form">
+          <div className="field"><label htmlFor="remote-name">配置名称</label><input id="remote-name" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div>
+          <div className="field"><label htmlFor="remote-url">服务器 URL</label><input id="remote-url" value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} /></div>
+          <div className="field remote-token-field"><label htmlFor="remote-token">Bearer Token</label><input id="remote-token" type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder={selectedProfile?.credentialConfigured ? "已保存在系统凭据库；留空则不修改" : "至少 16 位可见 ASCII 字符"} /></div>
+          <div className="action-row compact-actions"><button onClick={() => void saveRemote()} disabled={busy || !remoteName.trim() || !remoteUrl.trim() || (!selectedRemoteId && !remoteToken.trim())}>保存并验证</button><button className="secondary-button" onClick={() => void testConnection()} disabled={busy || !selectedRemoteId}>测试连接</button></div>
         </div>
+        {(selectedProfile?.insecureHttp || remoteUrl.trim().startsWith("http://")) && <p className="warning-copy">当前连接未使用 HTTPS。仅建议在本机或可信内网使用。</p>}
+        {connectionMessage && <p className="success-copy">{connectionMessage}</p>}
       </section>
+
+      {selectedRemoteId && <section className="panel namespace-panel">
+        <div className="section-heading"><div><h2>命名空间</h2><p>活动项对应当前 Codex Home；切换会完整替换本机会话。</p></div><button className="secondary-button" onClick={() => void refreshNamespaces()} disabled={busy}>刷新</button></div>
+        <div className="namespace-grid">
+          {namespaces.map((namespace) => {
+            const selected = namespace.id === selectedNamespaceId;
+            const active = namespaceStatus?.active && selected;
+            return <button key={namespace.id} className={`namespace-card ${selected ? "selected" : ""}`} onClick={() => void chooseNamespace(namespace.id)}><span>{namespace.displayName}</span><code>{shortHead(namespace.head)}</code>{active && <small>当前活动</small>}</button>;
+          })}
+          {namespaces.length === 0 && <p className="muted-copy">服务器上还没有命名空间。</p>}
+        </div>
+        <div className="namespace-editor">
+          <div className="field"><label htmlFor="namespace-name">命名空间名称</label><input id="namespace-name" value={namespaceName} onChange={(event) => setNamespaceName(event.target.value)} /></div>
+          <div className="action-row compact-actions"><button onClick={() => void createNamespace()} disabled={busy || !namespaceName.trim()}>创建</button><button className="secondary-button" onClick={() => void renameNamespace()} disabled={busy || !selectedNamespaceId || !namespaceName.trim()}>重命名选中项</button></div>
+        </div>
+
+        {selectedNamespace && namespaceStatus && <div className="sync-console">
+          <div className="sync-status-grid">
+            <article><span>选中命名空间</span><strong>{selectedNamespace.displayName}</strong></article>
+            <article><span>本机跟踪</span><code>{shortHead(namespaceStatus.integratedHead)}</code></article>
+            <article><span>远端 Head</span><code>{shortHead(namespaceStatus.remoteHead)}</code></article>
+            <article><span>状态</span><strong>{namespaceStatus.active ? "当前活动" : namespaceStatus.activeNamespaceId ? "需要切换" : "尚未绑定"}</strong></article>
+          </div>
+          <div className="action-row sync-actions">
+            {namespaceStatus.active ? <>
+              <button onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite}>推送</button>
+              <button className="secondary-button" onClick={() => void start("start_pull_job", syncPayload)} disabled={busy || !canWrite}>拉取</button>
+            </> : !namespaceStatus.activeNamespaceId && !namespaceStatus.remoteHead ? <button onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite}>用本机会话初始化并推送</button> : <button className="danger-button" onClick={() => void start("start_namespace_switch_job", { ...syncPayload, confirmedReplaceLocal: confirmedReplace })} disabled={busy || !canWrite || !confirmedReplace}>切换到此命名空间</button>}
+          </div>
+          {!namespaceStatus.active && <label className="safety-check"><input type="checkbox" checked={confirmedReplace} onChange={(event) => setConfirmedReplaceTarget(event.target.checked ? replaceTargetKey : null)} /><span>我确认切换会先备份，然后用目标命名空间完整替换本机会话</span></label>}
+        </div>}
+      </section>}
 
       {error && <div className="error-banner">{error}</div>}
+
+      {syncReport && <section className="panel sync-result">
+        <div className="section-heading"><h2>最近同步结果</h2><span>{syncReport.kind}</span></div>
+        <div className="result-grid"><article className="result-card success-card"><span>Head</span><strong>{shortHead(syncReport.head)}</strong><small>{syncReport.threadCount} 个会话</small></article><article className="result-card"><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.checkout ? `备份：${syncReport.checkout.backupDir}` : "无需本地 checkout"}</small></article></div>
+        {syncReport.conflicts.length > 0 && <div className="warning-list">{syncReport.conflicts.map((conflict) => <div className="warning-row" key={conflict.threadId}><strong>{conflict.kind}</strong><span>{conflict.title} · {conflict.threadId}</span></div>)}</div>}
+      </section>}
+
+      <section className="panel operation-panel">
+        <div className="section-heading"><div><h2>本地快照工具</h2><p>保留原有的验证、增量导入和恢复入口，便于诊断与手动操作。</p></div></div>
+        <div className="field"><label htmlFor="manifest-path">快照清单路径</label><input id="manifest-path" value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} placeholder="~/.codex-session-sync/snapshots/<id>.json" /></div>
+        <div className="action-row compact-actions"><button className="secondary-button" onClick={() => void start("start_validation_job", { manifestPath: manifestPath.trim(), repositoryRoot: repositoryRoot.trim() })} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button><button className="danger-button" onClick={() => void start("start_import_job", { manifestPath: manifestPath.trim(), codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !manifestPath.trim() || !canWrite}>增量导入</button></div>
+        <div className="recovery-row"><div className="field"><label htmlFor="journal-path">未完成操作的 Journal 路径</label><input id="journal-path" value={journalPath} onChange={(event) => setJournalPath(event.target.value)} /></div><button className="recovery-button" onClick={() => void start("start_recovery_job", { journalPath: journalPath.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !journalPath.trim() || !canWrite}>从备份恢复</button></div>
+      </section>
 
       {(snapshot || validation || importReport || recoveredJournal) && <section className="result-grid">
         {snapshot && <article className="result-card"><span>最新快照</span><strong>{snapshot.threadCount} 个会话</strong><small>{formatBytes(snapshot.totalBytes)} · {snapshot.objectCount} 个对象</small></article>}
@@ -229,29 +451,9 @@ export default function App() {
         {recoveredJournal && <article className="result-card success-card"><span>恢复结果</span><strong>{recoveredJournal.status}</strong><small>{recoveredJournal.error ?? recoveredJournal.operationId}</small></article>}
       </section>}
 
-      {report ? <>
-        <section className="metric-grid">
-          <article className="metric"><span>活动会话</span><strong>{report.activeCount}</strong></article>
-          <article className="metric"><span>已归档</span><strong>{report.archivedCount}</strong></article>
-          <article className="metric"><span>Rollout 大小</span><strong>{formatBytes(report.totalRolloutBytes)}</strong></article>
-          <article className="metric"><span>扫描警告</span><strong>{report.warnings.length}</strong></article>
-        </section>
-        <section className="content-grid">
-          <article className="panel"><div className="section-heading"><h2>会话预览</h2><span>显示 {report.threads.length} / {report.totalCount}</span></div><div className="thread-list">{recentThreads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span></div><small>{thread.modelProvider ?? "unknown"}</small></div>)}</div></article>
-          <article className="panel"><div className="section-heading"><h2>兼容性状态</h2><span>{report.databasePaths.length} databases</span></div>{report.warnings.length === 0 ? <p className="success-copy">扫描完成，没有发现需要处理的兼容性问题。</p> : <div className="warning-list">{report.warnings.slice(0, 8).map((warning, index) => <div className="warning-row" key={`${warning.path}-${index}`}><strong>{warning.kind}</strong><span>{warning.message}</span></div>)}</div>}</article>
-        </section>
-      </> : <section className="empty-state"><div className="empty-icon">↻</div><h2>等待扫描</h2><p>扫描会在后台运行，并显示当前正在处理的会话文件。</p></section>}
+      {report ? <><section className="metric-grid"><article className="metric"><span>活动会话</span><strong>{report.activeCount}</strong></article><article className="metric"><span>已归档</span><strong>{report.archivedCount}</strong></article><article className="metric"><span>Rollout 大小</span><strong>{formatBytes(report.totalRolloutBytes)}</strong></article><article className="metric"><span>扫描警告</span><strong>{report.warnings.length}</strong></article></section><section className="content-grid"><article className="panel"><div className="section-heading"><h2>会话预览</h2><span>显示 {report.threads.length} / {report.totalCount}</span></div><div className="thread-list">{recentThreads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span></div><small>{thread.modelProvider ?? "unknown"}</small></div>)}</div></article><article className="panel"><div className="section-heading"><h2>兼容性状态</h2><span>{report.databasePaths.length} databases</span></div>{report.warnings.length === 0 ? <p className="success-copy">扫描完成，没有发现阻塞同步的问题。</p> : <div className="warning-list">{report.warnings.slice(0, 8).map((warning, index) => <div className="warning-row" key={`${warning.path}-${index}`}><strong>{warning.kind}</strong><span>{warning.message}</span></div>)}</div>}</article></section></> : <section className="empty-state"><div className="empty-icon">↗</div><h2>等待扫描</h2><p>扫描会在后台运行，不会修改 Codex 数据。</p></section>}
 
-      {job && <div className="task-modal-backdrop" role="dialog" aria-modal="true" aria-label="任务进度">
-        <section className="task-modal">
-          <span className="eyebrow">{job.kind.toUpperCase()} · {job.state.toUpperCase()}</span>
-          <h2>{job.progress.phase.replaceAll("_", " ")}</h2>
-          <p>{job.progress.message}</p>
-          <div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div>
-          <small>{progressPercent === null ? `${job.progress.completed} ${job.progress.unit}` : `${progressPercent}% · ${job.progress.completed}/${job.progress.total} ${job.progress.unit}`}</small>
-          {isActive(job) ? <button className="danger-button modal-button" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "此操作不能取消"}</button> : <button className="secondary-button modal-button" onClick={() => setJob(null)}>关闭</button>}
-        </section>
-      </div>}
+      {job && <div className="task-modal-backdrop" role="dialog" aria-modal="true" aria-label="任务进度"><section className="task-modal"><span className="eyebrow">{job.kind.toUpperCase()} · {job.state.toUpperCase()}</span><h2>{job.progress.phase.replaceAll("_", " ")}</h2><p>{job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><small>{progressPercent === null ? `${job.progress.completed} ${job.progress.unit}` : `${progressPercent}% · ${job.progress.completed}/${job.progress.total} ${job.progress.unit}`}</small>{isActive(job) ? <button className="danger-button modal-button" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button> : <button className="secondary-button modal-button" onClick={() => setJob(null)}>关闭</button>}</section></div>}
     </main>
   );
 }

@@ -82,10 +82,83 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "recovery";
+  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "switch";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
   resultReady: boolean;
   error: string | null;
+};
+
+export type RemoteProfile = {
+  id: string;
+  displayName: string;
+  serverUrl: string;
+  selectedNamespaceId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RemoteProfileSummary = RemoteProfile & {
+  credentialConfigured: boolean;
+  insecureHttp: boolean;
+};
+
+export type RemoteNamespace = {
+  id: string;
+  displayName: string;
+  head: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProtocolInfo = {
+  service: string;
+  version: string;
+  protocolVersion: number;
+};
+
+export type RemoteConnectionStatus = {
+  profile: RemoteProfileSummary;
+  protocol: ProtocolInfo;
+  namespaces: RemoteNamespace[];
+};
+
+export type RemoteNamespaceStatus = {
+  remoteId: string;
+  namespaceId: string;
+  active: boolean;
+  activeRemoteId: string | null;
+  activeNamespaceId: string | null;
+  integratedHead: string | null;
+  remoteHead: string | null;
+  generation: number | null;
+};
+
+export type ThreadConflict = {
+  threadId: string;
+  title: string;
+  kind: "both_modified" | "local_deleted_remote_modified" | "remote_deleted_local_modified";
+};
+
+export type CheckoutReport = {
+  operationId: string;
+  snapshotId: string;
+  threadCount: number;
+  backupDir: string;
+  localBackupDir: string;
+  journalPath: string;
+};
+
+export type SyncReport = {
+  kind: "pushed" | "pulled" | "switched" | "no_changes" | "conflict";
+  namespaceId: string;
+  previousHead: string | null;
+  head: string | null;
+  revisionId: string | null;
+  uploadedObjects: number;
+  downloadedObjects: number;
+  threadCount: number;
+  conflicts: ThreadConflict[];
+  checkout: CheckoutReport | null;
 };
