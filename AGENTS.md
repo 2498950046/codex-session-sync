@@ -91,8 +91,9 @@ Implemented:
 
 - Rust workspace with `sync-core`, `sync-server`, and Tauri desktop members.
 - Shared `ThreadBundle`, content-object, warning, and scan-report models.
-- Read-only rollout discovery, SHA-256 hashing, SQLite thread metadata overlay,
-  and structured skipped-file warnings.
+- Read-only rollout discovery, fast first-record dashboard scans, full SHA-256
+  export/import paths, SQLite thread metadata overlay, and structured
+  skipped-file warnings.
 - Tests for valid, empty, malformed JSON, and invalid UTF-8 rollouts.
 - Tauri command boundary and React scan dashboard.
 - Content-addressed local object storage and immutable snapshot manifests.
@@ -113,6 +114,13 @@ Implemented:
 - GUI scan results use a compact dashboard projection; raw SQLite records stay
   in the Rust core. Completed task results are claimed once and then released
   from the task manager to prevent completion-time memory spikes.
+- Dashboard scans no longer hash complete rollout files. Snapshot creation
+  streams each changed rollout once while simultaneously copying and hashing,
+  eliminating the previous pre-hash pass.
+- Normal snapshots maintain a disposable trusted-local source index using
+  canonical path, byte length, and modification time. Unchanged sources reuse
+  immutable objects without re-hashing; malformed/stale index data falls back
+  to a full stream. Explicit validation and imports still hash every object.
 - Automated tests covering successful import, corrupt objects, conflicts,
   transactional rollback, restart recovery, process classification, scan
   cancellation, and import cancellation.

@@ -5,8 +5,9 @@ use sync_core::{
     ImportReport, OperationJournal, ScanDashboardReport, SnapshotSummary, SnapshotValidationReport,
     create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
     default_repository_root, detect_codex_processes, import_local_snapshot,
-    import_local_snapshot_with_control, recover_incomplete_operation, scan_codex_home,
-    scan_codex_home_with_control, validate_local_snapshot, validate_local_snapshot_with_control,
+    import_local_snapshot_with_control, recover_incomplete_operation, scan_codex_home_dashboard,
+    scan_codex_home_dashboard_with_control, validate_local_snapshot,
+    validate_local_snapshot_with_control,
 };
 use tauri::State;
 
@@ -27,9 +28,7 @@ async fn scan_local_codex(codex_home: Option<String>) -> Result<ScanDashboardRep
             .filter(|value| !value.trim().is_empty())
             .map(Into::into)
             .unwrap_or_else(default_codex_home);
-        scan_codex_home(home)
-            .map(|report| ScanDashboardReport::from(&report))
-            .map_err(|error| error.to_string())
+        scan_codex_home_dashboard(home).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -118,8 +117,7 @@ fn list_codex_processes() -> Vec<sync_core::CodexProcess> {
 fn start_scan_job(jobs: State<'_, JobManager>, codex_home: Option<String>) -> JobSnapshot {
     let home = resolve_codex_home(codex_home);
     jobs.start("scan", true, move |control| {
-        scan_codex_home_with_control(home, &control)
-            .map(|report| ScanDashboardReport::from(&report))
+        scan_codex_home_dashboard_with_control(home, &control)
     })
 }
 

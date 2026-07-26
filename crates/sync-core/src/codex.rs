@@ -11,12 +11,13 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::models::{
-    ContentObject, RelatedRecords, ScanReport, ScanWarning, ScanWarningKind,
-    THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, WorkspaceRef,
+    ContentObject, RelatedRecords, ScanDashboardReport, ScanReport, ScanWarning, ScanWarningKind,
+    THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, ThreadPreview, WorkspaceRef,
 };
 use crate::operation::{OperationControl, OperationProgress};
 
 const SESSION_DIRS: [(&str, bool); 2] = [("sessions", false), ("archived_sessions", true)];
+const MAX_SESSION_META_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct RolloutRecord {
@@ -24,7 +25,64 @@ struct RolloutRecord {
     archived: bool,
     cwd: Option<String>,
     model_provider: Option<String>,
-    rollout: ContentObject,
+    rollout: ScannedRollout,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedRollout {
+    pub(crate) byte_length: u64,
+    pub(crate) media_type: String,
+    pub(crate) logical_path: Option<String>,
+    pub(crate) source_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ScannedThread {
+    pub(crate) schema_version: u32,
+    pub(crate) thread_id: String,
+    pub(crate) title: String,
+    pub(crate) archived: bool,
+    pub(crate) created_at_ms: Option<i64>,
+    pub(crate) updated_at_ms: Option<i64>,
+    pub(crate) model_provider: Option<String>,
+    pub(crate) workspace: WorkspaceRef,
+    pub(crate) rollout: ScannedRollout,
+    pub(crate) related_records: RelatedRecords,
+}
+
+impl ScannedThread {
+    pub(crate) fn into_bundle(self, sha256: String) -> ThreadBundle {
+        ThreadBundle {
+            schema_version: self.schema_version,
+            thread_id: self.thread_id,
+            title: self.title,
+            archived: self.archived,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            model_provider: self.model_provider,
+            workspace: self.workspace,
+            rollout: ContentObject {
+                sha256,
+                byte_length: self.rollout.byte_length,
+                media_type: self.rollout.media_type,
+                logical_path: self.rollout.logical_path,
+                source_path: Some(self.rollout.source_path),
+            },
+            related_records: self.related_records,
+            attachments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataScanReport {
+    pub(crate) codex_home: PathBuf,
+    pub(crate) database_paths: Vec<PathBuf>,
+    pub(crate) active_count: usize,
+    pub(crate) archived_count: usize,
+    pub(crate) total_rollout_bytes: u64,
+    pub(crate) threads: Vec<ScannedThread>,
+    pub(crate) warnings: Vec<ScanWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,10 +114,85 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
     scan_codex_home_with_control(codex_home, &OperationControl::default())
 }
 
+pub fn scan_codex_home_dashboard(codex_home: impl AsRef<Path>) -> Result<ScanDashboardReport> {
+    scan_codex_home_dashboard_with_control(codex_home, &OperationControl::default())
+}
+
+pub fn scan_codex_home_dashboard_with_control(
+    codex_home: impl AsRef<Path>,
+    control: &OperationControl,
+) -> Result<ScanDashboardReport> {
+    let report = scan_codex_home_metadata_with_control(codex_home, control)?;
+    Ok(ScanDashboardReport {
+        codex_home: report.codex_home,
+        database_paths: report.database_paths,
+        active_count: report.active_count,
+        archived_count: report.archived_count,
+        total_rollout_bytes: report.total_rollout_bytes,
+        total_count: report.threads.len(),
+        threads: report
+            .threads
+            .iter()
+            .take(8)
+            .map(|thread| ThreadPreview {
+                thread_id: thread.thread_id.clone(),
+                title: thread.title.clone(),
+                archived: thread.archived,
+                model_provider: thread.model_provider.clone(),
+                workspace: thread.workspace.clone(),
+            })
+            .collect(),
+        warnings: report.warnings,
+    })
+}
+
 pub fn scan_codex_home_with_control(
     codex_home: impl AsRef<Path>,
     control: &OperationControl,
 ) -> Result<ScanReport> {
+    let report = scan_codex_home_metadata_with_control(codex_home, control)?;
+    let thread_count = report.threads.len() as u64;
+    let mut threads = Vec::with_capacity(report.threads.len());
+    for (index, thread) in report.threads.into_iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "hash_rollouts".to_string(),
+            message: thread.title.clone(),
+            completed: index as u64,
+            total: Some(thread_count),
+            unit: "files".to_string(),
+            cancellable: true,
+        });
+        let mut file = File::open(&thread.rollout.source_path).with_context(|| {
+            format!(
+                "failed to open rollout {}",
+                thread.rollout.source_path.display()
+            )
+        })?;
+        let hash = sha256_reader(&mut file, control).with_context(|| {
+            format!(
+                "failed to hash rollout {}",
+                thread.rollout.source_path.display()
+            )
+        })?;
+        threads.push(thread.into_bundle(hash));
+    }
+
+    Ok(ScanReport {
+        codex_home: report.codex_home,
+        database_paths: report.database_paths,
+        active_count: report.active_count,
+        archived_count: report.archived_count,
+        total_rollout_bytes: report.total_rollout_bytes,
+        threads,
+        warnings: report.warnings,
+    })
+}
+
+pub(crate) fn scan_codex_home_metadata_with_control(
+    codex_home: impl AsRef<Path>,
+    control: &OperationControl,
+) -> Result<MetadataScanReport> {
     let codex_home = codex_home.as_ref().to_path_buf();
     control.report(OperationProgress::indeterminate(
         "scan",
@@ -182,7 +315,7 @@ pub fn scan_codex_home_with_control(
             tables: BTreeMap::from([("threads".to_string(), vec![record.row.clone()])]),
         });
 
-        threads.push(ThreadBundle {
+        threads.push(ScannedThread {
             schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
             thread_id,
             title,
@@ -196,11 +329,10 @@ pub fn scan_codex_home_with_control(
             },
             rollout: rollout.rollout,
             related_records,
-            attachments: Vec::new(),
         });
     }
 
-    Ok(ScanReport {
+    Ok(MetadataScanReport {
         codex_home,
         database_paths,
         active_count,
@@ -229,18 +361,26 @@ fn read_rollout_record(
         return Ok(None);
     }
 
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open rollout {}", path.display()))?;
-    let hash = sha256_reader(&mut file, control)
-        .with_context(|| format!("failed to hash rollout {}", path.display()))?;
-
+    control.check_cancelled()?;
     let file =
-        File::open(path).with_context(|| format!("failed to reopen rollout {}", path.display()))?;
-    let mut reader = BufReader::new(file);
+        File::open(path).with_context(|| format!("failed to open rollout {}", path.display()))?;
+    let reader = BufReader::new(file);
     let mut first_line = Vec::new();
     reader
+        .take(MAX_SESSION_META_BYTES + 1)
         .read_until(b'\n', &mut first_line)
         .with_context(|| format!("failed to read rollout {}", path.display()))?;
+    if first_line.len() as u64 > MAX_SESSION_META_BYTES {
+        warnings.push(ScanWarning {
+            kind: ScanWarningKind::InvalidJson,
+            path: path.to_path_buf(),
+            message: format!(
+                "Rollout session metadata exceeds {} bytes",
+                MAX_SESSION_META_BYTES
+            ),
+        });
+        return Ok(None);
+    }
 
     let first_line = match std::str::from_utf8(&first_line) {
         Ok(value) => value,
@@ -304,12 +444,11 @@ fn read_rollout_record(
         archived,
         cwd: string_field(&Value::Object(payload.clone()), "cwd"),
         model_provider: string_field(&Value::Object(payload), "model_provider"),
-        rollout: ContentObject {
-            sha256: hash,
+        rollout: ScannedRollout {
             byte_length: metadata.len(),
             media_type: "application/x-ndjson".to_string(),
             logical_path: Some(logical_path.to_string()),
-            source_path: Some(path.to_path_buf()),
+            source_path: path.to_path_buf(),
         },
     }))
 }
@@ -516,7 +655,10 @@ fn sha256_reader(reader: &mut impl Read, control: &OperationControl) -> Result<S
 mod tests {
     use super::*;
     use rusqlite::Connection;
-    use std::sync::atomic::Ordering;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
     use tempfile::tempdir;
 
     fn write_rollout(root: &Path, name: &str, payload: Value, body: &str) -> PathBuf {
@@ -573,6 +715,35 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_scan_reads_metadata_without_hashing_rollouts() {
+        let temp = tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        write_rollout(
+            &sessions,
+            "rollout-thread-1.jsonl",
+            json!({"id": "thread-1"}),
+            &"x".repeat(1024 * 1024),
+        );
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let reporter_phases = phases.clone();
+        let control = OperationControl::new(Arc::new(AtomicBool::new(false)), move |progress| {
+            reporter_phases.lock().unwrap().push(progress.phase);
+        });
+
+        let dashboard = scan_codex_home_dashboard_with_control(temp.path(), &control).unwrap();
+
+        assert_eq!(dashboard.total_count, 1);
+        assert!(
+            !phases
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|phase| phase == "hash_rollouts")
+        );
+    }
+
+    #[test]
     fn empty_rollout_is_a_warning_not_a_scan_failure() {
         let temp = tempdir().unwrap();
         let sessions = temp.path().join("sessions");
@@ -595,6 +766,24 @@ mod tests {
         let report = scan_codex_home(temp.path()).unwrap();
         assert_eq!(report.total_count(), 0);
         assert_eq!(report.warnings[0].kind, ScanWarningKind::InvalidJson);
+    }
+
+    #[test]
+    fn oversized_metadata_line_is_bounded_and_skipped() {
+        let temp = tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-oversized.jsonl"),
+            vec![b'x'; MAX_SESSION_META_BYTES as usize + 2],
+        )
+        .unwrap();
+
+        let dashboard = scan_codex_home_dashboard(temp.path()).unwrap();
+
+        assert_eq!(dashboard.total_count, 0);
+        assert_eq!(dashboard.warnings[0].kind, ScanWarningKind::InvalidJson);
+        assert!(dashboard.warnings[0].message.contains("exceeds"));
     }
 
     #[test]

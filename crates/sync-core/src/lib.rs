@@ -4,7 +4,10 @@ pub mod models;
 pub mod operation;
 pub mod process;
 
-pub use codex::{default_codex_home, scan_codex_home, scan_codex_home_with_control};
+pub use codex::{
+    default_codex_home, scan_codex_home, scan_codex_home_dashboard,
+    scan_codex_home_dashboard_with_control, scan_codex_home_with_control,
+};
 pub use local::{
     create_local_snapshot, create_local_snapshot_with_control, default_repository_root,
     import_local_snapshot, import_local_snapshot_with_control, recover_incomplete_operation,

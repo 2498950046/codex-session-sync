@@ -1,8 +1,8 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -14,7 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::codex::scan_codex_home_with_control;
+use crate::codex::{scan_codex_home_metadata_with_control, scan_codex_home_with_control};
 use crate::models::{
     ImportReport, JournalRollout, LOCAL_SNAPSHOT_SCHEMA_VERSION, LocalSnapshot,
     OPERATION_JOURNAL_SCHEMA_VERSION, OperationJournal, OperationStatus, SnapshotSummary,
@@ -37,6 +37,38 @@ struct PreparedThread {
     object_path: PathBuf,
     target_path: PathBuf,
     temporary_path: PathBuf,
+}
+
+const SOURCE_OBJECT_INDEX_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceObjectIndex {
+    schema_version: u32,
+    entries: BTreeMap<String, SourceObjectIndexEntry>,
+}
+
+impl Default for SourceObjectIndex {
+    fn default() -> Self {
+        Self {
+            schema_version: SOURCE_OBJECT_INDEX_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct SourceObjectIndexEntry {
+    byte_length: u64,
+    modified_unix_nanos: u64,
+    sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceFingerprint {
+    byte_length: u64,
+    modified_unix_nanos: u64,
 }
 
 pub fn default_repository_root() -> PathBuf {
@@ -68,29 +100,34 @@ pub fn create_local_snapshot_with_control(
         bail!("snapshot creation requires confirmation that Codex is fully closed");
     }
     let repository_root = repository_root.as_ref();
-    let report = scan_codex_home_with_control(codex_home, control)?;
+    let report = scan_codex_home_metadata_with_control(codex_home, control)?;
     ensure_repository_layout(repository_root)?;
+    let index_path = source_object_index_path(repository_root);
+    let mut source_index = load_source_object_index(&index_path);
 
     let mut unique_objects = BTreeSet::new();
-    for (index, thread) in report.threads.iter().enumerate() {
+    let thread_count = report.threads.len();
+    let mut threads = Vec::with_capacity(thread_count);
+    for (index, thread) in report.threads.into_iter().enumerate() {
         control.check_cancelled()?;
         control.report(OperationProgress {
             phase: "snapshot_objects".to_string(),
             message: thread.title.clone(),
             completed: index as u64,
-            total: Some(report.threads.len() as u64),
+            total: Some(thread_count as u64),
             unit: "threads".to_string(),
             cancellable: true,
         });
-        let source_path = thread.rollout.source_path.as_deref().with_context(|| {
-            format!(
-                "thread {} has no local rollout source path",
-                thread.thread_id
-            )
-        })?;
-        let object_path = object_path(repository_root, &thread.rollout.sha256)?;
-        store_object(source_path, &object_path, &thread.rollout.sha256, control)?;
-        unique_objects.insert(thread.rollout.sha256.clone());
+        let source_path = thread.rollout.source_path.clone();
+        let sha256 = store_snapshot_object(
+            &source_path,
+            thread.rollout.byte_length,
+            repository_root,
+            &mut source_index,
+            control,
+        )?;
+        unique_objects.insert(sha256.clone());
+        threads.push(thread.into_bundle(sha256));
     }
 
     let snapshot_id = Uuid::now_v7().to_string();
@@ -98,7 +135,7 @@ pub fn create_local_snapshot_with_control(
         schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: snapshot_id.clone(),
         created_at: Utc::now().to_rfc3339(),
-        threads: report.threads,
+        threads,
         warning_count: report.warnings.len(),
     };
     let manifest_path = repository_root
@@ -109,6 +146,7 @@ pub fn create_local_snapshot_with_control(
         "snapshot_manifest",
         "正在写入快照清单",
     ));
+    atomic_write_json(&index_path, &source_index)?;
     atomic_write_json(&manifest_path, &snapshot)?;
 
     Ok(SnapshotSummary {
@@ -761,10 +799,59 @@ fn safe_rollout_path(thread: &ThreadBundle) -> Result<PathBuf> {
 }
 
 fn ensure_repository_layout(root: &Path) -> Result<()> {
-    for directory in ["objects/sha256", "snapshots", "backups", "journal"] {
+    for directory in [
+        "objects/sha256",
+        "objects/tmp",
+        "index",
+        "snapshots",
+        "backups",
+        "journal",
+    ] {
         fs::create_dir_all(root.join(directory))?;
     }
     Ok(())
+}
+
+fn source_object_index_path(root: &Path) -> PathBuf {
+    root.join("index").join("source-objects-v1.json")
+}
+
+fn load_source_object_index(path: &Path) -> SourceObjectIndex {
+    let Ok(file) = File::open(path) else {
+        return SourceObjectIndex::default();
+    };
+    let Ok(index) = serde_json::from_reader::<_, SourceObjectIndex>(BufReader::new(file)) else {
+        return SourceObjectIndex::default();
+    };
+    if index.schema_version != SOURCE_OBJECT_INDEX_SCHEMA_VERSION {
+        return SourceObjectIndex::default();
+    }
+    index
+}
+
+fn source_index_key(source: &Path) -> String {
+    fs::canonicalize(source)
+        .unwrap_or_else(|_| source.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn source_fingerprint(source: &Path) -> Result<SourceFingerprint> {
+    let metadata = fs::metadata(source)
+        .with_context(|| format!("failed to stat rollout {}", source.display()))?;
+    let modified = metadata
+        .modified()
+        .with_context(|| format!("failed to read modification time for {}", source.display()))?;
+    let modified_unix_nanos = modified
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| format!("invalid modification time for {}", source.display()))?
+        .as_nanos()
+        .try_into()
+        .with_context(|| format!("modification time is out of range for {}", source.display()))?;
+    Ok(SourceFingerprint {
+        byte_length: metadata.len(),
+        modified_unix_nanos,
+    })
 }
 
 fn object_path(root: &Path, sha256: &str) -> Result<PathBuf> {
@@ -781,30 +868,108 @@ fn object_path(root: &Path, sha256: &str) -> Result<PathBuf> {
         .join(&digest[2..]))
 }
 
-fn store_object(
+fn store_snapshot_object(
     source: &Path,
-    destination: &Path,
-    expected_hash: &str,
+    expected_length: u64,
+    repository_root: &Path,
+    source_index: &mut SourceObjectIndex,
     control: &OperationControl,
-) -> Result<()> {
-    if destination.exists() {
-        validate_object(destination, expected_hash, fs::metadata(source)?.len())?;
-        return Ok(());
+) -> Result<String> {
+    let before = source_fingerprint(source)?;
+    if before.byte_length != expected_length {
+        bail!(
+            "rollout changed after metadata scan: {} expected {} bytes, got {}",
+            source.display(),
+            expected_length,
+            before.byte_length
+        );
     }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
+    let source_key = source_index_key(source);
+    if let Some(entry) = source_index.entries.get(&source_key)
+        && entry.byte_length == before.byte_length
+        && entry.modified_unix_nanos == before.modified_unix_nanos
+        && let Ok(destination) = object_path(repository_root, &entry.sha256)
+        && fs::metadata(&destination)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == before.byte_length)
+    {
+        return Ok(entry.sha256.clone());
     }
-    let temporary = temporary_sibling(destination, "object");
-    copy_verified_object(source, &temporary, expected_hash, Some(control))?;
-    match fs::rename(&temporary, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if destination.exists() => {
-            let _ = fs::remove_file(&temporary);
-            validate_object(destination, expected_hash, fs::metadata(source)?.len()).context(error)
+
+    let temporary = repository_root
+        .join("objects")
+        .join("tmp")
+        .join(format!("{}.object.tmp", Uuid::now_v7()));
+    let copy_result = (|| -> Result<String> {
+        let input = File::open(source)?;
+        let mut reader = BufReader::new(input);
+        let output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        let mut writer = BufWriter::new(output);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            control.check_cancelled()?;
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
         }
-        Err(error) => Err(error)
-            .with_context(|| format!("failed to install content object {}", destination.display())),
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        let after = source_fingerprint(source)?;
+        if after != before {
+            bail!(
+                "rollout changed while creating snapshot: {}",
+                source.display()
+            );
+        }
+        let sha256 = format!("sha256:{}", hex::encode(hasher.finalize()));
+        let destination = object_path(repository_root, &sha256)?;
+        if destination.exists() {
+            validate_object(&destination, &sha256, before.byte_length)?;
+            fs::remove_file(&temporary)?;
+        } else {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            match fs::rename(&temporary, &destination) {
+                Ok(()) => {}
+                Err(error) if destination.exists() => {
+                    fs::remove_file(&temporary)?;
+                    validate_object(&destination, &sha256, before.byte_length).context(error)?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to install content object {}", destination.display())
+                    });
+                }
+            }
+        }
+        Ok(sha256)
+    })();
+    if copy_result.is_err() {
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
     }
+    let sha256 = copy_result?;
+    source_index.entries.insert(
+        source_key,
+        SourceObjectIndexEntry {
+            byte_length: before.byte_length,
+            modified_unix_nanos: before.modified_unix_nanos,
+            sha256: sha256.clone(),
+        },
+    );
+    Ok(sha256)
 }
 
 fn copy_verified_object(
@@ -1011,6 +1176,75 @@ mod tests {
             validate_local_snapshot(&summary.manifest_path, repository.path()).unwrap();
         assert!(validation.valid);
         assert_eq!(validation.snapshot_id, summary.snapshot_id);
+    }
+
+    #[test]
+    fn snapshot_hashes_while_copying_without_a_separate_hash_phase() {
+        let source = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(
+            source.path(),
+            &[("thread-1", "Demo", &"x".repeat(1024 * 1024))],
+        );
+        let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reporter_phases = phases.clone();
+        let control = OperationControl::new(Arc::new(AtomicBool::new(false)), move |progress| {
+            reporter_phases.lock().unwrap().push(progress.phase);
+        });
+
+        create_local_snapshot_with_control(source.path(), repository.path(), true, &control)
+            .unwrap();
+
+        assert!(
+            !phases
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|phase| phase == "hash_rollouts")
+        );
+    }
+
+    #[test]
+    fn unchanged_source_reuses_trusted_index_but_full_validation_still_detects_corruption() {
+        let source = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(source.path(), &[("thread-1", "Demo", "abcdefgh")]);
+        let first = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let manifest: LocalSnapshot = read_json(&first.manifest_path).unwrap();
+        let object = object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
+        let mut bytes = fs::read(&object).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        fs::write(&object, bytes).unwrap();
+
+        let second = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let error = validate_local_snapshot(&second.manifest_path, repository.path()).unwrap_err();
+
+        assert!(error.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn changed_source_invalidates_trusted_index() {
+        let source = tempdir().unwrap();
+        let repository = tempdir().unwrap();
+        create_codex_home(source.path(), &[("thread-1", "Demo", "abcdefgh")]);
+        let first = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let first_manifest: LocalSnapshot = read_json(&first.manifest_path).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let rollout = source
+            .path()
+            .join("sessions/2026/07/24/rollout-thread-1.jsonl");
+        let original = fs::read_to_string(&rollout).unwrap();
+        fs::write(&rollout, original.replace("abcdefgh", "abcdxfgh")).unwrap();
+
+        let second = create_local_snapshot(source.path(), repository.path(), true).unwrap();
+        let second_manifest: LocalSnapshot = read_json(&second.manifest_path).unwrap();
+
+        assert_ne!(
+            first_manifest.threads[0].rollout.sha256,
+            second_manifest.threads[0].rollout.sha256
+        );
+        validate_local_snapshot(&second.manifest_path, repository.path()).unwrap();
     }
 
     #[test]
