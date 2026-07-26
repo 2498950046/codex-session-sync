@@ -3144,12 +3144,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
+ "chrono",
+ "futures-util",
+ "hex",
+ "rusqlite",
  "serde",
+ "serde_json",
+ "sha2",
  "sync-core",
+ "tempfile",
+ "thiserror 2.0.19",
  "tokio",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
