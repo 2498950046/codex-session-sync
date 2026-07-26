@@ -6,11 +6,12 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sync_core::{
     CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, LocalSnapshot, OperationControl,
-    OperationProgress, ThreadBundle, ThreadConflict, TrackingStore,
-    checkout_local_snapshot_with_tracking_control, collect_object_descriptors,
-    create_local_snapshot_with_control, install_repository_object, load_local_snapshot,
-    merge_thread_sets, remote_thread_view, repository_object_path, revision_to_snapshot,
-    semantic_thread_hash, snapshot_to_revision, store_local_snapshot, validate_repository_object,
+    OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome,
+    TrackingRecord, TrackingStore, checkout_local_snapshot_with_tracking_control,
+    collect_object_descriptors, create_local_snapshot_with_control, install_repository_object,
+    load_local_snapshot, merge_thread_sets, remote_thread_view, repository_object_path,
+    resolve_thread_sets, revision_to_snapshot, semantic_thread_hash, snapshot_to_revision,
+    store_local_snapshot, validate_repository_object,
 };
 use uuid::Uuid;
 
@@ -26,6 +27,7 @@ const MAX_ANCESTRY_DEPTH: usize = 10_000;
 pub enum SyncOutcomeKind {
     Pushed,
     Pulled,
+    Merged,
     Switched,
     NoChanges,
     Conflict,
@@ -213,6 +215,187 @@ pub fn pull_namespace(
     repository_root: &Path,
     control: &OperationControl,
 ) -> Result<SyncReport> {
+    let prepared = match prepare_pull(
+        remote_id,
+        namespace_id,
+        client,
+        codex_home,
+        repository_root,
+        control,
+    )? {
+        PreparedPull::NoChanges { head } => {
+            return Ok(SyncReport {
+                kind: SyncOutcomeKind::NoChanges,
+                namespace_id,
+                previous_head: head.clone(),
+                head: head.clone(),
+                revision_id: head,
+                uploaded_objects: 0,
+                downloaded_objects: 0,
+                thread_count: 0,
+                conflicts: Vec::new(),
+                checkout: None,
+            });
+        }
+        PreparedPull::Merge(prepared) => *prepared,
+    };
+    if !prepared.merged.conflicts.is_empty() {
+        return Ok(SyncReport {
+            kind: SyncOutcomeKind::Conflict,
+            namespace_id,
+            previous_head: prepared.previous_head,
+            head: Some(prepared.remote_head.clone()),
+            revision_id: Some(prepared.remote_head),
+            uploaded_objects: 0,
+            downloaded_objects: prepared.downloaded,
+            thread_count: prepared.merged.threads.len(),
+            conflicts: prepared.merged.conflicts,
+            checkout: None,
+        });
+    }
+    let thread_count = prepared.merged.threads.len();
+    let checkout = apply_prepared_pull(
+        codex_home,
+        repository_root,
+        CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: Some(prepared.record.generation),
+            integrated_head: Some(prepared.remote_head.clone()),
+            activate_namespace: true,
+        },
+        prepared.merged.threads,
+        control,
+    )?;
+    Ok(SyncReport {
+        kind: SyncOutcomeKind::Pulled,
+        namespace_id,
+        previous_head: prepared.previous_head,
+        head: Some(prepared.remote_head.clone()),
+        revision_id: Some(prepared.remote_head),
+        uploaded_objects: 0,
+        downloaded_objects: prepared.downloaded,
+        thread_count,
+        conflicts: Vec::new(),
+        checkout: Some(checkout),
+    })
+}
+
+pub fn resolve_pull_conflicts(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    resolutions: &[ThreadConflictResolution],
+    client: &RemoteClient,
+    codex_home: &Path,
+    repository_root: &Path,
+    control: &OperationControl,
+) -> Result<SyncReport> {
+    let prepared = match prepare_pull(
+        remote_id,
+        namespace_id,
+        client,
+        codex_home,
+        repository_root,
+        control,
+    )? {
+        PreparedPull::NoChanges { .. } => {
+            bail!("there are no remote changes to resolve; pull again")
+        }
+        PreparedPull::Merge(prepared) => *prepared,
+    };
+    if prepared.merged.conflicts.is_empty() {
+        bail!("the conflict set changed and now merges automatically; pull again");
+    }
+    control.report(OperationProgress {
+        phase: "resolve_conflicts".to_string(),
+        message: "Validating explicit conflict choices".to_string(),
+        completed: 0,
+        total: Some(prepared.merged.conflicts.len() as u64),
+        unit: "conflicts".to_string(),
+        cancellable: true,
+    });
+    let resolved_threads = resolve_thread_sets(
+        &prepared.base,
+        &prepared.local.threads,
+        &prepared.remote_threads,
+        resolutions,
+    )?;
+    let thread_count = resolved_threads.len();
+    let previous_head = prepared.previous_head.clone();
+    let downloaded = prepared.downloaded;
+    let checkout = apply_prepared_pull(
+        codex_home,
+        repository_root,
+        CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: Some(prepared.record.generation),
+            integrated_head: Some(prepared.remote_head.clone()),
+            activate_namespace: true,
+        },
+        resolved_threads,
+        control,
+    )?;
+
+    // Applying first preserves the user's explicit merge locally if the remote Head changes
+    // before the following CAS push. Tracking still points at the integrated remote parent, so
+    // the ordinary pull path can safely re-plan instead of overwriting either side.
+    let publish_control = control.non_cancellable();
+    publish_control.report(OperationProgress {
+        phase: "resolve_publish".to_string(),
+        message: "Publishing the resolved revision".to_string(),
+        completed: 0,
+        total: None,
+        unit: "steps".to_string(),
+        cancellable: false,
+    });
+    let pushed = push_namespace(
+        remote_id,
+        namespace_id,
+        client,
+        codex_home,
+        repository_root,
+        &publish_control,
+    )
+    .context("conflicts were safely applied locally, but publishing failed; use Push to retry")?;
+    Ok(SyncReport {
+        kind: SyncOutcomeKind::Merged,
+        namespace_id,
+        previous_head,
+        head: pushed.head,
+        revision_id: pushed.revision_id,
+        uploaded_objects: pushed.uploaded_objects,
+        downloaded_objects: downloaded + pushed.downloaded_objects,
+        thread_count,
+        conflicts: Vec::new(),
+        checkout: Some(checkout),
+    })
+}
+
+enum PreparedPull {
+    NoChanges { head: Option<String> },
+    Merge(Box<PullMergePreparation>),
+}
+
+struct PullMergePreparation {
+    record: TrackingRecord,
+    previous_head: Option<String>,
+    remote_head: String,
+    base: Vec<ThreadBundle>,
+    local: LocalSnapshot,
+    remote_threads: Vec<ThreadBundle>,
+    merged: ThreadMergeOutcome,
+    downloaded: usize,
+}
+
+fn prepare_pull(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    codex_home: &Path,
+    repository_root: &Path,
+    control: &OperationControl,
+) -> Result<PreparedPull> {
     ensure_codex_closed()?;
     client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
@@ -228,17 +411,8 @@ pub fn pull_namespace(
     let previous_head = record.integrated_head.clone();
     let remote_head = client.namespace_head(namespace_id)?;
     if remote_head == previous_head {
-        return Ok(SyncReport {
-            kind: SyncOutcomeKind::NoChanges,
-            namespace_id,
-            previous_head: previous_head.clone(),
-            head: remote_head,
-            revision_id: previous_head,
-            uploaded_objects: 0,
-            downloaded_objects: 0,
-            thread_count: 0,
-            conflicts: Vec::new(),
-            checkout: None,
+        return Ok(PreparedPull::NoChanges {
+            head: previous_head,
         });
     }
     let remote_head = remote_head.context("remote namespace has no revision to pull")?;
@@ -256,7 +430,6 @@ pub fn pull_namespace(
         repository_root,
         control,
     )?;
-
     let local_summary =
         create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
     if local_summary.warning_count > 0 {
@@ -271,56 +444,44 @@ pub fn pull_namespace(
         }
         None => Vec::new(),
     };
-    let merged = merge_thread_sets(&base, &local.threads, &remote_revision.payload.threads)?;
-    if !merged.conflicts.is_empty() {
-        return Ok(SyncReport {
-            kind: SyncOutcomeKind::Conflict,
-            namespace_id,
-            previous_head,
-            head: Some(remote_head.clone()),
-            revision_id: Some(remote_head),
-            uploaded_objects: 0,
-            downloaded_objects: downloaded,
-            thread_count: merged.threads.len(),
-            conflicts: merged.conflicts,
-            checkout: None,
-        });
-    }
-    let merged_snapshot = LocalSnapshot {
+    let remote_threads = remote_revision.payload.threads;
+    let merged = merge_thread_sets(&base, &local.threads, &remote_threads)?;
+    Ok(PreparedPull::Merge(Box::new(PullMergePreparation {
+        record,
+        previous_head,
+        remote_head,
+        base,
+        local,
+        remote_threads,
+        merged,
+        downloaded,
+    })))
+}
+
+fn apply_prepared_pull(
+    codex_home: &Path,
+    repository_root: &Path,
+    tracking_update: CheckoutTrackingUpdate,
+    threads: Vec<ThreadBundle>,
+    control: &OperationControl,
+) -> Result<CheckoutReport> {
+    let snapshot = LocalSnapshot {
         schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: Uuid::now_v7().to_string(),
         created_at: Utc::now().to_rfc3339(),
-        threads: merged.threads,
+        threads,
         warning_count: 0,
     };
-    let manifest = store_local_snapshot(&merged_snapshot, repository_root)?;
+    let manifest = store_local_snapshot(&snapshot, repository_root)?;
     ensure_codex_closed()?;
-    let checkout = checkout_local_snapshot_with_tracking_control(
+    checkout_local_snapshot_with_tracking_control(
         manifest,
         codex_home,
         repository_root,
         true,
-        CheckoutTrackingUpdate {
-            remote_id,
-            namespace_id,
-            expected_generation: Some(record.generation),
-            integrated_head: Some(remote_head.clone()),
-            activate_namespace: true,
-        },
+        tracking_update,
         control,
-    )?;
-    Ok(SyncReport {
-        kind: SyncOutcomeKind::Pulled,
-        namespace_id,
-        previous_head,
-        head: Some(remote_head.clone()),
-        revision_id: Some(remote_head),
-        uploaded_objects: 0,
-        downloaded_objects: downloaded,
-        thread_count: merged_snapshot.threads.len(),
-        conflicts: Vec::new(),
-        checkout: Some(checkout),
-    })
+    )
 }
 
 pub fn switch_namespace(
@@ -838,6 +999,135 @@ mod tests {
         });
     }
 
+    #[test]
+    fn divergent_same_thread_is_resolved_explicitly_then_pushed_and_pulled() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let token = "test-token-that-is-long-enough-for-auth";
+        let config = sync_server::ServerConfig {
+            bind: "127.0.0.1:0".to_string(),
+            data_dir: temp.path().join("server"),
+            token: token.to_string(),
+            max_object_bytes: 1024 * 1024,
+            max_manifest_bytes: 1024 * 1024,
+        };
+        let (address, task) = runtime.block_on(async {
+            let state = sync_server::AppState::initialize(&config).await.unwrap();
+            let app: Router = sync_server::build_router(state, &config);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await });
+            (address, task)
+        });
+        let client = RemoteClient::new(
+            &format!("http://{address}"),
+            SecretToken::new(token.to_string()).unwrap(),
+        )
+        .unwrap();
+        let namespace = client.create_namespace("Personal".to_string()).unwrap();
+        let remote_id = Uuid::now_v7();
+        let home_a = temp.path().join("home-a");
+        let home_b = temp.path().join("home-b");
+        let repository_a = temp.path().join("repository-a");
+        let repository_b = temp.path().join("repository-b");
+        initialize_home(&home_a);
+        initialize_home(&home_b);
+        insert_fixture_thread(&home_a, "shared-thread");
+
+        push_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            &home_a,
+            &repository_a,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        switch_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            None,
+            &home_b,
+            &repository_b,
+            &OperationControl::default(),
+        )
+        .unwrap();
+
+        modify_fixture_thread(&home_a, "shared-thread", "来自 A", "event-a");
+        let pushed_a = push_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            &home_a,
+            &repository_a,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        modify_fixture_thread(&home_b, "shared-thread", "来自 B", "event-b");
+
+        let conflicted = pull_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            &home_b,
+            &repository_b,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        assert_eq!(conflicted.kind, SyncOutcomeKind::Conflict);
+        assert_eq!(conflicted.conflicts.len(), 1);
+        let conflict = &conflicted.conflicts[0];
+        assert_eq!(conflict.local.as_ref().unwrap().title, "来自 B");
+        assert_eq!(conflict.remote.as_ref().unwrap().title, "来自 A");
+        let resolutions = vec![ThreadConflictResolution {
+            conflict_id: conflict.conflict_id.clone(),
+            thread_id: conflict.thread_id.clone(),
+            choice: sync_core::ThreadResolutionChoice::Local,
+        }];
+
+        let resolved = resolve_pull_conflicts(
+            remote_id,
+            namespace.id,
+            &resolutions,
+            &client,
+            &home_b,
+            &repository_b,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.kind, SyncOutcomeKind::Merged);
+        assert!(resolved.checkout.is_some());
+        assert_ne!(resolved.head, pushed_a.head);
+        assert_eq!(
+            sync_core::scan_codex_home(&home_b).unwrap().threads[0].title,
+            "来自 B"
+        );
+
+        let pulled_a = pull_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            &home_a,
+            &repository_a,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        assert_eq!(pulled_a.kind, SyncOutcomeKind::Pulled);
+        assert_eq!(
+            sync_core::scan_codex_home(&home_a).unwrap().threads[0].title,
+            "来自 B"
+        );
+
+        task.abort();
+        runtime.block_on(async {
+            let _ = task.await;
+        });
+    }
+
     fn initialize_home(home: &Path) {
         fs::create_dir_all(home.join("sessions/2026/07/26")).unwrap();
         fs::create_dir_all(home.join("archived_sessions")).unwrap();
@@ -886,6 +1176,30 @@ mod tests {
                 params![thread_id, rollout.to_string_lossy().as_ref()],
             )
             .unwrap();
+    }
+
+    fn modify_fixture_thread(home: &Path, thread_id: &str, title: &str, event: &str) {
+        let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
+        let rollout_path: String = connection
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE threads SET title = ?2, updated_at = updated_at + 1 WHERE id = ?1",
+                params![thread_id, title],
+            )
+            .unwrap();
+        let mut rollout = File::options().append(true).open(rollout_path).unwrap();
+        writeln!(
+            rollout,
+            "{}",
+            json!({"type": "event", "thread": thread_id, "event": event})
+        )
+        .unwrap();
     }
 
     fn test_thread(id: &str) -> ThreadBundle {

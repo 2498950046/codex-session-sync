@@ -4,11 +4,11 @@ A personal, self-hosted, Git-like synchronization system for Codex
 conversations. The repository contains a cross-platform Tauri desktop client,
 a Rust synchronization core, and an Axum server.
 
-Phase 3B is implemented: the desktop client can securely store a server token,
-manage remote namespaces, and perform Push, Pull, and exact namespace checkout
-through the authenticated server API. Remote operations run in the Tauri Rust
-backend; the React webview never receives the stored token or talks to the
-server directly.
+Phase 4 is implemented: the desktop client can securely store a server token,
+manage remote namespaces, perform Push, Pull, and exact namespace checkout,
+and explicitly resolve divergent changes to the same thread UUID. Remote
+operations run in the Tauri Rust backend; the React webview never receives the
+stored token or talks to the server directly.
 
 ## Repository layout
 
@@ -22,8 +22,9 @@ crates/sync-core/   Shared models and local Codex adapters
 
 The dashboard scanner opens Codex databases read-only and reads only rollout
 metadata instead of hashing every complete file. Snapshot creation, import,
-recovery, Push, Pull, and namespace switching require explicit confirmation
-that Codex is fully closed and a live cross-platform process check. The backend
+recovery, Push, Pull, conflict resolution, and namespace switching require
+explicit confirmation that Codex is fully closed and a live cross-platform
+process check. The backend
 also serializes write operations per normalized Codex Home, so another IPC
 request cannot bypass the GUI's busy state. Snapshot creation hashes each
 changed rollout while copying it once into the object store. Imports validate
@@ -65,6 +66,16 @@ in that local synchronization repository. If a `LocalApplied` journal no longer
 matches the live conversations or its Tracking compare-and-swap conflicts,
 recovery refuses to overwrite either side and leaves the journal for explicit
 resolution.
+
+Conflict choices are bound to immutable fingerprints derived from the base,
+local, and remote semantic thread hashes. The backend re-scans the local Codex
+Home and re-reads the current remote Head before accepting a choice. If any
+version or the conflict set changed while the GUI was open, resolution is
+rejected and Pull must be run again. Accepted choices are backed up and checked
+out locally first, then published with an ordinary Head compare-and-swap; there
+is no force-push path. Publishing becomes non-cancellable after the guarded
+local checkout completes. If publishing still fails, the resolved local state
+and its tracked remote parent remain safe and an ordinary Push can retry it.
 
 Exact checkout backs up every affected thread database and the rebuildable
 `codex-dev.db` local thread catalog before replacing session directories. It
@@ -109,14 +120,18 @@ actions. In the GUI:
 2. Create or select a namespace.
 3. Use Push to initialize an empty namespace or publish local changes.
 4. Use Pull when the active namespace has advanced remotely.
-5. Use namespace switch only after reviewing and accepting the exact local
+5. If Pull reports same-thread conflicts, compare the common base, local, and
+   remote summaries, choose the local or remote result for every item, then
+   select **应用选择并完成合并**. A deleted side is also an explicit choice.
+6. Use namespace switch only after reviewing and accepting the exact local
    replacement confirmation. A recoverable backup is always created first.
 
 Push never force-updates a remote namespace. If its Head is ahead of local
 Tracking and the thread content differs, the client rejects Push and requires
-Pull. Different thread UUIDs merge automatically; divergent edits to the same
-UUID return a conflict without changing local conversations or advancing
-Tracking.
+Pull. Different thread UUIDs merge automatically. Divergent edits or
+delete/modify changes to the same UUID open the conflict workbench and never
+change local conversations or advance Tracking until every item has an
+explicit, still-valid choice.
 If a prior Push reached the server but crashed before updating local Tracking,
 retrying Push recognizes semantically identical remote content and atomically
 repairs Tracking plus the active-namespace binding.
@@ -161,6 +176,11 @@ npm install
 npm run check
 npm run build
 ```
+
+For repeatable browser-only visual QA of the conflict workbench, run
+`npm run dev` and open `http://127.0.0.1:1420/?preview=conflict`. This mock is
+loaded only by the Vite development build and is removed from production
+bundles.
 
 The native credential-store smoke test is intentionally ignored during normal
 test runs because it briefly creates an isolated operating-system credential.

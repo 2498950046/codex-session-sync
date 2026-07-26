@@ -71,9 +71,39 @@ impl OperationControl {
     }
 
     pub fn non_cancellable(&self) -> Self {
+        let reporter = self.reporter.as_ref().map(|reporter| {
+            let reporter = reporter.clone();
+            Arc::new(move |mut progress: OperationProgress| {
+                progress.cancellable = false;
+                reporter(progress);
+            }) as ProgressReporter
+        });
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
-            reporter: self.reporter.clone(),
+            reporter,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn non_cancellable_control_ignores_cancellation_and_forces_progress_state() {
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let captured = reported.clone();
+        let control = OperationControl::new(cancelled, move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        assert!(control.check_cancelled().is_err());
+
+        let non_cancellable = control.non_cancellable();
+        assert!(non_cancellable.check_cancelled().is_ok());
+        non_cancellable.report(OperationProgress::indeterminate("publish", "Publishing"));
+        assert!(!reported.lock().unwrap()[0].cancellable);
     }
 }

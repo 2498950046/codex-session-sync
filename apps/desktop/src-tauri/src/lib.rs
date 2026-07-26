@@ -13,11 +13,11 @@ use remote::{RemoteClient, SecretToken};
 use remote_config::{
     CredentialStore, RemoteProfile, RemoteProfileStore, RemoteProfileSummary, SystemCredentialStore,
 };
-use remote_sync::{pull_namespace, push_namespace, switch_namespace};
+use remote_sync::{pull_namespace, push_namespace, resolve_pull_conflicts, switch_namespace};
 use serde::Serialize;
 use sync_core::{
     CheckoutJournal, ImportReport, OperationJournal, ScanDashboardReport, SnapshotSummary,
-    SnapshotValidationReport, TrackingStore, create_local_snapshot,
+    SnapshotValidationReport, ThreadConflictResolution, TrackingStore, create_local_snapshot,
     create_local_snapshot_with_control, default_codex_home, default_repository_root,
     detect_codex_processes, import_local_snapshot, import_local_snapshot_with_control,
     recover_checkout_operation, recover_incomplete_operation, scan_codex_home_dashboard,
@@ -500,6 +500,38 @@ fn start_pull_job(
 }
 
 #[tauri::command]
+fn start_conflict_resolution_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    resolutions: Vec<ThreadConflictResolution>,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_exclusive(&lock_home, "resolve", true, move |control| {
+        resolve_pull_conflicts(
+            remote_id,
+            namespace_id,
+            &resolutions,
+            &client,
+            &codex_home,
+            &repository,
+            &control,
+        )
+    })
+}
+
+#[tauri::command]
 fn start_namespace_switch_job(
     jobs: State<'_, JobManager>,
     repository_root: Option<String>,
@@ -721,6 +753,7 @@ pub fn run() {
             get_remote_namespace_status,
             start_push_job,
             start_pull_job,
+            start_conflict_resolution_job,
             start_namespace_switch_job
         ])
         .run(tauri::generate_context!())

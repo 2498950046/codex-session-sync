@@ -46,10 +46,40 @@ pub enum ThreadConflictKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct ThreadConflictVersion {
+    pub title: String,
+    pub archived: bool,
+    pub updated_at_ms: Option<i64>,
+    pub model_provider: Option<String>,
+    pub workspace_source_path: Option<String>,
+    pub semantic_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadConflict {
+    pub conflict_id: String,
     pub thread_id: String,
     pub title: String,
     pub kind: ThreadConflictKind,
+    pub base: Option<ThreadConflictVersion>,
+    pub local: Option<ThreadConflictVersion>,
+    pub remote: Option<ThreadConflictVersion>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadResolutionChoice {
+    Local,
+    Remote,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadConflictResolution {
+    pub conflict_id: String,
+    pub thread_id: String,
+    pub choice: ThreadResolutionChoice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -497,10 +527,18 @@ pub fn merge_thread_sets(
                     .or(base_thread)
                     .map(|thread| thread.title.clone())
                     .unwrap_or_else(|| id.clone());
+                let base = conflict_version(base_thread)?;
+                let local = conflict_version(local_thread)?;
+                let remote = conflict_version(remote_thread)?;
+                let conflict_id = conflict_fingerprint(&id, &kind, &base, &local, &remote)?;
                 conflicts.push(ThreadConflict {
+                    conflict_id,
                     thread_id: id,
                     title,
                     kind,
+                    base,
+                    local,
+                    remote,
                 });
                 None
             }
@@ -511,6 +549,97 @@ pub fn merge_thread_sets(
     }
     threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
     Ok(ThreadMergeOutcome { threads, conflicts })
+}
+
+pub fn resolve_thread_sets(
+    base: &[ThreadBundle],
+    local: &[ThreadBundle],
+    remote: &[ThreadBundle],
+    resolutions: &[ThreadConflictResolution],
+) -> Result<Vec<ThreadBundle>> {
+    let mut outcome = merge_thread_sets(base, local, remote)?;
+    let local = thread_map(local)?;
+    let remote = thread_map(remote)?;
+    let mut selected = BTreeMap::new();
+    for resolution in resolutions {
+        if selected
+            .insert(resolution.thread_id.as_str(), resolution)
+            .is_some()
+        {
+            bail!(
+                "duplicate conflict resolution for thread {}",
+                resolution.thread_id
+            );
+        }
+    }
+    if selected.len() != outcome.conflicts.len() {
+        bail!(
+            "conflict set changed: expected {} resolution(s), received {}",
+            outcome.conflicts.len(),
+            selected.len()
+        );
+    }
+
+    for conflict in &outcome.conflicts {
+        let resolution = selected.get(conflict.thread_id.as_str()).with_context(|| {
+            format!(
+                "conflict set changed: missing resolution for thread {}",
+                conflict.thread_id
+            )
+        })?;
+        if resolution.conflict_id != conflict.conflict_id {
+            bail!(
+                "conflict {} changed after it was displayed; pull again before resolving",
+                conflict.thread_id
+            );
+        }
+        let thread = match resolution.choice {
+            ThreadResolutionChoice::Local => local.get(&conflict.thread_id),
+            ThreadResolutionChoice::Remote => remote.get(&conflict.thread_id),
+        };
+        if let Some(thread) = thread {
+            outcome.threads.push((*thread).clone());
+        }
+    }
+    outcome
+        .threads
+        .sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    Ok(outcome.threads)
+}
+
+fn conflict_version(thread: Option<&&ThreadBundle>) -> Result<Option<ThreadConflictVersion>> {
+    thread
+        .map(|thread| {
+            Ok(ThreadConflictVersion {
+                title: thread.title.clone(),
+                archived: thread.archived,
+                updated_at_ms: thread.updated_at_ms,
+                model_provider: thread.model_provider.clone(),
+                workspace_source_path: thread.workspace.source_path.clone(),
+                semantic_hash: semantic_thread_hash(thread)?,
+            })
+        })
+        .transpose()
+}
+
+fn conflict_fingerprint(
+    thread_id: &str,
+    kind: &ThreadConflictKind,
+    base: &Option<ThreadConflictVersion>,
+    local: &Option<ThreadConflictVersion>,
+    remote: &Option<ThreadConflictVersion>,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(&(
+        thread_id,
+        kind,
+        base.as_ref().map(|version| version.semantic_hash.as_str()),
+        local.as_ref().map(|version| version.semantic_hash.as_str()),
+        remote
+            .as_ref()
+            .map(|version| version.semantic_hash.as_str()),
+    ))
+    .context("failed to serialize conflict fingerprint")?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
 }
 
 pub fn semantic_thread_hash(thread: &ThreadBundle) -> Result<String> {
@@ -751,6 +880,90 @@ mod tests {
             outcome.conflicts[0].kind,
             ThreadConflictKind::LocalDeletedRemoteModified
         );
+    }
+
+    #[test]
+    fn conflict_fingerprint_binds_all_three_versions() {
+        let base = vec![thread("thread", 'a')];
+        let mut local = thread("thread", 'a');
+        local.title = "local".to_string();
+        let mut remote = thread("thread", 'a');
+        remote.title = "remote".to_string();
+        let first = merge_thread_sets(&base, &[local.clone()], &[remote.clone()])
+            .unwrap()
+            .conflicts
+            .remove(0);
+        assert!(first.base.is_some());
+        assert_eq!(first.local.as_ref().unwrap().title, "local");
+        assert_eq!(first.remote.as_ref().unwrap().title, "remote");
+
+        remote.archived = true;
+        let changed = merge_thread_sets(&base, &[local], &[remote])
+            .unwrap()
+            .conflicts
+            .remove(0);
+        assert_ne!(first.conflict_id, changed.conflict_id);
+    }
+
+    #[test]
+    fn explicit_resolution_selects_versions_and_rejects_stale_choices() {
+        let base = vec![thread("thread", 'a'), thread("deleted-remotely", 'b')];
+        let mut local_thread = thread("thread", 'a');
+        local_thread.title = "local".to_string();
+        let mut local_deleted_remotely = thread("deleted-remotely", 'b');
+        local_deleted_remotely.title = "local survives".to_string();
+        let local = vec![local_thread.clone(), local_deleted_remotely.clone()];
+        let mut remote_thread = thread("thread", 'a');
+        remote_thread.title = "remote".to_string();
+        let remote = vec![remote_thread];
+        let conflicts = merge_thread_sets(&base, &local, &remote).unwrap().conflicts;
+        assert_eq!(conflicts.len(), 2);
+        let resolutions = conflicts
+            .iter()
+            .map(|conflict| ThreadConflictResolution {
+                conflict_id: conflict.conflict_id.clone(),
+                thread_id: conflict.thread_id.clone(),
+                choice: if conflict.thread_id == "thread" {
+                    ThreadResolutionChoice::Remote
+                } else {
+                    ThreadResolutionChoice::Local
+                },
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_thread_sets(&base, &local, &remote, &resolutions).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(
+            resolved
+                .iter()
+                .find(|thread| thread.thread_id == "thread")
+                .unwrap()
+                .title,
+            "remote"
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .find(|thread| thread.thread_id == "deleted-remotely")
+                .unwrap()
+                .title,
+            "local survives"
+        );
+
+        let mut changed_local = local;
+        changed_local[0].archived = true;
+        let error = resolve_thread_sets(&base, &changed_local, &remote, &resolutions).unwrap_err();
+        assert!(error.to_string().contains("changed after it was displayed"));
+    }
+
+    #[test]
+    fn explicit_resolution_requires_one_choice_per_conflict() {
+        let base = vec![thread("thread", 'a')];
+        let mut local = thread("thread", 'a');
+        local.title = "local".to_string();
+        let mut remote = thread("thread", 'a');
+        remote.title = "remote".to_string();
+        let error = resolve_thread_sets(&base, &[local], &[remote], &[]).unwrap_err();
+        assert!(error.to_string().contains("conflict set changed"));
     }
 
     #[test]

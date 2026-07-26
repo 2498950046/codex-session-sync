@@ -82,7 +82,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "switch";
+  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "resolve" | "switch";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
@@ -135,10 +135,29 @@ export type RemoteNamespaceStatus = {
   generation: number | null;
 };
 
+export type ThreadConflictVersion = {
+  title: string;
+  archived: boolean;
+  updatedAtMs: number | null;
+  modelProvider: string | null;
+  workspaceSourcePath: string | null;
+  semanticHash: string;
+};
+
 export type ThreadConflict = {
+  conflictId: string;
   threadId: string;
   title: string;
   kind: "both_modified" | "local_deleted_remote_modified" | "remote_deleted_local_modified";
+  base: ThreadConflictVersion | null;
+  local: ThreadConflictVersion | null;
+  remote: ThreadConflictVersion | null;
+};
+
+export type ThreadConflictResolution = {
+  conflictId: string;
+  threadId: string;
+  choice: "local" | "remote";
 };
 
 export type CheckoutReport = {
@@ -151,7 +170,7 @@ export type CheckoutReport = {
 };
 
 export type SyncReport = {
-  kind: "pushed" | "pulled" | "switched" | "no_changes" | "conflict";
+  kind: "pushed" | "pulled" | "merged" | "switched" | "no_changes" | "conflict";
   namespaceId: string;
   previousHead: string | null;
   head: string | null;

@@ -104,9 +104,10 @@ cargo test -p codex-session-sync-desktop --lib remote_config::tests::system_cred
 
 ## Current Status
 
-Phase 3B (desktop remote synchronization) is complete. The authenticated HTTP
-transport, native credential storage, Push/Pull/exact namespace checkout
-orchestration, durable Tracking reconciliation, and remote-sync GUI are wired.
+Phase 4 (three-way conflict resolution) is complete. The authenticated HTTP
+transport, native credential storage, Push/Pull/exact namespace checkout,
+durable Tracking reconciliation, same-thread conflict workbench, and explicit
+resolution orchestration are wired.
 
 Implemented:
 
@@ -181,6 +182,21 @@ Implemented:
   parallel; RAII release covers completion, failure, and cancellation.
 - Pure three-way thread-set planning that merges independent UUID changes and
   reports modify/modify and delete/modify conflicts without writing.
+- Conflict reports include compact base/local/remote version summaries and a
+  deterministic fingerprint bound to all three semantic thread hashes.
+- Explicit local/remote choices are revalidated against a fresh local scan and
+  the current remote Head. Duplicate, missing, unknown, or stale choices are
+  rejected without changing Codex conversations or Tracking.
+- Accepted conflict choices use the existing guarded checkout path, backing up
+  and applying the resolved set locally while Tracking records the remote
+  parent. The normal Push path then publishes the result with Head CAS; there
+  is no force-push or silent same-thread resolution path. Publishing is
+  non-cancellable after checkout; a publish failure leaves a safe pending local
+  change that the ordinary Push path can retry.
+- The React conflict workbench shows common-base, local, and remote summaries,
+  supports explicit deletion choices, requires every conflict to be resolved,
+  and invalidates the visible choices as soon as the target Home, repository,
+  remote, or namespace changes.
 - Snapshot/Revision conversion with machine-local database paths removed from
   the remote semantic view.
 - Streaming installation of downloaded objects into the local content store,
@@ -210,6 +226,11 @@ Implemented:
 - Frontend type-check, production build, and browser visual verification.
 - Real loopback HTTP integration coverage, including an A Push → B checkout →
   B Push → A Pull merge flow across two temporary Codex homes.
+- Real loopback conflict coverage, including divergent edits to one thread on
+  A and B, an explicit choice on B, guarded checkout plus CAS Push, and Pull of
+  the resolved version back to A.
+- A Vite-development-only `?preview=conflict` IPC mock for repeatable browser
+  visual and interaction QA; production builds exclude the preview module.
 - Original cross-platform app icon and generated Tauri platform icon set.
 - Rust formatting, Clippy with warnings denied, full workspace tests, Tauri
   backend check, frontend type-check/build, server health smoke test, and a
@@ -234,8 +255,7 @@ All server tests use temporary data directories, and all automated local-write
 and remote-sync tests use temporary Codex homes. The current machine's real
 Codex data has not been modified by development or verification.
 
-Next phase: expose the existing three-way conflict model in the GUI and add
-explicit user resolution for divergent changes to the same thread UUID. After
-that, add optional API-key/provider/path mappings and namespace-selection
-automation. Keep fingerprints local/HMAC-derived, retain manual overrides, and
-do not add force-push or silent same-thread conflict resolution.
+Next phase: add optional API-key/provider/path mappings and namespace-selection
+automation. Keep API-key fingerprints local and HMAC-derived, retain manual
+namespace overrides, and never upload raw API keys. After that, complete
+cross-platform packaging and the Windows/macOS/Linux compatibility matrix.

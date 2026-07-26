@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   CodexProcess,
@@ -13,6 +13,8 @@ import type {
   SnapshotSummary,
   SnapshotValidationReport,
   SyncReport,
+  ThreadConflict,
+  ThreadConflictVersion,
 } from "./types";
 
 function formatBytes(bytes: number): string {
@@ -28,6 +30,28 @@ function shortHead(head: string | null): string {
 
 function isActive(job: JobSnapshot | null): boolean {
   return job?.state === "running" || job?.state === "cancelling";
+}
+
+function conflictKindLabel(kind: ThreadConflict["kind"]): string {
+  if (kind === "local_deleted_remote_modified") return "本地删除，远端已修改";
+  if (kind === "remote_deleted_local_modified") return "本地已修改，远端删除";
+  return "本地和远端都已修改";
+}
+
+function formatConflictTime(timestamp: number | null): string {
+  if (timestamp === null) return "更新时间未知";
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime()) ? "更新时间未知" : date.toLocaleString("zh-CN");
+}
+
+function ConflictVersionDetails({ version }: { version: ThreadConflictVersion | null }) {
+  if (!version) return <div className="deleted-version"><strong>此版本已删除会话</strong><span>选择它会从合并结果中删除该会话。</span></div>;
+  return <>
+    <strong className="version-title">{version.title}</strong>
+    <span>{formatConflictTime(version.updatedAtMs)} · {version.archived ? "已归档" : "活动"}</span>
+    <span>{version.modelProvider ?? "provider 未知"} · {version.workspaceSourcePath ?? "未记录工作目录"}</span>
+    <code>{shortHead(version.semanticHash)}</code>
+  </>;
 }
 
 export default function App() {
@@ -46,7 +70,10 @@ export default function App() {
   const [importReport, setImportReport] = useState<ImportReport | null>(null);
   const [recoveredJournal, setRecoveredJournal] = useState<OperationJournal | null>(null);
   const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
+  const [syncReportTargetKey, setSyncReportTargetKey] = useState<string | null>(null);
+  const [conflictChoices, setConflictChoices] = useState<Record<string, "local" | "remote">>({});
   const [error, setError] = useState<string | null>(null);
+  const jobSyncTargets = useRef(new Map<string, string>());
 
   const [profiles, setProfiles] = useState<RemoteProfileSummary[]>([]);
   const [selectedRemoteId, setSelectedRemoteId] = useState("");
@@ -70,6 +97,18 @@ export default function App() {
     : null;
   const confirmedReplace = replaceTargetKey !== null
     && confirmedReplaceTarget === replaceTargetKey;
+  const syncTargetKey = JSON.stringify([
+    repositoryRoot.trim(),
+    codexHome.trim(),
+    selectedRemoteId,
+    selectedNamespaceId,
+  ]);
+  const activeConflicts = syncReport?.kind === "conflict" && syncReportTargetKey === syncTargetKey
+    ? syncReport.conflicts
+    : [];
+  const resolvedConflictCount = activeConflicts.filter((conflict) => conflictChoices[conflict.conflictId]).length;
+  const allConflictsResolved = activeConflicts.length > 0
+    && resolvedConflictCount === activeConflicts.length;
   const progressPercent = job?.progress.total && job.progress.total > 0
     ? Math.min(100, Math.round((job.progress.completed / job.progress.total) * 100))
     : null;
@@ -172,6 +211,10 @@ export default function App() {
   }, [codexHome, selectedRemoteId, selectedNamespaceId]);
 
   useEffect(() => {
+    setConflictChoices({});
+  }, [syncTargetKey]);
+
+  useEffect(() => {
     if (!job || !isActive(job)) return;
     const timer = window.setInterval(() => {
       invoke<JobSnapshot>("get_job", { jobId: job.jobId })
@@ -186,6 +229,7 @@ export default function App() {
 
   async function finishJob(completed: JobSnapshot) {
     if (completed.state === "failed" || completed.state === "cancelled") {
+      jobSyncTargets.current.delete(completed.jobId);
       setError(completed.error ?? "任务未完成");
       return;
     }
@@ -216,9 +260,12 @@ export default function App() {
       setJournalPath(imported.journalPath);
     }
     if (completed.kind === "recovery") setRecoveredJournal(result as OperationJournal);
-    if (["push", "pull", "switch"].includes(completed.kind)) {
+    if (["push", "pull", "resolve", "switch"].includes(completed.kind)) {
       const synced = result as SyncReport;
       setSyncReport(synced);
+      setSyncReportTargetKey(jobSyncTargets.current.get(completed.jobId) ?? syncTargetKey);
+      jobSyncTargets.current.delete(completed.jobId);
+      setConflictChoices({});
       if (synced.checkout) setJournalPath(synced.checkout.journalPath);
       await refreshNamespaces();
       await refreshNamespaceStatus();
@@ -234,7 +281,12 @@ export default function App() {
     if (command === "start_namespace_switch_job") setConfirmedReplaceTarget(null);
     setError(null);
     try {
-      setJob(await invoke<JobSnapshot>(command, payload));
+      const targetKey = syncTargetKey;
+      const started = await invoke<JobSnapshot>(command, payload);
+      if (["start_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job"].includes(command)) {
+        jobSyncTargets.current.set(started.jobId, targetKey);
+      }
+      setJob(started);
     } catch (reason) {
       setError(String(reason));
       await refreshProcesses();
@@ -248,6 +300,18 @@ export default function App() {
     } catch (reason) {
       setError(String(reason));
     }
+  }
+
+  async function resolveConflicts() {
+    if (!allConflictsResolved) return;
+    await start("start_conflict_resolution_job", {
+      ...syncPayload,
+      resolutions: activeConflicts.map((conflict) => ({
+        conflictId: conflict.conflictId,
+        threadId: conflict.threadId,
+        choice: conflictChoices[conflict.conflictId],
+      })),
+    });
   }
 
   async function saveRemote() {
@@ -356,7 +420,7 @@ export default function App() {
     <main className="app-shell">
       <header className="hero">
         <div>
-          <span className="eyebrow">PHASE 3B · REMOTE SYNC</span>
+          <span className="eyebrow">PHASE 4 · CONFLICT RESOLUTION</span>
           <h1>Codex Session Sync</h1>
           <p>通过自托管服务器在命名空间之间安全推送、拉取和 checkout Codex 会话。</p>
         </div>
@@ -366,14 +430,14 @@ export default function App() {
       </header>
 
       <section className="process-banner">
-        <div><strong>写入安全检查</strong><span>Push、Pull 与命名空间切换前必须完全退出 Codex。</span></div>
+        <div><strong>写入安全检查</strong><span>Push、Pull、冲突解决与命名空间切换前必须完全退出 Codex。</span></div>
         <button className="secondary-button" onClick={() => void refreshProcesses()} disabled={busy || !isTauriRuntime}>重新检测</button>
       </section>
       {processes.length > 0 && <div className="process-list">{processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}</div>}
 
       <section className="panel workspace-panel">
-        <div className="field"><label htmlFor="codex-home">Codex Home</label><input id="codex-home" value={codexHome} onChange={(event) => setCodexHome(event.target.value)} /></div>
-        <div className="field"><label htmlFor="repository-root">本地同步仓库</label><input id="repository-root" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} /></div>
+        <div className="field"><label htmlFor="codex-home">Codex Home</label><input id="codex-home" value={codexHome} onChange={(event) => setCodexHome(event.target.value)} disabled={busy} /></div>
+        <div className="field"><label htmlFor="repository-root">本地同步仓库</label><input id="repository-root" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} disabled={busy} /></div>
         <div className="action-row">
           <button className="secondary-button" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}>扫描本机会话</button>
           <button onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !canWrite}>创建本地快照</button>
@@ -384,8 +448,8 @@ export default function App() {
       <section className="panel remote-panel">
         <div className="section-heading"><div><h2>远端服务器</h2><p>Token 仅保存到操作系统凭据库，前端不会读回明文。</p></div><span>{remoteLoading ? "连接中…" : `${profiles.length} 个配置`}</span></div>
         <div className="profile-tabs">
-          {profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : "secondary-button"} onClick={() => setSelectedRemoteId(profile.id)}>{profile.displayName}</button>)}
-          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); }}>＋ 新建远端</button>
+          {profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : "secondary-button"} onClick={() => setSelectedRemoteId(profile.id)} disabled={busy}>{profile.displayName}</button>)}
+          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); }} disabled={busy}>＋ 新建远端</button>
         </div>
         <div className="remote-form">
           <div className="field"><label htmlFor="remote-name">配置名称</label><input id="remote-name" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div>
@@ -403,7 +467,7 @@ export default function App() {
           {namespaces.map((namespace) => {
             const selected = namespace.id === selectedNamespaceId;
             const active = namespaceStatus?.active && selected;
-            return <button key={namespace.id} className={`namespace-card ${selected ? "selected" : ""}`} onClick={() => void chooseNamespace(namespace.id)}><span>{namespace.displayName}</span><code>{shortHead(namespace.head)}</code>{active && <small>当前活动</small>}</button>;
+            return <button key={namespace.id} className={`namespace-card ${selected ? "selected" : ""}`} onClick={() => void chooseNamespace(namespace.id)} disabled={busy}><span>{namespace.displayName}</span><code>{shortHead(namespace.head)}</code>{active && <small>当前活动</small>}</button>;
           })}
           {namespaces.length === 0 && <p className="muted-copy">服务器上还没有命名空间。</p>}
         </div>
@@ -434,7 +498,30 @@ export default function App() {
       {syncReport && <section className="panel sync-result">
         <div className="section-heading"><h2>最近同步结果</h2><span>{syncReport.kind}</span></div>
         <div className="result-grid"><article className="result-card success-card"><span>Head</span><strong>{shortHead(syncReport.head)}</strong><small>{syncReport.threadCount} 个会话</small></article><article className="result-card"><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.checkout ? `备份：${syncReport.checkout.backupDir}` : "无需本地 checkout"}</small></article></div>
-        {syncReport.conflicts.length > 0 && <div className="warning-list">{syncReport.conflicts.map((conflict) => <div className="warning-row" key={conflict.threadId}><strong>{conflict.kind}</strong><span>{conflict.title} · {conflict.threadId}</span></div>)}</div>}
+        {syncReport.conflicts.length > 0 && activeConflicts.length === 0 && <p className="warning-copy">同步目标已经改变。请切回产生这些冲突的 Codex Home、远端和命名空间，然后重新拉取。</p>}
+        {activeConflicts.length > 0 && <div className="conflict-workbench">
+          <div className="conflict-summary">
+            <div><strong>需要显式解决 {activeConflicts.length} 个同线程冲突</strong><span>每项选择都绑定到基础、本地和远端的内容指纹；内容变化后旧选择会被拒绝。</span></div>
+            <span>{resolvedConflictCount} / {activeConflicts.length} 已选择</span>
+          </div>
+          <div className="conflict-list">{activeConflicts.map((conflict, index) => {
+            const choice = conflictChoices[conflict.conflictId];
+            return <article className="conflict-item" key={conflict.conflictId}>
+              <header><div><span>冲突 {index + 1}</span><h3>{conflict.title}</h3></div><strong>{conflictKindLabel(conflict.kind)}</strong></header>
+              <code className="thread-id">{conflict.threadId}</code>
+              <div className="conflict-version-grid">
+                <div className="version-card base-version"><span className="version-label">共同基础</span><ConflictVersionDetails version={conflict.base} /></div>
+                <button type="button" className={`version-card selectable-version ${choice === "local" ? "chosen-version" : ""}`} onClick={() => setConflictChoices((current) => ({ ...current, [conflict.conflictId]: "local" }))} aria-pressed={choice === "local"} disabled={busy}>
+                  <span className="version-label">本地版本</span><ConflictVersionDetails version={conflict.local} /><b>{conflict.local ? "保留本地" : "接受本地删除"}</b>
+                </button>
+                <button type="button" className={`version-card selectable-version ${choice === "remote" ? "chosen-version" : ""}`} onClick={() => setConflictChoices((current) => ({ ...current, [conflict.conflictId]: "remote" }))} aria-pressed={choice === "remote"} disabled={busy}>
+                  <span className="version-label">远端版本</span><ConflictVersionDetails version={conflict.remote} /><b>{conflict.remote ? "保留远端" : "接受远端删除"}</b>
+                </button>
+              </div>
+            </article>;
+          })}</div>
+          <div className="conflict-submit-row"><div><strong>{allConflictsResolved ? "选择已完整，可以安全合并" : `还需选择 ${activeConflicts.length - resolvedConflictCount} 项`}</strong><span>提交会先备份并应用到本机，再以当前远端 Head 做 CAS Push；不会强制覆盖。</span></div><button onClick={() => void resolveConflicts()} disabled={busy || !canWrite || !allConflictsResolved}>应用选择并完成合并</button></div>
+        </div>}
       </section>}
 
       <section className="panel operation-panel">

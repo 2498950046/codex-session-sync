@@ -114,6 +114,37 @@ button { cursor: pointer; }
 .sync-status-grid strong, .sync-status-grid code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sync-actions { margin-top: 14px; }
 .sync-result .result-grid { margin-top: 0; }
+.conflict-workbench { display: grid; gap: 14px; margin-top: 18px; padding-top: 18px; border-top: 1px solid #493c2a; }
+.conflict-summary, .conflict-submit-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 14px 16px; border: 1px solid #72512d; border-radius: 13px; background: #281c10; }
+.conflict-summary div, .conflict-submit-row div { display: grid; gap: 5px; }
+.conflict-summary strong, .conflict-submit-row strong { color: #ffd497; }
+.conflict-summary span, .conflict-submit-row span { color: #b99c78; font-size: 12px; }
+.conflict-summary > span { flex: 0 0 auto; color: #ffca7d; font-weight: 800; }
+.conflict-list { display: grid; gap: 14px; }
+.conflict-item { display: grid; gap: 10px; padding: 16px; border: 1px solid #3b4654; border-radius: 15px; background: #0d131b; }
+.conflict-item header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.conflict-item header div { min-width: 0; display: grid; gap: 4px; }
+.conflict-item header span { color: #7f91a3; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+.conflict-item header h3 { margin: 0; overflow-wrap: anywhere; font-size: 16px; }
+.conflict-item header > strong { flex: 0 0 auto; padding: 5px 8px; border-radius: 999px; color: #f5bd73; background: #382512; font-size: 11px; }
+.thread-id { color: #67788a; font-size: 11px; overflow-wrap: anywhere; }
+.conflict-version-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.version-card { min-width: 0; display: grid; align-content: start; justify-items: start; gap: 7px; padding: 13px; border: 1px solid #2c3948; border-radius: 12px; color: #dfe8f0; text-align: left; background: #101720; }
+.version-card > span:not(.version-label), .deleted-version span { color: #7f90a1; font-size: 11px; overflow-wrap: anywhere; }
+.version-card code { color: #72cfae; font-size: 11px; }
+.version-label { color: #8fa0b1; font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; }
+.version-title { max-width: 100%; overflow-wrap: anywhere; }
+.base-version { opacity: .72; }
+.selectable-version { width: 100%; cursor: pointer; font: inherit; transition: border-color .15s ease, background .15s ease, transform .15s ease; }
+.selectable-version:hover:not(:disabled) { transform: translateY(-1px); border-color: #577086; }
+.selectable-version > b { align-self: end; margin-top: 5px; color: #a9b7c4; font-size: 12px; }
+.selectable-version.chosen-version { border-color: #61d0aa; background: #112c25; box-shadow: inset 0 0 0 1px #61d0aa44; }
+.selectable-version.chosen-version > b { color: #8ff2ce; }
+.selectable-version:disabled { cursor: not-allowed; opacity: .6; }
+.deleted-version { display: grid; gap: 5px; }
+.deleted-version strong { color: #efb8b8; }
+.conflict-submit-row button { flex: 0 0 auto; min-width: 190px; border: 0; border-radius: 11px; padding: 13px 18px; color: #06110e; background: #75e5be; font-weight: 800; }
+.conflict-submit-row button:disabled { cursor: not-allowed; opacity: .45; }
 .empty-state { min-height: 330px; display: grid; place-content: center; justify-items: center; text-align: center; color: #7f8c9c; }
 .empty-state h2 { color: #dfe7ef; margin: 12px 0 4px; }
 .empty-state p { margin: 0; }
@@ -132,6 +163,9 @@ button { cursor: pointer; }
   .result-grid { grid-template-columns: 1fr; }
   .recovery-row { grid-template-columns: 1fr; }
   .remote-form, .namespace-editor, .sync-status-grid { grid-template-columns: 1fr; }
+  .conflict-version-grid { grid-template-columns: 1fr; }
+  .conflict-summary, .conflict-submit-row, .conflict-item header { align-items: stretch; flex-direction: column; }
+  .conflict-submit-row button { width: 100%; }
   .remote-form .action-row { grid-column: auto; }
   .process-banner { align-items: stretch; flex-direction: column; }
   .section-heading { align-items: flex-start; }
