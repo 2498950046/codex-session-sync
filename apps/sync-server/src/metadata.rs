@@ -14,6 +14,8 @@ use uuid::Uuid;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const METADATA_SCHEMA_VERSION: i64 = 1;
 const MAX_NAMESPACE_NAME_CHARS: usize = 128;
+pub const MAX_REVISION_OBJECTS: usize = 10_000;
+pub const MAX_REVISION_OBJECT_REFERENCES: usize = 20_000;
 
 #[derive(Debug, Clone)]
 pub struct MetadataStore {
@@ -33,18 +35,43 @@ pub struct NewRevisionMetadata {
 
 impl NewRevisionMetadata {
     pub fn from_manifest(manifest: &RevisionManifest) -> Result<Self, MetadataError> {
-        manifest.validate()?;
-        let canonical = manifest.payload.canonical_json()?;
-        let thread_count = u64::try_from(manifest.payload.threads.len())
-            .map_err(|_| conflict(&manifest.revision_id))?;
-        let objects = manifest
+        let mut object_lengths = BTreeMap::new();
+        for (reference_index, object) in manifest
             .payload
             .threads
             .iter()
             .flat_map(|thread| std::iter::once(&thread.rollout).chain(&thread.attachments))
-            .map(|object| ObjectDescriptor {
-                sha256: object.sha256.clone(),
-                byte_length: object.byte_length,
+            .enumerate()
+        {
+            if reference_index >= MAX_REVISION_OBJECT_REFERENCES {
+                return Err(MetadataError::TooManyObjectReferences {
+                    max: MAX_REVISION_OBJECT_REFERENCES,
+                });
+            }
+            match object_lengths.get(&object.sha256) {
+                Some(existing) if *existing != object.byte_length => {
+                    return Err(conflict(&manifest.revision_id));
+                }
+                Some(_) => continue,
+                None if object_lengths.len() >= MAX_REVISION_OBJECTS => {
+                    return Err(MetadataError::TooManyObjects {
+                        max: MAX_REVISION_OBJECTS,
+                    });
+                }
+                None => {
+                    object_lengths.insert(object.sha256.clone(), object.byte_length);
+                }
+            }
+        }
+        manifest.validate()?;
+        let canonical = manifest.payload.canonical_json()?;
+        let thread_count = u64::try_from(manifest.payload.threads.len())
+            .map_err(|_| conflict(&manifest.revision_id))?;
+        let objects = object_lengths
+            .into_iter()
+            .map(|(sha256, byte_length)| ObjectDescriptor {
+                sha256,
+                byte_length,
             })
             .collect();
 
@@ -57,6 +84,10 @@ impl NewRevisionMetadata {
             thread_count,
             objects,
         })
+    }
+
+    pub fn objects(&self) -> &[ObjectDescriptor] {
+        &self.objects
     }
 }
 
@@ -93,6 +124,10 @@ pub enum MetadataError {
     HeadMismatch { current: Option<String> },
     #[error("revision conflicts with immutable metadata: {revision_id}")]
     RevisionConflict { revision_id: String },
+    #[error("revision references more than {max} unique objects")]
+    TooManyObjects { max: usize },
+    #[error("revision contains more than {max} object references")]
+    TooManyObjectReferences { max: usize },
     #[error("namespace display name must contain 1 to 128 non-control characters")]
     InvalidName,
     #[error("unsupported metadata schema version {actual}")]
@@ -578,7 +613,16 @@ mod tests {
         id: char,
         parent_revision: Option<String>,
     ) -> NewRevisionMetadata {
-        let manifest = RevisionManifest::from_payload(RevisionPayload {
+        NewRevisionMetadata::from_manifest(&revision_manifest(namespace_id, id, parent_revision))
+            .unwrap()
+    }
+
+    fn revision_manifest(
+        namespace_id: Uuid,
+        id: char,
+        parent_revision: Option<String>,
+    ) -> RevisionManifest {
+        RevisionManifest::from_payload(RevisionPayload {
             schema_version: REVISION_SCHEMA_VERSION,
             namespace_id,
             parent_revision,
@@ -604,8 +648,64 @@ mod tests {
             }],
             warning_count: 0,
         })
-        .unwrap();
-        NewRevisionMetadata::from_manifest(&manifest).unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn revision_metadata_deduplicates_objects_and_rejects_conflicting_lengths() {
+        let namespace_id = Uuid::now_v7();
+        let mut manifest = revision_manifest(namespace_id, 'a', None);
+        let duplicate = manifest.payload.threads[0].rollout.clone();
+        manifest.payload.threads[0]
+            .attachments
+            .push(duplicate.clone());
+        let manifest = RevisionManifest::from_payload(manifest.payload).unwrap();
+        let metadata = NewRevisionMetadata::from_manifest(&manifest).unwrap();
+        assert_eq!(metadata.objects.len(), 1);
+
+        let mut conflicting_payload = manifest.payload;
+        conflicting_payload.threads[0].attachments[0].byte_length += 1;
+        let conflicting = RevisionManifest::from_payload(conflicting_payload).unwrap();
+        assert!(matches!(
+            NewRevisionMetadata::from_manifest(&conflicting),
+            Err(MetadataError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn revision_metadata_limits_unique_objects() {
+        let mut manifest = revision_manifest(Uuid::now_v7(), 'a', None);
+        manifest.payload.threads[0].attachments = (0..MAX_REVISION_OBJECTS)
+            .map(|index| ContentObject {
+                sha256: format!("sha256:{index:064x}"),
+                byte_length: index as u64,
+                media_type: "application/octet-stream".to_string(),
+                logical_path: None,
+                source_path: None,
+            })
+            .collect();
+        let manifest = RevisionManifest::from_payload(manifest.payload).unwrap();
+        assert!(matches!(
+            NewRevisionMetadata::from_manifest(&manifest),
+            Err(MetadataError::TooManyObjects {
+                max: MAX_REVISION_OBJECTS
+            })
+        ));
+    }
+
+    #[test]
+    fn revision_metadata_limits_total_object_references_before_hashing() {
+        let mut manifest = revision_manifest(Uuid::now_v7(), 'a', None);
+        let duplicate = manifest.payload.threads[0].rollout.clone();
+        manifest.payload.threads[0].attachments = vec![duplicate; MAX_REVISION_OBJECT_REFERENCES];
+        manifest.revision_id = "not-yet-validated".to_string();
+
+        assert!(matches!(
+            NewRevisionMetadata::from_manifest(&manifest),
+            Err(MetadataError::TooManyObjectReferences {
+                max: MAX_REVISION_OBJECT_REFERENCES
+            })
+        ));
     }
 
     #[tokio::test]

@@ -85,12 +85,16 @@ npm run build
 
 ## Current Status
 
-Phase 2 is complete.
+Phase 3A (trusted server foundation) is complete. Desktop push/pull is not yet
+wired to the server.
 
 Implemented:
 
 - Rust workspace with `sync-core`, `sync-server`, and Tauri desktop members.
 - Shared `ThreadBundle`, content-object, warning, and scan-report models.
+- Shared namespace, object-query, revision, and commit protocol models with
+  deterministic recursive JSON canonicalization and content-derived revision
+  IDs.
 - Read-only rollout discovery, fast first-record dashboard scans, full SHA-256
   export/import paths, SQLite thread metadata overlay, and structured
   skipped-file warnings.
@@ -124,7 +128,22 @@ Implemented:
 - Automated tests covering successful import, corrupt objects, conflicts,
   transactional rollback, restart recovery, process classification, scan
   cancellation, and import cancellation.
-- Axum health endpoint skeleton.
+- Server filesystem object storage with streaming SHA-256/length/size checks,
+  atomic immutable installation, idempotent concurrent writes, cancellation
+  cleanup, and stale temporary-file cleanup after restart.
+- Canonical immutable revision storage with full hash validation on reads and
+  tamper detection.
+- SQLite metadata migration, namespace create/list/rename, revision metadata,
+  restart persistence, and `BEGIN IMMEDIATE` fast-forward head compare-and-swap.
+- Required single-user Bearer authentication with constant-time token compare;
+  only health and protocol information are public.
+- Axum v1 APIs for namespaces, missing-object queries, streaming object
+  upload/download, namespace heads, revision reads, and revision commits using
+  `expectedHead`.
+- In-process API tests covering unauthorized zero-write behavior, hash/length/
+  size rejection, object idempotency, missing objects, first commit,
+  fast-forward, idempotent retries, concurrent stale-head rejection, hidden
+  orphan revisions, and server restart persistence.
 - Frontend type-check, production build, and browser visual verification.
 - Original cross-platform app icon and generated Tauri platform icon set.
 - Rust formatting, Clippy with warnings denied, full workspace tests, Tauri
@@ -146,9 +165,11 @@ Latest real-data read-only scan:
 - 2 discovered thread databases.
 - 1 skipped zero-byte rollout warning.
 
-Phase 2 automated write tests use temporary Codex homes. The current machine's
-real Codex data has not been modified by development or verification.
+All server tests use temporary data directories, and Phase 2 automated local
+write tests use temporary Codex homes. The current machine's real Codex data
+has not been modified by development or verification.
 
-Next implementation phase: server object storage, namespaces, immutable
-revisions, and fast-forward push/pull. Keep server writes disabled until their
-hash validation and authorization paths have automated tests.
+Next implementation phase: Phase 3B desktop-side HTTP transport, local remote
+tracking state, and fast-forward push/pull orchestration. Reuse the existing
+safe local snapshot/import paths, keep Codex-closed checks around local writes,
+and do not add force-push or automatic same-thread conflict resolution.

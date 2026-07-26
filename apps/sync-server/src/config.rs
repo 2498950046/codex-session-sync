@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const DEFAULT_MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_TOKEN_BYTES: usize = 16;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -31,11 +32,10 @@ impl fmt::Debug for ServerConfig {
 
 impl ServerConfig {
     pub fn from_env() -> Result<Self> {
-        let token = env::var("SYNC_SERVER_TOKEN")
-            .context("SYNC_SERVER_TOKEN must be set before the sync server can start")?;
-        if token.trim().is_empty() {
-            bail!("SYNC_SERVER_TOKEN must not be empty");
-        }
+        let token = validate_token(
+            env::var("SYNC_SERVER_TOKEN")
+                .context("SYNC_SERVER_TOKEN must be set before the sync server can start")?,
+        )?;
 
         Ok(Self {
             bind: env::var("SYNC_SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into()),
@@ -82,6 +82,16 @@ fn parse_limit(name: &str, default: u64) -> Result<u64> {
     Ok(parsed)
 }
 
+fn validate_token(token: String) -> Result<String> {
+    if token.len() < MIN_TOKEN_BYTES {
+        bail!("SYNC_SERVER_TOKEN must contain at least {MIN_TOKEN_BYTES} characters");
+    }
+    if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        bail!("SYNC_SERVER_TOKEN must contain only visible ASCII characters without spaces");
+    }
+    Ok(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +102,15 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(rendered.contains("[redacted]"));
         assert!(!rendered.contains(&config.token));
+    }
+
+    #[test]
+    fn token_must_be_a_nonempty_visible_ascii_value() {
+        assert!(validate_token("valid-token_123+/=".to_string()).is_ok());
+        assert!(validate_token(String::new()).is_err());
+        assert!(validate_token("too-short".to_string()).is_err());
+        assert!(validate_token("contains space".to_string()).is_err());
+        assert!(validate_token("contains\nnewline".to_string()).is_err());
+        assert!(validate_token("令牌".to_string()).is_err());
     }
 }

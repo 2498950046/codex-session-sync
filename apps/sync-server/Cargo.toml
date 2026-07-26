@@ -16,9 +16,11 @@ rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle.workspace = true
 sync-core.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -26,3 +28,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tower.workspace = true
