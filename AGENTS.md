@@ -16,6 +16,9 @@ Codex SQLite files.
 - Object storage: local filesystem first; keep an adapter boundary for S3 later.
 - Deployment: Docker Compose.
 - Target platforms: Windows, macOS, Linux.
+- Minimum Rust toolchain: 1.88. Keep the workspace `rust-version` and pinned
+  Docker builder image aligned with the minimum Rust version required by the
+  locked dependencies.
 
 ## Product Boundaries (v1)
 
@@ -40,6 +43,10 @@ Codex SQLite files.
   `archived_sessions/**/rollout-*.jsonl`.
 - Handle missing, empty, malformed, or unsupported rollout files without
   aborting the whole scan; return structured warnings instead.
+- Allow an explicitly confirmed empty-rollout cleanup only through quarantine:
+  revalidate that the target is a regular zero-byte `rollout-*.jsonl` under
+  the selected Home's session directories, serialize it with the Home write
+  lease, and never permanently delete it from the warning UI.
 - A local probe on 2026-07-23 found one zero-byte rollout among 342 active
   sessions. This is a supported skipped-file condition, not a fatal error.
 - Any write must create a local backup and operation journal before changing
@@ -255,6 +262,11 @@ Implemented:
 - Rust formatting, Clippy with warnings denied, full workspace tests, Tauri
   backend check, frontend type-check/build, server health smoke test, and a
   read-only scan against the current machine's real Codex data.
+- Docker multi-stage build for `sync-server`, non-root runtime execution,
+  container health checking, and a Compose deployment that persists `/data`
+  in the `codex-session-sync-data` named volume. The current direct-IP test
+  profile publishes `0.0.0.0:8787`; it must be replaced by HTTPS before
+  sensitive or long-term Internet use.
 
 Environment note:
 

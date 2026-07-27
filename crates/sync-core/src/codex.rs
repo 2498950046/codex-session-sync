@@ -1,23 +1,138 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::Engine;
 use rusqlite::{Connection, OpenFlags, Row, types::ValueRef};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::models::{
-    ContentObject, RelatedRecords, ScanDashboardReport, ScanReport, ScanWarning, ScanWarningKind,
-    THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, ThreadPreview, WorkspaceRef,
+    ContentObject, QuarantinedRollout, RelatedRecords, ScanDashboardReport, ScanReport,
+    ScanWarning, ScanWarningKind, THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, ThreadPreview,
+    WorkspaceRef,
 };
 use crate::operation::{OperationControl, OperationProgress};
 
 const SESSION_DIRS: [(&str, bool); 2] = [("sessions", false), ("archived_sessions", true)];
 const MAX_SESSION_META_BYTES: u64 = 1024 * 1024;
+
+pub fn quarantine_empty_rollout(
+    codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    rollout_path: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+) -> Result<QuarantinedRollout> {
+    if !confirmed_codex_closed {
+        bail!("empty rollout cleanup requires confirmation that Codex is fully closed");
+    }
+
+    let codex_home = fs::canonicalize(codex_home.as_ref()).with_context(|| {
+        format!(
+            "failed to normalize Codex Home {}",
+            codex_home.as_ref().display()
+        )
+    })?;
+    let requested_path = rollout_path.as_ref();
+    let link_metadata = fs::symlink_metadata(requested_path)
+        .with_context(|| format!("failed to inspect rollout {}", requested_path.display()))?;
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        bail!("empty rollout cleanup accepts only regular non-symlink files");
+    }
+    let original_path = fs::canonicalize(requested_path)
+        .with_context(|| format!("failed to normalize rollout {}", requested_path.display()))?;
+    let allowed = SESSION_DIRS.iter().any(|(directory, _)| {
+        fs::canonicalize(codex_home.join(directory))
+            .map(|root| original_path.starts_with(root))
+            .unwrap_or(false)
+    });
+    if !allowed {
+        bail!(
+            "rollout {} is outside the selected Codex Home session directories",
+            original_path.display()
+        );
+    }
+
+    let file_name = original_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| value.starts_with("rollout-") && value.ends_with(".jsonl"))
+        .context("empty rollout cleanup requires a rollout-*.jsonl file")?;
+    let metadata = fs::metadata(&original_path)
+        .with_context(|| format!("failed to inspect rollout {}", original_path.display()))?;
+    if metadata.len() != 0 {
+        bail!(
+            "rollout {} is no longer empty; cleanup was refused",
+            original_path.display()
+        );
+    }
+
+    let quarantine_dir = repository_root
+        .as_ref()
+        .join("quarantine")
+        .join("empty-rollouts");
+    fs::create_dir_all(&quarantine_dir).with_context(|| {
+        format!(
+            "failed to create empty rollout quarantine {}",
+            quarantine_dir.display()
+        )
+    })?;
+    let quarantine_path = quarantine_dir.join(format!("{}-{file_name}", Uuid::now_v7()));
+
+    match fs::rename(&original_path, &quarantine_path) {
+        Ok(()) => {
+            if fs::metadata(&quarantine_path)?.len() != 0 {
+                fs::rename(&quarantine_path, &original_path).context(
+                    "rollout changed while it was being quarantined; the original was restored",
+                )?;
+                bail!("rollout changed while it was being quarantined; cleanup was refused");
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::CrossesDevices => {
+            let destination = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&quarantine_path)
+                .with_context(|| {
+                    format!(
+                        "failed to create quarantined rollout {}",
+                        quarantine_path.display()
+                    )
+                })?;
+            destination.sync_all()?;
+            drop(destination);
+            if fs::metadata(&original_path)?.len() != 0 {
+                let _ = fs::remove_file(&quarantine_path);
+                bail!("rollout changed while it was being quarantined; cleanup was refused");
+            }
+            if let Err(error) = fs::remove_file(&original_path) {
+                let _ = fs::remove_file(&quarantine_path);
+                return Err(error).with_context(|| {
+                    format!("failed to remove empty rollout {}", original_path.display())
+                });
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to move empty rollout {} to {}",
+                    original_path.display(),
+                    quarantine_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(QuarantinedRollout {
+        original_path,
+        quarantine_path,
+    })
+}
 
 #[derive(Debug, Clone)]
 struct RolloutRecord {
@@ -868,6 +983,57 @@ mod tests {
         assert_eq!(report.total_count(), 0);
         assert_eq!(report.warnings.len(), 1);
         assert_eq!(report.warnings[0].kind, ScanWarningKind::EmptyRollout);
+    }
+
+    #[test]
+    fn quarantines_only_an_empty_rollout_inside_the_selected_codex_home() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions/2026/07/27");
+        let repository = temp.path().join("repository");
+        fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("rollout-empty.jsonl");
+        File::create(&rollout).unwrap();
+        let expected_original = fs::canonicalize(&rollout).unwrap();
+
+        let report = quarantine_empty_rollout(&codex_home, &repository, &rollout, true).unwrap();
+
+        assert_eq!(report.original_path, expected_original);
+        assert!(!rollout.exists());
+        assert!(report.quarantine_path.is_file());
+        assert_eq!(fs::metadata(&report.quarantine_path).unwrap().len(), 0);
+        assert!(scan_codex_home(&codex_home).unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn empty_rollout_quarantine_rejects_nonempty_and_outside_files() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions");
+        let repository = temp.path().join("repository");
+        fs::create_dir_all(&sessions).unwrap();
+        let nonempty = sessions.join("rollout-nonempty.jsonl");
+        fs::write(&nonempty, "not empty").unwrap();
+        let outside = temp.path().join("rollout-outside.jsonl");
+        File::create(&outside).unwrap();
+
+        let nonempty_error =
+            quarantine_empty_rollout(&codex_home, &repository, &nonempty, true).unwrap_err();
+        let outside_error =
+            quarantine_empty_rollout(&codex_home, &repository, &outside, true).unwrap_err();
+
+        assert!(nonempty_error.to_string().contains("no longer empty"));
+        assert!(outside_error.to_string().contains("outside"));
+        assert!(nonempty.is_file());
+        assert!(outside.is_file());
+    }
+
+    #[test]
+    fn empty_rollout_quarantine_requires_closed_codex_confirmation() {
+        let temp = tempdir().unwrap();
+        let error =
+            quarantine_empty_rollout(temp.path(), temp.path(), temp.path(), false).unwrap_err();
+        assert!(error.to_string().contains("confirmation"));
     }
 
     #[test]

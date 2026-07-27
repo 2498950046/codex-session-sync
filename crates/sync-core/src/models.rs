@@ -69,6 +69,13 @@ pub struct ScanWarning {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantinedRollout {
+    pub original_path: PathBuf,
+    pub quarantine_path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanReport {

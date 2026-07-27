@@ -4,6 +4,11 @@ export type ScanWarning = {
   message: string;
 };
 
+export type QuarantinedRollout = {
+  originalPath: string;
+  quarantinePath: string;
+};
+
 export type ThreadBundle = {
   threadId: string;
   title: string;

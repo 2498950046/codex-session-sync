@@ -6,11 +6,13 @@ import type {
   JobSnapshot,
   NamespaceMappingState,
   OperationJournal,
+  QuarantinedRollout,
   RemoteConnectionStatus,
   RemoteNamespace,
   RemoteNamespaceStatus,
   RemoteProfileSummary,
   ScanReport,
+  ScanWarning,
   SnapshotSummary,
   SnapshotValidationReport,
   SyncReport,
@@ -89,6 +91,7 @@ export default function App() {
   const [syncReportTargetKey, setSyncReportTargetKey] = useState<string | null>(null);
   const [conflictChoices, setConflictChoices] = useState<Record<string, "local" | "remote">>({});
   const [error, setError] = useState<string | null>(null);
+  const [quarantineMessage, setQuarantineMessage] = useState<string | null>(null);
   const jobSyncTargets = useRef(new Map<string, string>());
 
   const [profiles, setProfiles] = useState<RemoteProfileSummary[]>([]);
@@ -293,6 +296,10 @@ export default function App() {
   }, [codexHome, selectedRemoteId, selectedNamespaceId]);
 
   useEffect(() => {
+    setQuarantineMessage(null);
+  }, [codexHome, repositoryRoot]);
+
+  useEffect(() => {
     setConflictChoices({});
   }, [syncTargetKey]);
 
@@ -381,6 +388,30 @@ export default function App() {
       setJob(await invoke<JobSnapshot>("cancel_job", { jobId: job.jobId }));
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function quarantineWarning(warning: ScanWarning) {
+    if (busy || !canWrite || warning.kind !== "empty_rollout") return;
+    if (!window.confirm(`将这个 0 字节 rollout 移入可恢复隔离区？\n\n${warning.path}`)) return;
+    setRemoteLoading(true);
+    setError(null);
+    setQuarantineMessage(null);
+    try {
+      const result = await invoke<QuarantinedRollout>("quarantine_empty_rollout_file", {
+        codexHome: codexHome.trim(),
+        repositoryRoot: repositoryRoot.trim(),
+        rolloutPath: warning.path,
+        confirmedCodexClosed: confirmedClosed,
+      });
+      setQuarantineMessage(`空文件已移入隔离区：${result.quarantinePath}`);
+      const scanned = await invoke<JobSnapshot>("start_scan_job", { codexHome: codexHome.trim() });
+      setJob(scanned);
+    } catch (reason) {
+      setError(String(reason));
+      await refreshProcesses();
+    } finally {
+      setRemoteLoading(false);
     }
   }
 
@@ -739,7 +770,7 @@ export default function App() {
         {recoveredJournal && <article className="result-card success-card"><span>恢复结果</span><strong>{recoveredJournal.status}</strong><small>{recoveredJournal.error ?? recoveredJournal.operationId}</small></article>}
       </section>}
 
-      {report ? <><section className="metric-grid"><article className="metric"><span>活动会话</span><strong>{report.activeCount}</strong></article><article className="metric"><span>已归档</span><strong>{report.archivedCount}</strong></article><article className="metric"><span>Rollout 大小</span><strong>{formatBytes(report.totalRolloutBytes)}</strong></article><article className="metric"><span>扫描警告</span><strong>{report.warnings.length}</strong></article></section><section className="content-grid"><article className="panel"><div className="section-heading"><h2>会话预览</h2><span>显示 {report.threads.length} / {report.totalCount}</span></div><div className="thread-list">{recentThreads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span></div><small>{thread.modelProvider ?? "unknown"}</small></div>)}</div></article><article className="panel"><div className="section-heading"><h2>兼容性状态</h2><span>{report.databasePaths.length} databases</span></div>{report.warnings.length === 0 ? <p className="success-copy">扫描完成，没有发现阻塞同步的问题。</p> : <div className="warning-list">{report.warnings.slice(0, 8).map((warning, index) => <div className="warning-row" key={`${warning.path}-${index}`}><strong>{warning.kind}</strong><span>{warning.message}</span></div>)}</div>}</article></section></> : <section className="empty-state"><div className="empty-icon">↗</div><h2>等待扫描</h2><p>扫描会在后台运行，不会修改 Codex 数据。</p></section>}
+      {report ? <><section className="metric-grid"><article className="metric"><span>活动会话</span><strong>{report.activeCount}</strong></article><article className="metric"><span>已归档</span><strong>{report.archivedCount}</strong></article><article className="metric"><span>Rollout 大小</span><strong>{formatBytes(report.totalRolloutBytes)}</strong></article><article className="metric"><span>扫描警告</span><strong>{report.warnings.length}</strong></article></section><section className="content-grid"><article className="panel"><div className="section-heading"><h2>会话预览</h2><span>显示 {report.threads.length} / {report.totalCount}</span></div><div className="thread-list">{recentThreads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span></div><small>{thread.modelProvider ?? "unknown"}</small></div>)}</div></article><article className="panel"><div className="section-heading"><h2>兼容性状态</h2><span>{report.databasePaths.length} databases</span></div>{quarantineMessage && <p className="success-copy">{quarantineMessage}</p>}{report.warnings.length === 0 ? <p className="success-copy">扫描完成，没有发现阻塞同步的问题。</p> : <div className="warning-list">{report.warnings.slice(0, 8).map((warning, index) => <div className="warning-row" key={`${warning.path}-${index}`}><strong>{warning.kind}</strong><span>{warning.message}</span><code>{warning.path}</code>{warning.kind === "empty_rollout" && <button type="button" className="warning-cleanup-button" onClick={() => void quarantineWarning(warning)} disabled={busy || !canWrite}>清理空文件</button>}</div>)}</div>}</article></section></> : <section className="empty-state"><div className="empty-icon">↗</div><h2>等待扫描</h2><p>扫描会在后台运行，不会修改 Codex 数据。</p></section>}
 
       {job && <div className="task-modal-backdrop" role="dialog" aria-modal="true" aria-label="任务进度"><section className="task-modal"><span className="eyebrow">{job.kind.toUpperCase()} · {job.state.toUpperCase()}</span><h2>{job.progress.phase.replaceAll("_", " ")}</h2><p>{job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><small>{progressPercent === null ? `${job.progress.completed} ${job.progress.unit}` : `${progressPercent}% · ${job.progress.completed}/${job.progress.total} ${job.progress.unit}`}</small>{isActive(job) ? <button className="danger-button modal-button" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button> : <button className="secondary-button modal-button" onClick={() => setJob(null)}>关闭</button>}</section></div>}
     </main>

@@ -21,11 +21,12 @@ use remote_sync::{pull_namespace, push_namespace, resolve_pull_conflicts, switch
 use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
-    CheckoutJournal, ImportReport, OperationJournal, ScanDashboardReport, SnapshotSummary,
-    SnapshotValidationReport, ThreadConflictResolution, TrackingStore, create_local_snapshot,
-    create_local_snapshot_with_control, default_codex_home, default_repository_root,
-    detect_codex_processes, import_local_snapshot, import_local_snapshot_with_control,
-    recover_checkout_operation, recover_incomplete_operation, scan_codex_home_dashboard,
+    CheckoutJournal, ImportReport, OperationJournal, QuarantinedRollout, ScanDashboardReport,
+    SnapshotSummary, SnapshotValidationReport, ThreadConflictResolution, TrackingStore,
+    create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
+    default_repository_root, detect_codex_processes, import_local_snapshot,
+    import_local_snapshot_with_control, quarantine_empty_rollout, recover_checkout_operation,
+    recover_incomplete_operation, scan_codex_home_dashboard,
     scan_codex_home_dashboard_with_control, validate_local_snapshot,
     validate_local_snapshot_with_control,
 };
@@ -101,6 +102,28 @@ async fn scan_local_codex(codex_home: Option<String>) -> Result<ScanDashboardRep
             .map(Into::into)
             .unwrap_or_else(default_codex_home);
         scan_codex_home_dashboard(home).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn quarantine_empty_rollout_file(
+    jobs: State<'_, JobManager>,
+    codex_home: Option<String>,
+    repository_root: Option<String>,
+    rollout_path: String,
+    confirmed_codex_closed: bool,
+) -> Result<QuarantinedRollout, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let home = resolve_codex_home(codex_home);
+    let repository = resolve_repository_root(repository_root);
+    let lease = jobs.try_acquire_codex_home(&home)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        quarantine_empty_rollout(home, repository, rollout_path, confirmed_codex_closed)
+            .map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -905,6 +928,7 @@ pub fn run() {
             get_default_codex_home,
             get_default_repository_root,
             scan_local_codex,
+            quarantine_empty_rollout_file,
             create_snapshot,
             validate_snapshot,
             import_snapshot,

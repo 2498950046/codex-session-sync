@@ -33,6 +33,13 @@ all SHA-256 objects before writing, reject divergent updates to an existing
 thread UUID, create a database backup, and re-scan the target before marking
 the journal complete.
 
+An empty-rollout warning can be cleaned from the compatibility panel only
+after Codex is confirmed closed. The backend revalidates that the selected
+path is a regular zero-byte `rollout-*.jsonl` inside the selected Codex Home's
+session directories, then moves it into the local repository's recoverable
+`quarantine/empty-rollouts` directory and triggers a fresh scan. Non-empty,
+symlinked, renamed, or out-of-home paths are rejected.
+
 Long-running operations run as cancellable background tasks. Scan, snapshot,
 and validation stop at the next safe checkpoint. Cancelling an import switches
 the task into rollback and restores the SQLite backup before it closes. Recovery
@@ -170,6 +177,55 @@ Optional settings:
 - `SYNC_SERVER_BIND` defaults to `127.0.0.1:8787`.
 - `SYNC_SERVER_MAX_OBJECT_BYTES` defaults to 4 GiB.
 - `SYNC_SERVER_MAX_MANIFEST_BYTES` defaults to 64 MiB.
+
+### Temporary public HTTP deployment with Docker
+
+The deployment files under `deploy/server` publish TCP port `8787` on every
+server interface, so a desktop client can connect to
+`http://SERVER_PUBLIC_IP:8787`. This mode is intended only for temporary
+testing: the Bearer token and synchronized conversation content are not
+encrypted on the public network. Move the service behind HTTPS before using
+real or sensitive conversation data.
+
+On the Linux server, copy or clone this repository and run:
+
+```bash
+cd /opt/codex-session-sync/deploy/server
+cp .env.example .env
+openssl rand -hex 32
+nano .env
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=100 sync-server
+curl http://127.0.0.1:8787/health
+```
+
+Put the generated 64-character hexadecimal value after
+`SYNC_SERVER_TOKEN=` in `.env`. If a host or cloud firewall is enabled, allow
+inbound TCP port `8787`. The Compose port mapping is deliberately
+`0.0.0.0:8787:8787`, and persistent server data is stored in the Docker named
+volume `codex-session-sync-data`.
+
+From another computer, verify the public endpoint:
+
+```bash
+curl http://SERVER_PUBLIC_IP:8787/health
+```
+
+Then configure the desktop profile with
+`http://SERVER_PUBLIC_IP:8787` and the exact token from `.env`. Routine
+operations are:
+
+```bash
+cd /opt/codex-session-sync/deploy/server
+docker compose logs --tail=100 -f sync-server
+docker compose restart sync-server
+docker compose up -d --build
+```
+
+Do not delete the `codex-session-sync-data` volume during upgrades. Switching
+to a domain later requires only an HTTPS reverse proxy and changing the
+desktop server URL; the stored namespace data remains in the same volume.
 
 Public endpoints are `GET /health` and `GET /api/v1/info`. Authenticated v1
 endpoints provide namespace create/list/rename, batch missing-object lookup,
