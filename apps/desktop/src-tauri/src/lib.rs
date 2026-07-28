@@ -5,6 +5,7 @@ mod remote_config;
 mod remote_sync;
 mod workspace_mapping;
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,10 @@ use sync_core::{
 };
 use tauri::State;
 use uuid::Uuid;
-use workspace_mapping::{WorkspaceMappingState, WorkspaceMappingStore};
+use workspace_mapping::{
+    AutomaticWorkspaceMappingResult, WorkspaceMappingState, WorkspaceMappingStore,
+    WorkspacePathSelection, WorkspacePullPlan, collect_workspace_paths,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +81,15 @@ struct CreateWorkspaceMappingRequest {
     namespace_id: String,
     remote_prefix: String,
     local_prefix: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAutomaticWorkspaceMappingsRequest {
+    remote_id: String,
+    namespace_id: String,
+    expected_head: Option<String>,
+    mappings: Vec<WorkspacePathSelection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -615,6 +628,101 @@ async fn get_workspace_mapping_state(
 }
 
 #[tauri::command]
+async fn get_workspace_pull_plan(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+) -> Result<WorkspacePullPlan, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_id = parse_uuid(&remote_id)?;
+        let namespace_id = parse_uuid(&namespace_id)?;
+        let (_, client) = load_remote_client(&repository, remote_id)?;
+        client.info()?;
+        let remote_head = client.namespace_head(namespace_id)?;
+        let remote_paths = match remote_head.as_deref() {
+            Some(head) => {
+                let revision = client.revision(head)?;
+                if revision.payload.namespace_id != namespace_id {
+                    bail!("remote revision belongs to a different namespace");
+                }
+                collect_workspace_paths(&revision.payload.threads)
+            }
+            None => Vec::new(),
+        };
+        WorkspaceMappingStore::new(repository).pull_plan(
+            &codex_home,
+            remote_id,
+            namespace_id,
+            remote_head,
+            remote_paths,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_automatic_workspace_mappings(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    request: CreateAutomaticWorkspaceMappingsRequest,
+) -> Result<AutomaticWorkspaceMappingResult, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        let remote_id = parse_uuid(&request.remote_id)?;
+        let namespace_id = parse_uuid(&request.namespace_id)?;
+        let (_, client) = load_remote_client(&repository, remote_id)?;
+        client.info()?;
+        let current_head = client.namespace_head(namespace_id)?;
+        if current_head != request.expected_head {
+            bail!(
+                "remote namespace changed while workspace paths were being prepared; retry the sync"
+            );
+        }
+        let remote_paths = match current_head.as_deref() {
+            Some(head) => {
+                let revision = client.revision(head)?;
+                if revision.payload.namespace_id != namespace_id {
+                    bail!("remote revision belongs to a different namespace");
+                }
+                collect_workspace_paths(&revision.payload.threads)
+            }
+            None => Vec::new(),
+        };
+        let store = WorkspaceMappingStore::new(repository);
+        let plan = store.pull_plan(
+            &codex_home,
+            remote_id,
+            namespace_id,
+            current_head,
+            remote_paths,
+        )?;
+        let expected = plan
+            .unmapped_paths
+            .iter()
+            .map(|candidate| candidate.remote_path.as_str())
+            .collect::<BTreeSet<_>>();
+        let provided = request
+            .mappings
+            .iter()
+            .map(|mapping| mapping.remote_path.trim())
+            .collect::<BTreeSet<_>>();
+        if expected != provided || request.mappings.len() != expected.len() {
+            bail!("workspace path set changed while mappings were being edited; inspect again");
+        }
+        store.create_automatic(&codex_home, remote_id, namespace_id, request.mappings)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn create_workspace_mapping(
     repository_root: Option<String>,
     codex_home: Option<String>,
@@ -1088,7 +1196,9 @@ pub fn run() {
             set_automatic_namespace_selection,
             clear_manual_namespace_override,
             get_workspace_mapping_state,
+            get_workspace_pull_plan,
             create_workspace_mapping,
+            create_automatic_workspace_mappings,
             delete_workspace_mapping,
             get_remote_namespace_status,
             start_push_job,

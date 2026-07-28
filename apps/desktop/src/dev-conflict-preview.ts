@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport, WorkspaceMappingRule } from "./types";
+import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport, WorkspaceMappingRule, WorkspacePullPlan } from "./types";
 
 const remoteId = "019fa1a0-1111-7111-8111-111111111111";
 const namespaceId = "019fa1a0-2222-7222-8222-222222222222";
@@ -132,6 +132,23 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
   let mappings = [...namespaceMappingState.mappings];
   let workspaceMappings: WorkspaceMappingRule[] = [];
 
+  function workspacePullPlan(requestedNamespaceId: string): WorkspacePullPlan {
+    return {
+      remoteId,
+      namespaceId: requestedNamespaceId,
+      remoteHead: requestedNamespaceId === workNamespaceId ? remoteHead : baseHash,
+      mappedPathCount: workspaceMappings.length,
+      existingPathCount: 1,
+      unmappedPaths: workspaceMappings.length > 0 ? [] : [{
+        remotePath: "D:/projects/codex-session-sync",
+        suggestedSubdirectory: "codex-session-sync",
+      }, {
+        remotePath: "/Users/demo/work/notes",
+        suggestedSubdirectory: "notes",
+      }],
+    };
+  }
+
   function currentMappingState(): NamespaceMappingState {
     const mappedNamespaceId = mappings[0]?.namespaceId ?? null;
     return {
@@ -216,6 +233,28 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
       codexHomeKey: "c:/users/demo/.codex",
       mappings: workspaceMappings,
     };
+    if (command === "get_workspace_pull_plan") {
+      const requestedNamespaceId = String((args as { namespaceId?: string } | undefined)?.namespaceId ?? namespaceId);
+      return workspacePullPlan(requestedNamespaceId);
+    }
+    if (command === "create_automatic_workspace_mappings") {
+      const request = (args as { request?: { namespaceId?: string; mappings?: Array<{ remotePath: string; localPath: string }> } } | undefined)?.request;
+      const plan = workspacePullPlan(String(request?.namespaceId ?? namespaceId));
+      workspaceMappings = (request?.mappings ?? []).map((mapping, index) => ({
+        id: `019fa1a0-5555-7555-8555-55555555555${index}`,
+        remoteId,
+        namespaceId: plan.namespaceId,
+        codexHomeKey: "c:/users/demo/.codex",
+        remotePrefix: mapping.remotePath,
+        localPrefix: mapping.localPath,
+        createdAt: "2026-07-28T00:00:00Z",
+        updatedAt: "2026-07-28T00:00:00Z",
+      }));
+      return {
+        state: { remoteId, namespaceId: plan.namespaceId, codexHomeKey: "c:/users/demo/.codex", mappings: workspaceMappings },
+        createdDirectories: workspaceMappings.map((mapping) => mapping.localPrefix),
+      };
+    }
     if (command === "create_workspace_mapping") {
       const request = (args as { request?: { namespaceId?: string; remotePrefix?: string; localPrefix?: string } } | undefined)?.request;
       workspaceMappings = [...workspaceMappings, {

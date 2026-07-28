@@ -198,6 +198,25 @@ export type WorkspaceMappingState = {
   mappings: WorkspaceMappingRule[];
 };
 
+export type WorkspacePathCandidate = {
+  remotePath: string;
+  suggestedSubdirectory: string;
+};
+
+export type WorkspacePullPlan = {
+  remoteId: string;
+  namespaceId: string;
+  remoteHead: string | null;
+  mappedPathCount: number;
+  existingPathCount: number;
+  unmappedPaths: WorkspacePathCandidate[];
+};
+
+export type AutomaticWorkspaceMappingResult = {
+  state: WorkspaceMappingState;
+  createdDirectories: string[];
+};
+
 export type ThreadConflictVersion = {
   title: string;
   archived: boolean;

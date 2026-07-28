@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type {
+  AutomaticWorkspaceMappingResult,
   CodexProcess,
   ImportReport,
   JobSnapshot,
@@ -20,7 +21,84 @@ import type {
   ThreadConflict,
   ThreadConflictVersion,
   WorkspaceMappingState,
+  WorkspacePullPlan,
 } from "./types";
+
+type PendingWorkspaceSync = {
+  command: "start_pull_job" | "start_namespace_switch_job" | "start_workspace_remap_job";
+  payload: Record<string, unknown>;
+  plan: WorkspacePullPlan;
+};
+
+type WorkspacePathDraft = {
+  remotePath: string;
+  suggestedSubdirectory: string;
+  localPath: string;
+};
+
+type WorkspacePathEditorProps = {
+  parentDirectory: string;
+  drafts: WorkspacePathDraft[];
+  busy: boolean;
+  submitLabel: string;
+  onParentChange: (value: string) => void;
+  onChooseParent: () => void;
+  onTargetChange: (index: number, value: string) => void;
+  onChooseTarget: (index: number) => void;
+  onSubmit: () => void;
+  onCancel?: () => void;
+};
+
+function WorkspacePathEditor({
+  parentDirectory,
+  drafts,
+  busy,
+  submitLabel,
+  onParentChange,
+  onChooseParent,
+  onTargetChange,
+  onChooseTarget,
+  onSubmit,
+  onCancel,
+}: WorkspacePathEditorProps) {
+  const complete = drafts.length > 0 && drafts.every((draft) => draft.localPath.trim());
+  return <div className="workspace-path-editor">
+    <div className="field workspace-parent-field"><label htmlFor={onCancel ? "sync-workspace-parent" : "migration-workspace-parent"}>统一父目录</label><div className="path-picker-row"><input id={onCancel ? "sync-workspace-parent" : "migration-workspace-parent"} value={parentDirectory} onChange={(event) => onParentChange(event.target.value)} placeholder="输入或选择父目录，自动生成右侧路径" /><button type="button" className="path-picker-button" onClick={onChooseParent} disabled={busy}>选择目录</button></div></div>
+    <div className="workspace-path-table">
+      <div className="workspace-path-table-head"><span>原路径</span><span>本机目标路径（可逐项修改）</span></div>
+      {drafts.map((draft, index) => <div className="workspace-path-table-row" key={draft.remotePath}>
+        <code title={draft.remotePath}>{draft.remotePath}</code>
+        <div className="path-picker-row"><input value={draft.localPath} onChange={(event) => onTargetChange(index, event.target.value)} placeholder={`目标目录，例如 ${draft.suggestedSubdirectory}`} /><button type="button" className="path-picker-button" onClick={() => onChooseTarget(index)} disabled={busy}>选择</button></div>
+      </div>)}
+    </div>
+    <div className="workspace-editor-actions"><button onClick={onSubmit} disabled={busy || !complete} title={!complete ? "请为每个原路径指定本机目标路径" : undefined}>{submitLabel}</button>{onCancel && <button className="secondary-button" onClick={onCancel} disabled={busy}>取消</button>}</div>
+  </div>;
+}
+
+function joinWorkspacePath(parent: string, child: string): string {
+  const trimmed = parent.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return "";
+  const separator = trimmed.includes("\\") && !trimmed.includes("/") ? "\\" : "/";
+  return `${trimmed}${separator}${child}`;
+}
+
+function buildWorkspaceDrafts(plan: WorkspacePullPlan, parentDirectory: string): WorkspacePathDraft[] {
+  const used = new Set<string>();
+  return plan.unmappedPaths.map((candidate) => {
+    let suffix = 1;
+    let child = candidate.suggestedSubdirectory;
+    while (used.has(child.toLocaleLowerCase())) {
+      suffix += 1;
+      child = `${candidate.suggestedSubdirectory}-${suffix}`;
+    }
+    used.add(child.toLocaleLowerCase());
+    return {
+      remotePath: candidate.remotePath,
+      suggestedSubdirectory: child,
+      localPath: joinWorkspacePath(parentDirectory, child),
+    };
+  });
+}
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -110,6 +188,14 @@ export default function App() {
   const [namespaceStatus, setNamespaceStatus] = useState<RemoteNamespaceStatus | null>(null);
   const [mappingState, setMappingState] = useState<NamespaceMappingState | null>(null);
   const [workspaceMappingState, setWorkspaceMappingState] = useState<WorkspaceMappingState | null>(null);
+  const [pendingWorkspaceSync, setPendingWorkspaceSync] = useState<PendingWorkspaceSync | null>(null);
+  const [workspaceSetupMessage, setWorkspaceSetupMessage] = useState<string | null>(null);
+  const [workspaceEditorParent, setWorkspaceEditorParent] = useState("");
+  const [workspaceDrafts, setWorkspaceDrafts] = useState<WorkspacePathDraft[]>([]);
+  const [migrationPlan, setMigrationPlan] = useState<WorkspacePullPlan | null>(null);
+  const [migrationParent, setMigrationParent] = useState("");
+  const [migrationDrafts, setMigrationDrafts] = useState<WorkspacePathDraft[]>([]);
+  const [migrationMessage, setMigrationMessage] = useState<string | null>(null);
   const [remoteWorkspacePrefix, setRemoteWorkspacePrefix] = useState("");
   const [localWorkspacePrefix, setLocalWorkspacePrefix] = useState("");
   const [mappingLabel, setMappingLabel] = useState("");
@@ -124,6 +210,32 @@ export default function App() {
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
   const selectedProfile = profiles.find((profile) => profile.id === selectedRemoteId) ?? null;
   const selectedNamespace = namespaces.find((namespace) => namespace.id === selectedNamespaceId) ?? null;
+  const writeBlockedReason = busy
+    ? "请等待当前任务完成"
+    : !isTauriRuntime
+      ? "请在 Codex Session Sync 桌面应用中操作"
+      : processes.length > 0
+        ? "请先完全退出 Codex，然后点击“重新检测”"
+        : !confirmedClosed
+          ? "请先勾选上方“我已完全退出 Codex”"
+          : null;
+  const workflowNextStep = remoteLoading
+    ? "正在读取远端状态，请稍候。"
+    : !codexHome.trim() || !repositoryRoot.trim()
+      ? "先确认 Codex Home 和本地同步仓库路径。"
+      : profiles.length === 0
+        ? "下一步：填写远端服务器信息，然后点击“保存并验证”。"
+        : !selectedRemoteId
+          ? "下一步：选择一个远端服务器。"
+          : namespaces.length === 0
+            ? "下一步：创建第一个命名空间。"
+            : !selectedNamespaceId
+              ? "下一步：选择一个命名空间。"
+              : processes.length > 0
+                ? "下一步：完全退出 Codex，再点击“重新检测”。"
+                : !confirmedClosed
+                  ? "下一步：勾选“我已完全退出 Codex”，即可启用同步操作。"
+                  : "准备完成：可以推送、拉取或切换命名空间。拉取时会自动检查项目路径。";
   const mappingCriteriaValid = Boolean(
     (matchApiKey && mappingState?.context.apiKeyAvailable)
     || (matchProvider && mappingState?.context.provider)
@@ -314,6 +426,14 @@ export default function App() {
 
   useEffect(() => {
     setConflictChoices({});
+    setPendingWorkspaceSync(null);
+    setWorkspaceSetupMessage(null);
+    setWorkspaceEditorParent("");
+    setWorkspaceDrafts([]);
+    setMigrationPlan(null);
+    setMigrationParent("");
+    setMigrationDrafts([]);
+    setMigrationMessage(null);
   }, [syncTargetKey]);
 
   useEffect(() => {
@@ -378,8 +498,8 @@ export default function App() {
     }
   }
 
-  async function start(command: string, payload: Record<string, unknown>) {
-    if (busy) return;
+  async function start(command: string, payload: Record<string, unknown>, allowWhilePreparing = false) {
+    if (busy && !allowWhilePreparing) return;
     if (command === "start_namespace_switch_job") setConfirmedReplaceTarget(null);
     setError(null);
     try {
@@ -434,6 +554,181 @@ export default function App() {
     } catch (reason) {
       setError(`无法打开项目目录选择器：${String(reason)}`);
     }
+  }
+
+  async function prepareWorkspacePathsAndStart(
+    command: "start_pull_job" | "start_namespace_switch_job",
+    payload: Record<string, unknown>,
+  ) {
+    if (busy || !selectedRemoteId || !selectedNamespaceId) return;
+    setRemoteLoading(true);
+    setError(null);
+    setWorkspaceSetupMessage(null);
+    let directStart = false;
+    try {
+      const plan = await invoke<WorkspacePullPlan>("get_workspace_pull_plan", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+      });
+      if (plan.unmappedPaths.length === 0) {
+        setPendingWorkspaceSync(null);
+        directStart = true;
+      } else {
+        const effectiveCommand = command === "start_pull_job"
+          && namespaceStatus?.active
+          && namespaceStatus.integratedHead === plan.remoteHead
+          ? "start_workspace_remap_job"
+          : command;
+        setPendingWorkspaceSync({ command: effectiveCommand, payload, plan });
+        setWorkspaceEditorParent("");
+        setWorkspaceDrafts(buildWorkspaceDrafts(plan, ""));
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+    if (directStart) await start(command, payload, true);
+  }
+
+  function changeEditorParent(mode: "sync" | "migration", value: string) {
+    const plan = mode === "sync" ? pendingWorkspaceSync?.plan : migrationPlan;
+    if (!plan) return;
+    if (mode === "sync") {
+      setWorkspaceEditorParent(value);
+      setWorkspaceDrafts(buildWorkspaceDrafts(plan, value));
+    } else {
+      setMigrationParent(value);
+      setMigrationDrafts(buildWorkspaceDrafts(plan, value));
+    }
+  }
+
+  async function chooseEditorParent(mode: "sync" | "migration") {
+    const plan = mode === "sync" ? pendingWorkspaceSync?.plan : migrationPlan;
+    if (!plan || !isTauriRuntime || busy) return;
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: true,
+        title: `选择父目录，生成 ${plan.unmappedPaths.length} 个本机项目路径`,
+      });
+      if (typeof selected === "string") changeEditorParent(mode, selected);
+    } catch (reason) {
+      setError(`无法打开项目父目录选择器：${String(reason)}`);
+    }
+  }
+
+  async function chooseEditorTarget(mode: "sync" | "migration", index: number) {
+    if (!isTauriRuntime || busy) return;
+    const drafts = mode === "sync" ? workspaceDrafts : migrationDrafts;
+    const current = drafts[index];
+    if (!current) return;
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: true,
+        defaultPath: current.localPath.trim() || undefined,
+        title: `为 ${current.remotePath} 选择本机目录`,
+      });
+      if (typeof selected !== "string") return;
+      const update = (items: WorkspacePathDraft[]) => items.map((item, itemIndex) => (
+        itemIndex === index ? { ...item, localPath: selected } : item
+      ));
+      if (mode === "sync") setWorkspaceDrafts(update);
+      else setMigrationDrafts(update);
+    } catch (reason) {
+      setError(`无法打开项目目录选择器：${String(reason)}`);
+    }
+  }
+
+  async function saveWorkspaceDrafts(plan: WorkspacePullPlan, drafts: WorkspacePathDraft[]) {
+    return invoke<AutomaticWorkspaceMappingResult>("create_automatic_workspace_mappings", {
+      repositoryRoot: repositoryRoot.trim(),
+      codexHome: codexHome.trim(),
+      request: {
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+        expectedHead: plan.remoteHead,
+        mappings: drafts.map((draft) => ({
+          remotePath: draft.remotePath,
+          localPath: draft.localPath.trim(),
+        })),
+      },
+    });
+  }
+
+  async function saveWorkspaceDraftsAndContinue() {
+    if (!pendingWorkspaceSync || busy) return;
+    setRemoteLoading(true);
+    setError(null);
+    let shouldContinue = false;
+    try {
+      const result = await saveWorkspaceDrafts(pendingWorkspaceSync.plan, workspaceDrafts);
+      setWorkspaceMappingState(result.state);
+      setWorkspaceSetupMessage(
+        `已保存 ${workspaceDrafts.length} 条路径规则，创建 ${result.createdDirectories.length} 个目录，正在继续同步。`,
+      );
+      setPendingWorkspaceSync(null);
+      shouldContinue = true;
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+    if (shouldContinue) {
+      await start(pendingWorkspaceSync.command, pendingWorkspaceSync.payload, true);
+    }
+  }
+
+  async function inspectWorkspaceMigration() {
+    if (busy || !selectedRemoteId || !selectedNamespaceId) return;
+    setRemoteLoading(true);
+    setError(null);
+    setMigrationMessage(null);
+    try {
+      const plan = await invoke<WorkspacePullPlan>("get_workspace_pull_plan", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+      });
+      setMigrationPlan(plan.unmappedPaths.length > 0 ? plan : null);
+      setMigrationParent("");
+      setMigrationDrafts(buildWorkspaceDrafts(plan, ""));
+      if (plan.unmappedPaths.length === 0) {
+        setMigrationMessage("当前命名空间没有需要迁移的未映射项目路径。");
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
+
+  async function saveMigrationDrafts() {
+    if (!migrationPlan || busy) return;
+    setRemoteLoading(true);
+    setError(null);
+    let applyToLocal = false;
+    try {
+      const result = await saveWorkspaceDrafts(migrationPlan, migrationDrafts);
+      setWorkspaceMappingState(result.state);
+      setMigrationPlan(null);
+      setMigrationDrafts([]);
+      applyToLocal = Boolean(namespaceStatus?.active && canWrite);
+      setMigrationMessage(applyToLocal
+        ? `已保存 ${migrationDrafts.length} 条规则，正在安全应用到已有会话。`
+        : `已保存 ${migrationDrafts.length} 条规则；下次拉取或切换时会自动应用。`);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+    if (applyToLocal) await start("start_workspace_remap_job", syncPayload, true);
   }
 
   async function createWorkspaceMapping() {
@@ -741,6 +1036,9 @@ export default function App() {
         <div><strong>写入安全检查</strong><span>Push、Pull、冲突解决与命名空间切换前必须完全退出 Codex。</span></div>
         <button className="secondary-button" onClick={() => void refreshProcesses()} disabled={busy || !isTauriRuntime}>重新检测</button>
       </section>
+      <section className="next-step-banner" aria-live="polite">
+        <span>操作引导</span><strong>{workflowNextStep}</strong>
+      </section>
       {processes.length > 0 && <div className="process-list">{processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}</div>}
 
       <section className="panel workspace-panel">
@@ -809,14 +1107,18 @@ export default function App() {
         </div>}
 
         {selectedNamespace && workspaceMappingState && <div className="workspace-mapping-console">
-          <div className="mapping-heading"><div><h3>项目路径映射</h3><p>把远端会话记录的绝对路径映射到当前电脑；规则只保存在本机，Push 前会自动反向规范化。</p></div><span>{workspaceMappingState.mappings.length} 条规则</span></div>
-          <div className="workspace-mapping-builder">
-            <div className="field"><label htmlFor="remote-workspace-prefix">源电脑项目根路径</label><input id="remote-workspace-prefix" value={remoteWorkspacePrefix} onChange={(event) => setRemoteWorkspacePrefix(event.target.value)} placeholder="例如 D:\projects" /></div>
-            <div className="field"><label htmlFor="local-workspace-prefix">当前电脑项目根路径</label><div className="path-picker-row"><input id="local-workspace-prefix" value={localWorkspacePrefix} onChange={(event) => setLocalWorkspacePrefix(event.target.value)} placeholder="例如 F:\workspace" /><button type="button" className="path-picker-button" onClick={() => void selectLocalWorkspacePrefix()} disabled={busy || !isTauriRuntime}>选择目录</button></div></div>
-            <button onClick={() => void createWorkspaceMapping()} disabled={busy || !remoteWorkspacePrefix.trim() || !localWorkspacePrefix.trim()}>添加路径映射</button>
-          </div>
-          <div className="workspace-mapping-list">{workspaceMappingState.mappings.map((mapping) => <article key={mapping.id}><div><code>{mapping.remotePrefix}</code><span>→</span><code>{mapping.localPrefix}</code></div><button className="danger-button" onClick={() => void deleteWorkspaceMapping(mapping.id)} disabled={busy}>删除</button></article>)}{workspaceMappingState.mappings.length === 0 && <p className="muted-copy">尚未配置。跨电脑路径不一致时，会话无法恢复原项目分组。</p>}</div>
-          {workspaceMappingState.mappings.length > 0 && <div className="workspace-remap-row"><p>保存规则不会立即改动会话。应用时会重新校验远端 Head、创建备份并安全 checkout。</p><button className="secondary-button" onClick={() => void start("start_workspace_remap_job", syncPayload)} disabled={busy || !canWrite || !namespaceStatus?.active}>应用映射到本机会话</button></div>}
+          <div className="mapping-heading"><div><h3>项目路径</h3><p>拉取或切换时自动检查。原路径在本机可用或已有映射时不会处理；其余项目只需统一选择一次父目录。</p></div><span>{workspaceMappingState.mappings.length} 条本机规则</span></div>
+          {workspaceSetupMessage && <p className="success-copy workspace-setup-message">{workspaceSetupMessage}</p>}
+          <div className="workspace-mapping-list">{workspaceMappingState.mappings.map((mapping) => <article key={mapping.id}><div><code>{mapping.remotePrefix}</code><span>→</span><code>{mapping.localPrefix}</code></div><button className="danger-button" onClick={() => void deleteWorkspaceMapping(mapping.id)} disabled={busy}>删除</button></article>)}{workspaceMappingState.mappings.length === 0 && !pendingWorkspaceSync && <p className="muted-copy">无需提前配置。首次拉取发现跨电脑路径时，应用会引导你批量设置。</p>}</div>
+          <details className="advanced-mapping">
+            <summary>高级：手动添加根路径规则</summary>
+            <div className="workspace-mapping-builder">
+              <div className="field"><label htmlFor="remote-workspace-prefix">源电脑项目根路径</label><input id="remote-workspace-prefix" value={remoteWorkspacePrefix} onChange={(event) => setRemoteWorkspacePrefix(event.target.value)} placeholder="例如 D:\projects" /></div>
+              <div className="field"><label htmlFor="local-workspace-prefix">当前电脑项目根路径</label><div className="path-picker-row"><input id="local-workspace-prefix" value={localWorkspacePrefix} onChange={(event) => setLocalWorkspacePrefix(event.target.value)} placeholder="例如 F:\workspace" /><button type="button" className="path-picker-button" onClick={() => void selectLocalWorkspacePrefix()} disabled={busy || !isTauriRuntime}>选择目录</button></div></div>
+              <button onClick={() => void createWorkspaceMapping()} disabled={busy || !remoteWorkspacePrefix.trim() || !localWorkspacePrefix.trim()} title={!remoteWorkspacePrefix.trim() || !localWorkspacePrefix.trim() ? "请填写源路径和本机路径" : undefined}>添加路径映射</button>
+            </div>
+          </details>
+          {workspaceMappingState.mappings.length > 0 && <div className="workspace-remap-row"><p>如需让已经拉取到本机的会话立即使用新规则，可安全备份并重新整理。</p><button className="secondary-button" onClick={() => void start("start_workspace_remap_job", syncPayload)} disabled={busy || !canWrite || !namespaceStatus?.active} title={!namespaceStatus?.active ? "只能整理当前活动命名空间" : writeBlockedReason ?? undefined}>应用到已有会话</button></div>}
         </div>}
 
         {selectedNamespace && namespaceStatus && <div className="sync-console">
@@ -826,17 +1128,57 @@ export default function App() {
             <article><span>远端 Head</span><code>{shortHead(namespaceStatus.remoteHead)}</code></article>
             <article><span>状态</span><strong>{namespaceStatus.active ? "当前活动" : namespaceStatus.activeNamespaceId ? "需要切换" : "尚未绑定"}</strong></article>
           </div>
+          <div className={`sync-guidance ${writeBlockedReason ? "sync-guidance-blocked" : ""}`}><strong>{writeBlockedReason ? "操作尚未就绪" : "可以开始同步"}</strong><span>{writeBlockedReason ?? "拉取会先检查远端项目路径；需要调整时会让你一次选择父目录。"}</span></div>
           <div className="action-row sync-actions">
             {namespaceStatus.active ? <>
-              <button onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite}>推送</button>
-              <button className="secondary-button" onClick={() => void start("start_pull_job", syncPayload)} disabled={busy || !canWrite}>拉取</button>
-            </> : !namespaceStatus.activeNamespaceId && !namespaceStatus.remoteHead ? <button onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite}>用本机会话初始化并推送</button> : <button className="danger-button" onClick={() => void start("start_namespace_switch_job", { ...syncPayload, confirmedReplaceLocal: confirmedReplace })} disabled={busy || !canWrite || !confirmedReplace}>切换到此命名空间</button>}
+              <button onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>推送</button>
+              <button className="secondary-button" onClick={() => void prepareWorkspacePathsAndStart("start_pull_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>拉取</button>
+            </> : !namespaceStatus.activeNamespaceId && !namespaceStatus.remoteHead ? <button onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>用本机会话初始化并推送</button> : <button className="danger-button" onClick={() => void prepareWorkspacePathsAndStart("start_namespace_switch_job", { ...syncPayload, confirmedReplaceLocal: confirmedReplace })} disabled={busy || !canWrite || !confirmedReplace} title={!confirmedReplace ? "请先勾选下方的替换确认" : writeBlockedReason ?? undefined}>切换到此命名空间</button>}
           </div>
           {!namespaceStatus.active && <label className="safety-check"><input type="checkbox" checked={confirmedReplace} onChange={(event) => setConfirmedReplaceTarget(event.target.checked ? replaceTargetKey : null)} /><span>我确认切换会先备份，然后用目标命名空间完整替换本机会话</span></label>}
         </div>}
       </section>}
 
+      {selectedNamespace && workspaceMappingState && <section className="panel migration-panel">
+        <div className="section-heading"><div><h2>会话项目路径迁移</h2><p>复用同步前的路径分析，批量把尚未适配当前电脑的项目迁移到新目录；已存在和已映射路径不会改动。</p></div><button className="secondary-button" onClick={() => void inspectWorkspaceMigration()} disabled={busy} title={busy ? "请等待当前任务完成" : undefined}>检查项目路径</button></div>
+        {migrationMessage && <p className="success-copy">{migrationMessage}</p>}
+        {migrationPlan && <>
+          <div className="migration-summary"><strong>待迁移 {migrationPlan.unmappedPaths.length} 项</strong><span>{migrationPlan.mappedPathCount} 项已有映射 · {migrationPlan.existingPathCount} 项原路径可用</span></div>
+          <WorkspacePathEditor
+            parentDirectory={migrationParent}
+            drafts={migrationDrafts}
+            busy={busy}
+            submitLabel={namespaceStatus?.active && canWrite ? "保存并应用到已有会话" : "保存路径规则"}
+            onParentChange={(value) => changeEditorParent("migration", value)}
+            onChooseParent={() => void chooseEditorParent("migration")}
+            onTargetChange={(index, value) => setMigrationDrafts((current) => current.map((draft, draftIndex) => draftIndex === index ? { ...draft, localPath: value } : draft))}
+            onChooseTarget={(index) => void chooseEditorTarget("migration", index)}
+            onSubmit={() => void saveMigrationDrafts()}
+          />
+        </>}
+      </section>}
+
       {error && <div className="error-banner">{error}</div>}
+
+      {pendingWorkspaceSync && <div className="task-modal-backdrop" role="dialog" aria-modal="true" aria-label="设置本机项目路径">
+        <section className="workspace-path-modal">
+          <div className="workspace-modal-heading"><div><span className="eyebrow">同步前路径检查</span><h2>设置本机项目路径</h2></div><button type="button" className="modal-close-button" onClick={() => setPendingWorkspaceSync(null)} disabled={busy} aria-label="关闭">×</button></div>
+          <p>发现 {pendingWorkspaceSync.plan.unmappedPaths.length} 个本机不存在且尚未映射的项目路径。选择一个父目录可批量生成目标；右侧每一项仍可单独输入或选择。</p>
+          <div className="migration-summary"><strong>{pendingWorkspaceSync.plan.unmappedPaths.length} 项待设置</strong><span>{pendingWorkspaceSync.plan.mappedPathCount} 项已有映射 · {pendingWorkspaceSync.plan.existingPathCount} 项原路径可用，不会改动</span></div>
+          <WorkspacePathEditor
+            parentDirectory={workspaceEditorParent}
+            drafts={workspaceDrafts}
+            busy={busy}
+            submitLabel="创建目录并继续同步"
+            onParentChange={(value) => changeEditorParent("sync", value)}
+            onChooseParent={() => void chooseEditorParent("sync")}
+            onTargetChange={(index, value) => setWorkspaceDrafts((current) => current.map((draft, draftIndex) => draftIndex === index ? { ...draft, localPath: value } : draft))}
+            onChooseTarget={(index) => void chooseEditorTarget("sync", index)}
+            onSubmit={() => void saveWorkspaceDraftsAndContinue()}
+            onCancel={() => setPendingWorkspaceSync(null)}
+          />
+        </section>
+      </div>}
 
       {syncReport && <section className="panel sync-result">
         <div className="section-heading"><h2>最近同步结果</h2><span>{syncReport.kind}</span></div>
