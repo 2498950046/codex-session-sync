@@ -1241,6 +1241,7 @@ mod tests {
             updated_at: "2026-07-26T10:00:01Z".to_string(),
             database_backups: Vec::new(),
             directory_swaps: Vec::new(),
+            file_swaps: Vec::new(),
             expected_thread_hashes: BTreeMap::new(),
             tracking_update: None,
             error: None,

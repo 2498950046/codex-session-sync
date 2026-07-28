@@ -8,7 +8,7 @@ use sync_core::{
     CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, LocalSnapshot, OperationControl,
     OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome,
     TrackingRecord, TrackingStore, WorkspacePathMapper,
-    checkout_local_snapshot_with_tracking_control, collect_object_descriptors,
+    checkout_local_snapshot_with_tracking_and_projects_control, collect_object_descriptors,
     create_local_snapshot_with_control, install_repository_object, load_local_snapshot,
     merge_thread_sets, remote_thread_view, repository_object_path, resolve_thread_sets,
     revision_to_snapshot, semantic_thread_hash, snapshot_to_revision, store_local_snapshot,
@@ -108,8 +108,9 @@ pub fn reapply_workspace_mappings(
     )?;
     let thread_count = snapshot.threads.len();
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
-    let checkout = checkout_local_snapshot_with_tracking_control(
+    let checkout = checkout_local_snapshot_with_tracking_and_projects_control(
         manifest,
         codex_home,
         repository_root,
@@ -121,6 +122,7 @@ pub fn reapply_workspace_mappings(
             integrated_head: record.integrated_head.clone(),
             activate_namespace: true,
         },
+        &project_roots,
         control,
     )?;
     Ok(SyncReport {
@@ -588,13 +590,15 @@ fn apply_prepared_pull(
         control,
     )?;
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
-    checkout_local_snapshot_with_tracking_control(
+    checkout_local_snapshot_with_tracking_and_projects_control(
         manifest,
         codex_home,
         repository_root,
         true,
         tracking_update,
+        &project_roots,
         control,
     )
 }
@@ -668,8 +672,9 @@ pub fn switch_namespace(
         control,
     )?;
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = target_workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
-    let checkout = checkout_local_snapshot_with_tracking_control(
+    let checkout = checkout_local_snapshot_with_tracking_and_projects_control(
         manifest,
         codex_home,
         repository_root,
@@ -681,6 +686,7 @@ pub fn switch_namespace(
             integrated_head: target_head.clone(),
             activate_namespace: true,
         },
+        &project_roots,
         control,
     )?;
     Ok(SyncReport {
@@ -1153,6 +1159,29 @@ mod tests {
         assert_eq!(remapped_paths["thread-b"], "F:/workspace/new");
         assert_eq!(rollout_cwd(&home_b, "thread-a"), "F:/workspace");
         assert_eq!(rollout_cwd(&home_b, "thread-b"), "F:/workspace/new");
+        let project_state: serde_json::Value =
+            serde_json::from_reader(File::open(home_b.join(".codex-global-state.json")).unwrap())
+                .unwrap();
+        let assignment_a = &project_state["thread-project-assignments"]["thread-a"];
+        let assignment_b = &project_state["thread-project-assignments"]["thread-b"];
+        assert_eq!(assignment_a["projectId"], assignment_b["projectId"]);
+        assert_eq!(
+            assignment_a["cwd"].as_str().unwrap().replace('\\', "/"),
+            "F:/workspace"
+        );
+        assert_eq!(
+            assignment_b["cwd"].as_str().unwrap().replace('\\', "/"),
+            "F:/workspace/new"
+        );
+        assert!(
+            remapped_b
+                .checkout
+                .as_ref()
+                .unwrap()
+                .local_backup_dir
+                .join("project-state/global-state.json")
+                .is_file()
+        );
 
         let pushed_b = push_namespace(
             remote_id,
@@ -1369,6 +1398,18 @@ mod tests {
     fn initialize_home(home: &Path) {
         fs::create_dir_all(home.join("sessions/2026/07/26")).unwrap();
         fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        fs::write(
+            home.join(".codex-global-state.json"),
+            serde_json::to_vec(&json!({
+                "electron-saved-workspace-roots": [],
+                "project-order": [],
+                "local-projects": {},
+                "thread-project-assignments": {},
+                "projectless-thread-ids": ["thread-a", "thread-b"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
         connection
             .execute_batch(

@@ -78,6 +78,13 @@ impl WorkspacePathMapper {
         self.transform_snapshot_objects(snapshot, repository_root, control, false)
     }
 
+    pub fn local_prefixes(&self) -> Vec<String> {
+        self.mappings
+            .iter()
+            .map(|mapping| mapping.local_prefix.clone())
+            .collect()
+    }
+
     pub fn materialize_snapshot_objects_with_reference(
         &self,
         snapshot: &LocalSnapshot,
