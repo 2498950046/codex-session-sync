@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type {
   CodexProcess,
   ImportReport,
@@ -394,6 +395,23 @@ export default function App() {
     }
   }
 
+  async function selectJournalFile() {
+    if (!isTauriRuntime || busy) return;
+    setError(null);
+    const repository = repositoryRoot.trim().replace(/[\\/]+$/, "");
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: false,
+        defaultPath: journalPath.trim() || (repository ? `${repository}/journal` : undefined),
+        filters: [{ name: "Checkout Journal", extensions: ["json"] }],
+      });
+      if (typeof selected === "string") setJournalPath(selected);
+    } catch (reason) {
+      setError(`无法打开 Journal 文件选择器：${String(reason)}`);
+    }
+  }
+
   async function quarantineWarning(warning: ScanWarning) {
     if (busy || !canWrite || warning.kind !== "empty_rollout") return;
     if (!window.confirm(`将这个 0 字节 rollout 移入可恢复隔离区？\n\n${warning.path}`)) return;
@@ -763,7 +781,7 @@ export default function App() {
         <div className="section-heading"><div><h2>本地快照工具</h2><p>保留原有的验证、增量导入和恢复入口，便于诊断与手动操作。</p></div></div>
         <div className="field"><label htmlFor="manifest-path">快照清单路径</label><input id="manifest-path" value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} placeholder="~/.codex-session-sync/snapshots/<id>.json" /></div>
         <div className="action-row compact-actions"><button className="secondary-button" onClick={() => void start("start_validation_job", { manifestPath: manifestPath.trim(), repositoryRoot: repositoryRoot.trim() })} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button><button className="danger-button" onClick={() => void start("start_import_job", { manifestPath: manifestPath.trim(), codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !manifestPath.trim() || !canWrite}>增量导入</button></div>
-        <div className="recovery-row"><div className="field"><label htmlFor="journal-path">未完成操作的 Journal 路径</label><input id="journal-path" value={journalPath} onChange={(event) => setJournalPath(event.target.value)} /></div><button className="recovery-button" onClick={() => void start("start_recovery_job", { journalPath: journalPath.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !journalPath.trim() || !canWrite}>从备份恢复</button></div>
+        <div className="recovery-row"><div className="field"><label htmlFor="journal-path">未完成操作的 Journal 路径</label><div className="path-picker-row"><input id="journal-path" value={journalPath} onChange={(event) => setJournalPath(event.target.value)} placeholder="选择 checkout-*.json" /><button type="button" className="path-picker-button" onClick={() => void selectJournalFile()} disabled={busy || !isTauriRuntime}>选择文件</button></div></div><button className="recovery-button" onClick={() => void start("start_recovery_job", { journalPath: journalPath.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !journalPath.trim() || !canWrite}>从备份恢复</button></div>
       </section>
 
       {(snapshot || validation || importReport || recoveredJournal) && <section className="result-grid">

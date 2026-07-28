@@ -38,6 +38,9 @@ button { cursor: pointer; }
 .field label { color: #9aabba; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
 .field input { width: 100%; border: 1px solid #354354; border-radius: 11px; padding: 12px 14px; color: #f7f9fb; background: #0c1118; outline: none; }
 .field input:focus { border-color: #61c9a7; box-shadow: 0 0 0 3px rgba(97, 201, 167, .12); }
+.path-picker-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.path-picker-button { min-width: 96px; border: 1px solid #405064; border-radius: 11px; padding: 12px 14px; color: #dce7f1; background: #17202b; font-weight: 800; }
+.path-picker-button:disabled { cursor: not-allowed; opacity: .45; }
 .scan-panel button { min-width: 168px; border: 0; border-radius: 11px; padding: 13px 18px; color: #06110e; background: #75e5be; font-weight: 800; }
 .scan-panel button:disabled { cursor: not-allowed; opacity: .55; }
 .action-row { display: flex; gap: 12px; align-items: center; }
@@ -197,6 +200,7 @@ button { cursor: pointer; }
   .action-row { align-items: stretch; flex-direction: column; }
   .result-grid { grid-template-columns: 1fr; }
   .recovery-row { grid-template-columns: 1fr; }
+  .path-picker-row { grid-template-columns: 1fr; }
   .remote-form, .namespace-editor, .sync-status-grid, .identity-grid, .mapping-builder { grid-template-columns: 1fr; }
   .mapping-card { grid-template-columns: 1fr auto; }
   .mapping-card .mapping-tags { grid-column: 1 / -1; grid-row: 2; }

@@ -923,6 +923,7 @@ fn resolve_repository_root(value: Option<String>) -> std::path::PathBuf {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(JobManager::default())
         .invoke_handler(tauri::generate_handler![
             get_default_codex_home,
