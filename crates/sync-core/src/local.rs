@@ -793,6 +793,25 @@ pub(crate) fn insert_thread_row(
         .first()
         .and_then(Value::as_object)
         .context("snapshot thread record is not a JSON object")?;
+    let created_at_ms = thread.created_at_ms.or_else(|| {
+        row.get("created_at_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                row.get("created_at")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+    });
+    let updated_at_ms = thread.updated_at_ms.or_else(|| {
+        row.get("updated_at_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                row.get("updated_at")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+    });
+    let recency_at_ms = updated_at_ms.or(created_at_ms);
 
     let mut columns = Vec::new();
     let mut values = Vec::new();
@@ -803,6 +822,30 @@ pub(crate) fn insert_thread_row(
             Some(Value::String(
                 target_codex_home.to_string_lossy().into_owned(),
             ))
+        } else if column == "created_at_ms" {
+            row.get(column)
+                .cloned()
+                .or_else(|| created_at_ms.map(Value::from))
+        } else if column == "updated_at_ms" {
+            row.get(column)
+                .cloned()
+                .or_else(|| updated_at_ms.map(Value::from))
+        } else if column == "created_at" {
+            row.get(column)
+                .cloned()
+                .or_else(|| created_at_ms.map(|value| Value::from(value / 1_000)))
+        } else if column == "updated_at" {
+            row.get(column)
+                .cloned()
+                .or_else(|| updated_at_ms.map(|value| Value::from(value / 1_000)))
+        } else if column == "recency_at_ms" {
+            row.get(column)
+                .cloned()
+                .or_else(|| recency_at_ms.map(Value::from))
+        } else if column == "recency_at" {
+            row.get(column)
+                .cloned()
+                .or_else(|| recency_at_ms.map(|value| Value::from(value / 1_000)))
         } else {
             row.get(column).cloned()
         };
@@ -1200,12 +1243,12 @@ pub(crate) fn copy_verified_object(
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        if let Some(control) = control {
-            if control.is_cancelled() {
-                drop(writer);
-                let _ = fs::remove_file(destination);
-                bail!("operation cancelled");
-            }
+        if let Some(control) = control
+            && control.is_cancelled()
+        {
+            drop(writer);
+            let _ = fs::remove_file(destination);
+            bail!("operation cancelled");
         }
         let count = reader.read(&mut buffer)?;
         if count == 0 {
@@ -1333,6 +1376,9 @@ fn write_journal(path: &Path, journal: &OperationJournal) -> Result<()> {
 mod tests {
     use super::*;
     use crate::codex::scan_codex_home;
+    use crate::models::{
+        ContentObject, RelatedRecords, THREAD_BUNDLE_SCHEMA_VERSION, WorkspaceRef,
+    };
     use serde_json::json;
     use std::sync::{
         Arc,
@@ -1370,6 +1416,72 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn insert_thread_row_synthesizes_recency_from_bundle_timestamp() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    updated_at_ms INTEGER,
+                    recency_at INTEGER NOT NULL DEFAULT 0,
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        let timestamp_ms = 1_700_000_100_123_i64;
+        let thread = ThreadBundle {
+            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+            thread_id: "thread".to_string(),
+            title: "Thread".to_string(),
+            archived: false,
+            created_at_ms: None,
+            updated_at_ms: Some(timestamp_ms),
+            model_provider: Some("openai".to_string()),
+            workspace: WorkspaceRef {
+                logical_id: None,
+                source_path: Some("C:/work".to_string()),
+            },
+            rollout: ContentObject {
+                sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                byte_length: 0,
+                media_type: "application/x-ndjson".to_string(),
+                logical_path: Some("sessions/rollout-thread.jsonl".to_string()),
+                source_path: None,
+            },
+            related_records: RelatedRecords {
+                source_database: None,
+                tables: BTreeMap::from([(
+                    "threads".to_string(),
+                    vec![json!({"id": "thread", "cwd": "C:/work"})],
+                )]),
+            },
+            attachments: Vec::new(),
+        };
+        let columns = thread_table_columns(&connection).unwrap();
+
+        insert_thread_row(
+            &connection,
+            &columns,
+            &thread,
+            Path::new("C:/codex/sessions/rollout-thread.jsonl"),
+            Path::new("C:/codex"),
+        )
+        .unwrap();
+
+        let values: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT updated_at_ms, recency_at, recency_at_ms FROM threads WHERE id = 'thread'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (timestamp_ms, timestamp_ms / 1_000, timestamp_ms));
     }
 
     #[test]

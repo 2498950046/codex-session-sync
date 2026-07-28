@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport } from "./types";
+import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport, WorkspaceMappingRule } from "./types";
 
 const remoteId = "019fa1a0-1111-7111-8111-111111111111";
 const namespaceId = "019fa1a0-2222-7222-8222-222222222222";
@@ -69,6 +69,20 @@ const conflictReport: SyncReport = {
   }],
 };
 
+const remapReport: SyncReport = {
+  ...conflictReport,
+  kind: "remapped",
+  conflicts: [],
+  checkout: {
+    operationId: "019fa1a0-6666-7666-8666-666666666666",
+    snapshotId: "019fa1a0-7777-7777-8777-777777777777",
+    threadCount: 418,
+    backupDir: "C:/Users/demo/.codex-session-sync/backups/remap",
+    localBackupDir: "C:/Users/demo/.codex/.codex-session-sync/backups/remap",
+    journalPath: "C:/Users/demo/.codex-session-sync/journal/checkout-remap.json",
+  },
+};
+
 const scanReport: ScanReport = {
   codexHome: "C:/Users/demo/.codex",
   databasePaths: ["C:/Users/demo/.codex/state_5.sqlite"],
@@ -116,6 +130,7 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
   let selectedProfileNamespaceId = namespaceId;
   let manualOverrideNamespaceId: string | null = null;
   let mappings = [...namespaceMappingState.mappings];
+  let workspaceMappings: WorkspaceMappingRule[] = [];
 
   function currentMappingState(): NamespaceMappingState {
     const mappedNamespaceId = mappings[0]?.namespaceId ?? null;
@@ -195,6 +210,31 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
       };
     }
     if (command === "get_namespace_mapping_state") return currentMappingState();
+    if (command === "get_workspace_mapping_state") return {
+      remoteId,
+      namespaceId: String((args as { namespaceId?: string } | undefined)?.namespaceId ?? namespaceId),
+      codexHomeKey: "c:/users/demo/.codex",
+      mappings: workspaceMappings,
+    };
+    if (command === "create_workspace_mapping") {
+      const request = (args as { request?: { namespaceId?: string; remotePrefix?: string; localPrefix?: string } } | undefined)?.request;
+      workspaceMappings = [...workspaceMappings, {
+        id: "019fa1a0-5555-7555-8555-555555555555",
+        remoteId,
+        namespaceId: String(request?.namespaceId ?? namespaceId),
+        codexHomeKey: "c:/users/demo/.codex",
+        remotePrefix: String(request?.remotePrefix ?? "D:/projects"),
+        localPrefix: String(request?.localPrefix ?? "F:/workspace"),
+        createdAt: "2026-07-28T00:00:00Z",
+        updatedAt: "2026-07-28T00:00:00Z",
+      }];
+      return { remoteId, namespaceId: request?.namespaceId ?? namespaceId, codexHomeKey: "c:/users/demo/.codex", mappings: workspaceMappings };
+    }
+    if (command === "delete_workspace_mapping") {
+      const mappingId = String((args as { mappingId?: string } | undefined)?.mappingId);
+      workspaceMappings = workspaceMappings.filter((mapping) => mapping.id !== mappingId);
+      return { remoteId, namespaceId, codexHomeKey: "c:/users/demo/.codex", mappings: workspaceMappings };
+    }
     if (command === "set_automatic_namespace_selection") {
       automaticEnabled = Boolean((args as { enabled?: boolean } | undefined)?.enabled);
       if (automaticEnabled) manualOverrideNamespaceId = null;
@@ -211,15 +251,15 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
       return currentMappingState();
     }
     if (command === "start_pull_job") return job("preview-pull", "pull", "running");
+    if (command === "start_workspace_remap_job") return job("preview-remap", "remap", "running");
     if (command === "start_scan_job") return job("preview-scan", "scan", "running");
     if (command === "get_job") {
       const jobId = String((args as { jobId?: string } | undefined)?.jobId);
-      return job(jobId, jobId === "preview-scan" ? "scan" : "pull", "completed");
+      return job(jobId, jobId === "preview-scan" ? "scan" : jobId === "preview-remap" ? "remap" : "pull", "completed");
     }
     if (command === "take_job_result") {
-      return (args as { jobId?: string } | undefined)?.jobId === "preview-scan"
-        ? scanReport
-        : conflictReport;
+      const jobId = (args as { jobId?: string } | undefined)?.jobId;
+      return jobId === "preview-scan" ? scanReport : jobId === "preview-remap" ? remapReport : conflictReport;
     }
     if (command === "select_remote_namespace") {
       const selected = String((args as { namespaceId?: string } | undefined)?.namespaceId);

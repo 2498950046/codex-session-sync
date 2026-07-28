@@ -6,6 +6,7 @@ pub mod operation;
 pub mod process;
 pub mod protocol;
 pub mod sync;
+pub mod workspace;
 
 pub use checkout::*;
 pub use codex::{
@@ -24,3 +25,4 @@ pub use operation::{OperationControl, OperationProgress};
 pub use process::{CodexProcess, CodexProcessKind, detect_codex_processes};
 pub use protocol::*;
 pub use sync::*;
+pub use workspace::*;

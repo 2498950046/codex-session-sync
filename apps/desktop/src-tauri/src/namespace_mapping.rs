@@ -639,10 +639,10 @@ fn validate_mapping_file(file: &NamespaceMappingFile) -> Result<()> {
         if let Some(fingerprint) = &mapping.api_key_fingerprint {
             validate_fingerprint(fingerprint)?;
         }
-        if let Some(provider) = &mapping.provider {
-            if normalize_provider(provider)? != *provider {
-                bail!("namespace mapping provider is not normalized");
-            }
+        if let Some(provider) = &mapping.provider
+            && normalize_provider(provider)? != *provider
+        {
+            bail!("namespace mapping provider is not normalized");
         }
         if let Some(path) = &mapping.codex_home_key {
             validate_path_matcher(path)?;

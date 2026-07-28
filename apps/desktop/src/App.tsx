@@ -19,6 +19,7 @@ import type {
   SyncReport,
   ThreadConflict,
   ThreadConflictVersion,
+  WorkspaceMappingState,
 } from "./types";
 
 function formatBytes(bytes: number): string {
@@ -74,7 +75,10 @@ function apiKeySourceLabel(source: NamespaceMappingState["context"]["apiKeySourc
 }
 
 export default function App() {
-  const isTauriRuntime = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+  const isDevelopmentPreview = import.meta.env.DEV
+    && ["conflict", "mapping"].includes(new URLSearchParams(window.location.search).get("preview") ?? "");
+  const isTauriRuntime = (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window)
+    || isDevelopmentPreview;
   const [codexHome, setCodexHome] = useState("");
   const [repositoryRoot, setRepositoryRoot] = useState("");
   const [manifestPath, setManifestPath] = useState("");
@@ -105,6 +109,9 @@ export default function App() {
   const [namespaceName, setNamespaceName] = useState("");
   const [namespaceStatus, setNamespaceStatus] = useState<RemoteNamespaceStatus | null>(null);
   const [mappingState, setMappingState] = useState<NamespaceMappingState | null>(null);
+  const [workspaceMappingState, setWorkspaceMappingState] = useState<WorkspaceMappingState | null>(null);
+  const [remoteWorkspacePrefix, setRemoteWorkspacePrefix] = useState("");
+  const [localWorkspacePrefix, setLocalWorkspacePrefix] = useState("");
   const [mappingLabel, setMappingLabel] = useState("");
   const [matchApiKey, setMatchApiKey] = useState(true);
   const [matchProvider, setMatchProvider] = useState(false);
@@ -270,6 +277,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedProfile) return;
     setMappingState(null);
+    setWorkspaceMappingState(null);
     setRemoteName(selectedProfile.displayName);
     setRemoteUrl(selectedProfile.serverUrl);
     setRemoteToken("");
@@ -283,6 +291,7 @@ export default function App() {
     setNamespaceName(namespace?.displayName ?? "");
     setMappingLabel((current) => current || `${namespace?.displayName ?? "命名空间"} 自动映射`);
     void refreshNamespaceStatus(selectedNamespaceId);
+    void refreshWorkspaceMappings(selectedNamespaceId);
   }, [selectedNamespaceId, codexHome]);
 
   useEffect(() => {
@@ -353,7 +362,7 @@ export default function App() {
       setJournalPath(imported.journalPath);
     }
     if (completed.kind === "recovery") setRecoveredJournal(result as OperationJournal);
-    if (["push", "pull", "resolve", "switch"].includes(completed.kind)) {
+    if (["push", "pull", "resolve", "switch", "remap"].includes(completed.kind)) {
       const synced = result as SyncReport;
       setSyncReport(synced);
       setSyncReportTargetKey(jobSyncTargets.current.get(completed.jobId) ?? syncTargetKey);
@@ -376,7 +385,7 @@ export default function App() {
     try {
       const targetKey = syncTargetKey;
       const started = await invoke<JobSnapshot>(command, payload);
-      if (["start_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job"].includes(command)) {
+      if (["start_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job", "start_workspace_remap_job"].includes(command)) {
         jobSyncTargets.current.set(started.jobId, targetKey);
       }
       setJob(started);
@@ -409,6 +418,76 @@ export default function App() {
       if (typeof selected === "string") setJournalPath(selected);
     } catch (reason) {
       setError(`无法打开 Journal 文件选择器：${String(reason)}`);
+    }
+  }
+
+  async function selectLocalWorkspacePrefix() {
+    if (!isTauriRuntime || busy) return;
+    setError(null);
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: true,
+        defaultPath: localWorkspacePrefix.trim() || undefined,
+      });
+      if (typeof selected === "string") setLocalWorkspacePrefix(selected);
+    } catch (reason) {
+      setError(`无法打开项目目录选择器：${String(reason)}`);
+    }
+  }
+
+  async function createWorkspaceMapping() {
+    if (!selectedRemoteId || !selectedNamespaceId) return;
+    setError(null);
+    try {
+      const state = await invoke<WorkspaceMappingState>("create_workspace_mapping", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        request: {
+          remoteId: selectedRemoteId,
+          namespaceId: selectedNamespaceId,
+          remotePrefix: remoteWorkspacePrefix.trim(),
+          localPrefix: localWorkspacePrefix.trim(),
+        },
+      });
+      setWorkspaceMappingState(state);
+      setRemoteWorkspacePrefix("");
+      setLocalWorkspacePrefix("");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function deleteWorkspaceMapping(mappingId: string) {
+    if (!selectedRemoteId || !selectedNamespaceId) return;
+    setError(null);
+    try {
+      setWorkspaceMappingState(await invoke<WorkspaceMappingState>("delete_workspace_mapping", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+        mappingId,
+      }));
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function refreshWorkspaceMappings(namespaceId = selectedNamespaceId) {
+    if (!selectedRemoteId || !namespaceId || !codexHome.trim() || !isTauriRuntime) {
+      setWorkspaceMappingState(null);
+      return;
+    }
+    try {
+      setWorkspaceMappingState(await invoke<WorkspaceMappingState>("get_workspace_mapping_state", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId,
+      }));
+    } catch (reason) {
+      setError(String(reason));
     }
   }
 
@@ -678,7 +757,7 @@ export default function App() {
         <div className="section-heading"><div><h2>远端服务器</h2><p>Token 仅保存到操作系统凭据库，前端不会读回明文。</p></div><span>{remoteLoading ? "连接中…" : `${profiles.length} 个配置`}</span></div>
         <div className="profile-tabs">
           {profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : "secondary-button"} onClick={() => setSelectedRemoteId(profile.id)} disabled={busy}>{profile.displayName}</button>)}
-          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); setMappingState(null); }} disabled={busy}>＋ 新建远端</button>
+          <button className="secondary-button" onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); setMappingState(null); setWorkspaceMappingState(null); }} disabled={busy}>＋ 新建远端</button>
         </div>
         <div className="remote-form">
           <div className="field"><label htmlFor="remote-name">配置名称</label><input id="remote-name" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div>
@@ -727,6 +806,17 @@ export default function App() {
             const target = namespaces.find((namespace) => namespace.id === mapping.namespaceId);
             return <article className="mapping-card" key={mapping.id}><div><strong>{mapping.label}</strong><span>→ {target?.displayName ?? mapping.namespaceId}</span></div><div className="mapping-tags">{mapping.matchesApiKey && <code>KEY {mapping.apiKeyFingerprintHint}</code>}{mapping.provider && <code>PROVIDER {mapping.provider}</code>}{mapping.codexHomeKey && <code>HOME {mapping.codexHomeKey}</code>}</div><button className="danger-button" onClick={() => void deleteMapping(mapping.id)} disabled={busy}>删除</button></article>;
           })}{mappingState.mappings.length === 0 && <p className="muted-copy">还没有本机映射规则。至少选择一个匹配条件后创建。</p>}</div>
+        </div>}
+
+        {selectedNamespace && workspaceMappingState && <div className="workspace-mapping-console">
+          <div className="mapping-heading"><div><h3>项目路径映射</h3><p>把远端会话记录的绝对路径映射到当前电脑；规则只保存在本机，Push 前会自动反向规范化。</p></div><span>{workspaceMappingState.mappings.length} 条规则</span></div>
+          <div className="workspace-mapping-builder">
+            <div className="field"><label htmlFor="remote-workspace-prefix">源电脑项目根路径</label><input id="remote-workspace-prefix" value={remoteWorkspacePrefix} onChange={(event) => setRemoteWorkspacePrefix(event.target.value)} placeholder="例如 D:\projects" /></div>
+            <div className="field"><label htmlFor="local-workspace-prefix">当前电脑项目根路径</label><div className="path-picker-row"><input id="local-workspace-prefix" value={localWorkspacePrefix} onChange={(event) => setLocalWorkspacePrefix(event.target.value)} placeholder="例如 F:\workspace" /><button type="button" className="path-picker-button" onClick={() => void selectLocalWorkspacePrefix()} disabled={busy || !isTauriRuntime}>选择目录</button></div></div>
+            <button onClick={() => void createWorkspaceMapping()} disabled={busy || !remoteWorkspacePrefix.trim() || !localWorkspacePrefix.trim()}>添加路径映射</button>
+          </div>
+          <div className="workspace-mapping-list">{workspaceMappingState.mappings.map((mapping) => <article key={mapping.id}><div><code>{mapping.remotePrefix}</code><span>→</span><code>{mapping.localPrefix}</code></div><button className="danger-button" onClick={() => void deleteWorkspaceMapping(mapping.id)} disabled={busy}>删除</button></article>)}{workspaceMappingState.mappings.length === 0 && <p className="muted-copy">尚未配置。跨电脑路径不一致时，会话无法恢复原项目分组。</p>}</div>
+          {workspaceMappingState.mappings.length > 0 && <div className="workspace-remap-row"><p>保存规则不会立即改动会话。应用时会重新校验远端 Head、创建备份并安全 checkout。</p><button className="secondary-button" onClick={() => void start("start_workspace_remap_job", syncPayload)} disabled={busy || !canWrite || !namespaceStatus?.active}>应用映射到本机会话</button></div>}
         </div>}
 
         {selectedNamespace && namespaceStatus && <div className="sync-console">

@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, FileTimes, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -498,7 +498,48 @@ fn stage_rollouts(
         if fs::metadata(&target)?.len() != thread.rollout.byte_length {
             bail!("staged rollout has an unexpected byte length");
         }
+        restore_rollout_modified_time(&target, thread_modified_at_ms(thread))?;
     }
+    Ok(())
+}
+
+fn thread_modified_at_ms(thread: &ThreadBundle) -> Option<i64> {
+    thread.updated_at_ms.or(thread.created_at_ms).or_else(|| {
+        let row = thread
+            .related_records
+            .tables
+            .get("threads")?
+            .first()?
+            .as_object()?;
+        row.get("updated_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| {
+                row.get("updated_at")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+            .or_else(|| row.get("created_at_ms").and_then(serde_json::Value::as_i64))
+            .or_else(|| {
+                row.get("created_at")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+    })
+}
+
+fn restore_rollout_modified_time(path: &Path, timestamp_ms: Option<i64>) -> Result<()> {
+    let Some(timestamp_ms) = timestamp_ms.filter(|timestamp| *timestamp >= 0) else {
+        return Ok(());
+    };
+    let timestamp = std::time::UNIX_EPOCH
+        .checked_add(Duration::from_millis(timestamp_ms as u64))
+        .context("rollout timestamp is outside the supported filesystem range")?;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open staged rollout {}", path.display()))?;
+    file.set_times(FileTimes::new().set_modified(timestamp))
+        .with_context(|| format!("failed to restore rollout timestamp {}", path.display()))?;
     Ok(())
 }
 
@@ -923,6 +964,25 @@ mod tests {
         ContentObject, LOCAL_SNAPSHOT_SCHEMA_VERSION, RelatedRecords, THREAD_BUNDLE_SCHEMA_VERSION,
         WorkspaceRef,
     };
+
+    #[test]
+    fn staged_rollout_modified_time_can_be_restored_from_thread_timestamp() {
+        let directory = tempdir().unwrap();
+        let rollout = directory.path().join("rollout-thread.jsonl");
+        fs::write(&rollout, b"rollout").unwrap();
+        let timestamp_ms = 1_700_000_100_123_i64;
+
+        restore_rollout_modified_time(&rollout, Some(timestamp_ms)).unwrap();
+
+        let actual = fs::metadata(&rollout)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!((actual - timestamp_ms).abs() <= 2_000);
+    }
 
     #[test]
     fn exact_checkout_replaces_sessions_and_keeps_recoverable_backup() {

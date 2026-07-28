@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 use sync_core::{
     CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, LocalSnapshot, OperationControl,
     OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome,
-    TrackingRecord, TrackingStore, checkout_local_snapshot_with_tracking_control,
-    collect_object_descriptors, create_local_snapshot_with_control, install_repository_object,
-    load_local_snapshot, merge_thread_sets, remote_thread_view, repository_object_path,
-    resolve_thread_sets, revision_to_snapshot, semantic_thread_hash, snapshot_to_revision,
-    store_local_snapshot, validate_repository_object,
+    TrackingRecord, TrackingStore, WorkspacePathMapper,
+    checkout_local_snapshot_with_tracking_control, collect_object_descriptors,
+    create_local_snapshot_with_control, install_repository_object, load_local_snapshot,
+    merge_thread_sets, remote_thread_view, repository_object_path, resolve_thread_sets,
+    revision_to_snapshot, semantic_thread_hash, snapshot_to_revision, store_local_snapshot,
+    validate_repository_object,
 };
 use uuid::Uuid;
 
@@ -29,8 +30,111 @@ pub enum SyncOutcomeKind {
     Pulled,
     Merged,
     Switched,
+    Remapped,
     NoChanges,
     Conflict,
+}
+
+#[derive(Clone, Copy)]
+pub struct LocalSyncContext<'a> {
+    codex_home: &'a Path,
+    repository_root: &'a Path,
+    workspace_mapper: &'a WorkspacePathMapper,
+    control: &'a OperationControl,
+}
+
+impl<'a> LocalSyncContext<'a> {
+    pub fn new(
+        codex_home: &'a Path,
+        repository_root: &'a Path,
+        workspace_mapper: &'a WorkspacePathMapper,
+        control: &'a OperationControl,
+    ) -> Self {
+        Self {
+            codex_home,
+            repository_root,
+            workspace_mapper,
+            control,
+        }
+    }
+}
+
+pub fn reapply_workspace_mappings(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    client.info()?;
+    let tracking = TrackingStore::open(repository_root)?;
+    let active = tracking
+        .active(codex_home)?
+        .context("no namespace is active for this Codex home")?;
+    if active.remote_id != remote_id || active.namespace_id != namespace_id {
+        bail!("the selected namespace is not active; switch namespaces before applying mappings");
+    }
+    let record = tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .context("active namespace has no tracking record")?;
+    let remote_head = client
+        .namespace_head(namespace_id)?
+        .context("remote namespace has no revision to remap")?;
+    if record.integrated_head.as_deref() != Some(remote_head.as_str()) {
+        bail!("remote namespace has advanced; pull before applying workspace mappings");
+    }
+    let revision = client.revision(&remote_head)?;
+    validate_revision_namespace(&revision, namespace_id)?;
+    if revision.payload.warning_count > 0 {
+        bail!("remote revision is incomplete and cannot be checked out safely");
+    }
+    let local_summary =
+        create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
+    if local_summary.warning_count > 0 {
+        bail!("workspace remap is blocked because the local scan contains warnings");
+    }
+    let local = load_local_snapshot(local_summary.manifest_path)?;
+    if !thread_states_equal_ignoring_workspace_paths(&local.threads, &revision.payload.threads)? {
+        bail!("the active namespace has unpushed local changes; push before applying mappings");
+    }
+    let downloaded =
+        download_revision_objects(client, &revision.payload.threads, repository_root, control)?;
+    let snapshot = workspace_mapper.materialize_snapshot(&revision_to_snapshot(&revision)?);
+    let thread_count = snapshot.threads.len();
+    let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    ensure_codex_closed()?;
+    let checkout = checkout_local_snapshot_with_tracking_control(
+        manifest,
+        codex_home,
+        repository_root,
+        true,
+        CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: Some(record.generation),
+            integrated_head: Some(remote_head.clone()),
+            activate_namespace: true,
+        },
+        control,
+    )?;
+    Ok(SyncReport {
+        kind: SyncOutcomeKind::Remapped,
+        namespace_id,
+        previous_head: Some(remote_head.clone()),
+        head: Some(remote_head.clone()),
+        revision_id: Some(remote_head),
+        uploaded_objects: 0,
+        downloaded_objects: downloaded,
+        thread_count,
+        conflicts: Vec::new(),
+        checkout: Some(checkout),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,10 +156,14 @@ pub fn push_namespace(
     remote_id: Uuid,
     namespace_id: Uuid,
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
     ensure_codex_closed()?;
     client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
@@ -77,7 +185,8 @@ pub fn push_namespace(
             summary.warning_count
         );
     }
-    let snapshot = load_local_snapshot(&summary.manifest_path)?;
+    let snapshot =
+        workspace_mapper.canonicalize_snapshot(&load_local_snapshot(&summary.manifest_path)?);
     let revision = snapshot_to_revision(&snapshot, namespace_id, remote_head.clone())?;
     if let Some(head) = remote_head.as_deref() {
         let current = client.revision(head)?;
@@ -211,18 +320,9 @@ pub fn pull_namespace(
     remote_id: Uuid,
     namespace_id: Uuid,
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
-    let prepared = match prepare_pull(
-        remote_id,
-        namespace_id,
-        client,
-        codex_home,
-        repository_root,
-        control,
-    )? {
+    let prepared = match prepare_pull(remote_id, namespace_id, client, context)? {
         PreparedPull::NoChanges { head } => {
             return Ok(SyncReport {
                 kind: SyncOutcomeKind::NoChanges,
@@ -255,8 +355,6 @@ pub fn pull_namespace(
     }
     let thread_count = prepared.merged.threads.len();
     let checkout = apply_prepared_pull(
-        codex_home,
-        repository_root,
         CheckoutTrackingUpdate {
             remote_id,
             namespace_id,
@@ -265,7 +363,7 @@ pub fn pull_namespace(
             activate_namespace: true,
         },
         prepared.merged.threads,
-        control,
+        context,
     )?;
     Ok(SyncReport {
         kind: SyncOutcomeKind::Pulled,
@@ -286,18 +384,15 @@ pub fn resolve_pull_conflicts(
     namespace_id: Uuid,
     resolutions: &[ThreadConflictResolution],
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
-    let prepared = match prepare_pull(
-        remote_id,
-        namespace_id,
-        client,
+    let LocalSyncContext {
         codex_home,
         repository_root,
+        workspace_mapper,
         control,
-    )? {
+    } = context;
+    let prepared = match prepare_pull(remote_id, namespace_id, client, context)? {
         PreparedPull::NoChanges { .. } => {
             bail!("there are no remote changes to resolve; pull again")
         }
@@ -324,8 +419,6 @@ pub fn resolve_pull_conflicts(
     let previous_head = prepared.previous_head.clone();
     let downloaded = prepared.downloaded;
     let checkout = apply_prepared_pull(
-        codex_home,
-        repository_root,
         CheckoutTrackingUpdate {
             remote_id,
             namespace_id,
@@ -334,7 +427,7 @@ pub fn resolve_pull_conflicts(
             activate_namespace: true,
         },
         resolved_threads,
-        control,
+        context,
     )?;
 
     // Applying first preserves the user's explicit merge locally if the remote Head changes
@@ -353,9 +446,12 @@ pub fn resolve_pull_conflicts(
         remote_id,
         namespace_id,
         client,
-        codex_home,
-        repository_root,
-        &publish_control,
+        LocalSyncContext::new(
+            codex_home,
+            repository_root,
+            workspace_mapper,
+            &publish_control,
+        ),
     )
     .context("conflicts were safely applied locally, but publishing failed; use Push to retry")?;
     Ok(SyncReport {
@@ -392,10 +488,14 @@ fn prepare_pull(
     remote_id: Uuid,
     namespace_id: Uuid,
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<PreparedPull> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
     ensure_codex_closed()?;
     client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
@@ -435,7 +535,8 @@ fn prepare_pull(
     if local_summary.warning_count > 0 {
         bail!("pull is blocked because the local scan contains warnings");
     }
-    let local = load_local_snapshot(local_summary.manifest_path)?;
+    let local =
+        workspace_mapper.canonicalize_snapshot(&load_local_snapshot(local_summary.manifest_path)?);
     let base = match previous_head.as_deref() {
         Some(head) => {
             let revision = client.revision(head)?;
@@ -459,19 +560,23 @@ fn prepare_pull(
 }
 
 fn apply_prepared_pull(
-    codex_home: &Path,
-    repository_root: &Path,
     tracking_update: CheckoutTrackingUpdate,
     threads: Vec<ThreadBundle>,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<CheckoutReport> {
-    let snapshot = LocalSnapshot {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    let snapshot = workspace_mapper.materialize_snapshot(&LocalSnapshot {
         schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
         snapshot_id: Uuid::now_v7().to_string(),
         created_at: Utc::now().to_rfc3339(),
         threads,
         warning_count: 0,
-    };
+    });
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     ensure_codex_closed()?;
     checkout_local_snapshot_with_tracking_control(
@@ -489,23 +594,21 @@ pub fn switch_namespace(
     namespace_id: Uuid,
     target_client: &RemoteClient,
     current_client: Option<&RemoteClient>,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    current_workspace_mapper: Option<&WorkspacePathMapper>,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper: target_workspace_mapper,
+        control,
+    } = context;
     ensure_codex_closed()?;
     target_client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
     if let Some(active) = tracking.active(codex_home)? {
         if active.remote_id == remote_id && active.namespace_id == namespace_id {
-            return pull_namespace(
-                remote_id,
-                namespace_id,
-                target_client,
-                codex_home,
-                repository_root,
-                control,
-            );
+            return pull_namespace(remote_id, namespace_id, target_client, context);
         }
         let current_client = current_client.context(
             "the active namespace uses a different remote, but its client is unavailable",
@@ -516,6 +619,7 @@ pub fn switch_namespace(
             current_client,
             codex_home,
             repository_root,
+            current_workspace_mapper.unwrap_or(target_workspace_mapper),
             control,
         )?;
     }
@@ -548,6 +652,7 @@ pub fn switch_namespace(
             0,
         ),
     };
+    let snapshot = target_workspace_mapper.materialize_snapshot(&snapshot);
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     ensure_codex_closed()?;
     let checkout = checkout_local_snapshot_with_tracking_control(
@@ -584,6 +689,7 @@ fn ensure_active_namespace_clean(
     client: &RemoteClient,
     codex_home: &Path,
     repository_root: &Path,
+    workspace_mapper: &WorkspacePathMapper,
     control: &OperationControl,
 ) -> Result<()> {
     client.info()?;
@@ -595,7 +701,8 @@ fn ensure_active_namespace_clean(
     if local_summary.warning_count > 0 {
         bail!("namespace switch is blocked because the local scan contains warnings");
     }
-    let local = load_local_snapshot(local_summary.manifest_path)?;
+    let local =
+        workspace_mapper.canonicalize_snapshot(&load_local_snapshot(local_summary.manifest_path)?);
     let base = match record.integrated_head.as_deref() {
         Some(head) => {
             let revision = client.revision(head)?;
@@ -677,6 +784,34 @@ fn thread_states_equal(left: &[ThreadBundle], right: &[ThreadBundle]) -> Result<
     Ok(thread_state(left)? == thread_state(right)?)
 }
 
+fn thread_states_equal_ignoring_workspace_paths(
+    left: &[ThreadBundle],
+    right: &[ThreadBundle],
+) -> Result<bool> {
+    Ok(workspace_independent_thread_state(left)? == workspace_independent_thread_state(right)?)
+}
+
+fn workspace_independent_thread_state(
+    threads: &[ThreadBundle],
+) -> Result<BTreeMap<String, String>> {
+    let threads = threads
+        .iter()
+        .map(|thread| {
+            let mut thread = remote_thread_view(thread);
+            thread.workspace.source_path = None;
+            if let Some(rows) = thread.related_records.tables.get_mut("threads") {
+                for row in rows {
+                    if let Some(row) = row.as_object_mut() {
+                        row.remove("cwd");
+                    }
+                }
+            }
+            thread
+        })
+        .collect::<Vec<_>>();
+    thread_state(&threads)
+}
+
 fn thread_state(threads: &[ThreadBundle]) -> Result<BTreeMap<String, String>> {
     let mut state = BTreeMap::new();
     for thread in threads {
@@ -737,6 +872,25 @@ mod tests {
     }
 
     #[test]
+    fn workspace_remap_safety_ignores_only_workspace_paths() {
+        let mut left = test_thread("one");
+        let mut right = left.clone();
+        left.workspace.source_path = Some("D:/projects/demo".to_string());
+        right.workspace.source_path = Some("F:/workspace/demo".to_string());
+        left.related_records.tables.get_mut("threads").unwrap()[0]["cwd"] =
+            json!("D:/projects/demo");
+        right.related_records.tables.get_mut("threads").unwrap()[0]["cwd"] =
+            json!("F:/workspace/demo");
+        assert!(
+            thread_states_equal_ignoring_workspace_paths(&[left.clone()], &[right.clone()])
+                .unwrap()
+        );
+
+        right.title = "changed".to_string();
+        assert!(!thread_states_equal_ignoring_workspace_paths(&[left], &[right]).unwrap());
+    }
+
+    #[test]
     fn retry_push_reconciles_missing_or_stale_tracking_when_remote_content_matches() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -770,6 +924,7 @@ mod tests {
         let home_b = temp.path().join("home-b");
         let repository_a = temp.path().join("repository-a");
         let repository_b = temp.path().join("repository-b");
+        let workspace_mapper = WorkspacePathMapper::default();
         initialize_home(&home_a);
         initialize_home(&home_b);
         insert_fixture_thread(&home_a, "shared-thread");
@@ -779,9 +934,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pushed_a.kind, SyncOutcomeKind::Pushed);
@@ -800,9 +958,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(retried_b.kind, SyncOutcomeKind::NoChanges);
@@ -825,9 +986,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(repeated_b.kind, SyncOutcomeKind::NoChanges);
@@ -867,9 +1031,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(retried_stale.kind, SyncOutcomeKind::NoChanges);
@@ -929,6 +1096,12 @@ mod tests {
         let home_b = temp.path().join("home-b");
         let repository_a = temp.path().join("repository-a");
         let repository_b = temp.path().join("repository-b");
+        let workspace_mapper_a = WorkspacePathMapper::default();
+        let workspace_mapper_b = WorkspacePathMapper::new(vec![sync_core::WorkspacePathMapping {
+            remote_prefix: "C:/work".to_string(),
+            local_prefix: "F:/workspace".to_string(),
+        }])
+        .unwrap();
         initialize_home(&home_a);
         initialize_home(&home_b);
         insert_fixture_thread(&home_a, "thread-a");
@@ -937,9 +1110,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pushed_a.kind, SyncOutcomeKind::Pushed);
@@ -949,9 +1125,13 @@ mod tests {
             namespace.id,
             &client,
             None,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            None,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(switched_b.kind, SyncOutcomeKind::Switched);
@@ -959,15 +1139,46 @@ mod tests {
             sync_core::scan_codex_home(&home_b).unwrap().threads.len(),
             1
         );
+        assert_eq!(
+            sync_core::scan_codex_home(&home_b).unwrap().threads[0]
+                .workspace
+                .source_path
+                .as_deref(),
+            Some("C:/work")
+        );
 
-        insert_fixture_thread(&home_b, "thread-b");
+        let remapped_b = reapply_workspace_mappings(
+            remote_id,
+            namespace.id,
+            &client,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_b,
+                &OperationControl::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(remapped_b.kind, SyncOutcomeKind::Remapped);
+        assert_eq!(
+            sync_core::scan_codex_home(&home_b).unwrap().threads[0]
+                .workspace
+                .source_path
+                .as_deref(),
+            Some("F:/workspace")
+        );
+
+        insert_fixture_thread_at(&home_b, "thread-b", "F:/workspace");
         let pushed_b = push_namespace(
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_b,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pushed_b.kind, SyncOutcomeKind::Pushed);
@@ -976,9 +1187,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pulled_a.kind, SyncOutcomeKind::Pulled);
@@ -1033,6 +1247,7 @@ mod tests {
         let home_b = temp.path().join("home-b");
         let repository_a = temp.path().join("repository-a");
         let repository_b = temp.path().join("repository-b");
+        let workspace_mapper = WorkspacePathMapper::default();
         initialize_home(&home_a);
         initialize_home(&home_b);
         insert_fixture_thread(&home_a, "shared-thread");
@@ -1041,9 +1256,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         switch_namespace(
@@ -1051,9 +1269,13 @@ mod tests {
             namespace.id,
             &client,
             None,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            None,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
 
@@ -1062,9 +1284,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         modify_fixture_thread(&home_b, "shared-thread", "来自 B", "event-b");
@@ -1073,9 +1298,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(conflicted.kind, SyncOutcomeKind::Conflict);
@@ -1094,9 +1322,12 @@ mod tests {
             namespace.id,
             &resolutions,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(resolved.kind, SyncOutcomeKind::Merged);
@@ -1111,9 +1342,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pulled_a.kind, SyncOutcomeKind::Pulled);
@@ -1152,6 +1386,10 @@ mod tests {
     }
 
     fn insert_fixture_thread(home: &Path, thread_id: &str) {
+        insert_fixture_thread_at(home, thread_id, "C:/work");
+    }
+
+    fn insert_fixture_thread_at(home: &Path, thread_id: &str, cwd: &str) {
         let rollout = home
             .join("sessions/2026/07/26")
             .join(format!("rollout-{thread_id}.jsonl"));
@@ -1161,7 +1399,7 @@ mod tests {
             "{}",
             json!({
                 "type": "session_meta",
-                "payload": {"id": thread_id, "cwd": "C:/work", "model_provider": "openai"}
+                "payload": {"id": thread_id, "cwd": cwd, "model_provider": "openai"}
             })
         )
         .unwrap();
@@ -1172,8 +1410,8 @@ mod tests {
                 "INSERT INTO threads (
                     id, rollout_path, created_at, updated_at, source, model_provider,
                     cwd, title, sandbox_policy, approval_mode, archived
-                 ) VALUES (?1, ?2, 1, 1, 'cli', 'openai', 'C:/work', ?1, '{}', 'never', 0)",
-                params![thread_id, rollout.to_string_lossy().as_ref()],
+                 ) VALUES (?1, ?2, 1, 1, 'cli', 'openai', ?3, ?1, '{}', 'never', 0)",
+                params![thread_id, rollout.to_string_lossy().as_ref(), cwd],
             )
             .unwrap();
     }

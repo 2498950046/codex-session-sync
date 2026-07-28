@@ -3,6 +3,7 @@ mod namespace_mapping;
 mod remote;
 mod remote_config;
 mod remote_sync;
+mod workspace_mapping;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -17,7 +18,10 @@ use remote::{RemoteClient, SecretToken};
 use remote_config::{
     CredentialStore, RemoteProfile, RemoteProfileStore, RemoteProfileSummary, SystemCredentialStore,
 };
-use remote_sync::{pull_namespace, push_namespace, resolve_pull_conflicts, switch_namespace};
+use remote_sync::{
+    LocalSyncContext, pull_namespace, push_namespace, reapply_workspace_mappings,
+    resolve_pull_conflicts, switch_namespace,
+};
 use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
@@ -32,6 +36,7 @@ use sync_core::{
 };
 use tauri::State;
 use uuid::Uuid;
+use workspace_mapping::{WorkspaceMappingState, WorkspaceMappingStore};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +68,15 @@ struct CreateNamespaceMappingRequest {
     match_api_key: bool,
     match_provider: bool,
     match_codex_home: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateWorkspaceMappingRequest {
+    remote_id: String,
+    namespace_id: String,
+    remote_prefix: String,
+    local_prefix: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,6 +594,72 @@ async fn clear_manual_namespace_override(
 }
 
 #[tauri::command]
+async fn get_workspace_mapping_state(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+) -> Result<WorkspaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        WorkspaceMappingStore::new(repository).state(
+            &codex_home,
+            parse_uuid(&remote_id)?,
+            parse_uuid(&namespace_id)?,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_workspace_mapping(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    request: CreateWorkspaceMappingRequest,
+) -> Result<WorkspaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        WorkspaceMappingStore::new(repository).create(
+            &codex_home,
+            parse_uuid(&request.remote_id)?,
+            parse_uuid(&request.namespace_id)?,
+            request.remote_prefix,
+            request.local_prefix,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_workspace_mapping(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    mapping_id: String,
+) -> Result<WorkspaceMappingState, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        WorkspaceMappingStore::new(repository).delete(
+            &codex_home,
+            parse_uuid(&remote_id)?,
+            parse_uuid(&namespace_id)?,
+            parse_uuid(&mapping_id)?,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_remote_namespace_status(
     repository_root: Option<String>,
     codex_home: Option<String>,
@@ -634,15 +714,16 @@ fn start_push_job(
     let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
     let (_, client) =
         load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
     jobs.start_exclusive(&lock_home, "push", true, move |control| {
         push_namespace(
             remote_id,
             namespace_id,
             &client,
-            &codex_home,
-            &repository,
-            &control,
+            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
         )
     })
 }
@@ -664,15 +745,16 @@ fn start_pull_job(
     let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
     let (_, client) =
         load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
     jobs.start_exclusive(&lock_home, "pull", true, move |control| {
         pull_namespace(
             remote_id,
             namespace_id,
             &client,
-            &codex_home,
-            &repository,
-            &control,
+            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
         )
     })
 }
@@ -695,6 +777,9 @@ fn start_conflict_resolution_job(
     let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
     let (_, client) =
         load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
     jobs.start_exclusive(&lock_home, "resolve", true, move |control| {
         resolve_pull_conflicts(
@@ -702,9 +787,7 @@ fn start_conflict_resolution_job(
             namespace_id,
             &resolutions,
             &client,
-            &codex_home,
-            &repository,
-            &control,
+            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
         )
     })
 }
@@ -733,10 +816,26 @@ fn start_namespace_switch_job(
     let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
     let (_, target_client) =
         load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
-    let current_client = TrackingStore::open(&repository)
+    let target_workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let active = TrackingStore::open(&repository)
         .and_then(|tracking| tracking.active(&codex_home))
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let current_client = active
+        .as_ref()
         .map(|active| load_remote_client(&repository, active.remote_id).map(|(_, client)| client))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let current_workspace_mapper = active
+        .as_ref()
+        .map(|active| {
+            WorkspaceMappingStore::new(&repository).mapper(
+                &codex_home,
+                active.remote_id,
+                active.namespace_id,
+            )
+        })
         .transpose()
         .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
@@ -746,9 +845,42 @@ fn start_namespace_switch_job(
             namespace_id,
             &target_client,
             current_client.as_ref(),
-            &codex_home,
-            &repository,
-            &control,
+            current_workspace_mapper.as_ref(),
+            LocalSyncContext::new(&codex_home, &repository, &target_workspace_mapper, &control),
+        )
+    })
+}
+
+#[tauri::command]
+fn start_workspace_remap_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    if workspace_mapper.is_empty() {
+        return Err("at least one workspace path mapping is required".to_string());
+    }
+    let lock_home = codex_home.clone();
+    jobs.start_exclusive(&lock_home, "remap", true, move |control| {
+        reapply_workspace_mappings(
+            remote_id,
+            namespace_id,
+            &client,
+            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
         )
     })
 }
@@ -955,11 +1087,15 @@ pub fn run() {
             delete_namespace_mapping,
             set_automatic_namespace_selection,
             clear_manual_namespace_override,
+            get_workspace_mapping_state,
+            create_workspace_mapping,
+            delete_workspace_mapping,
             get_remote_namespace_status,
             start_push_job,
             start_pull_job,
             start_conflict_resolution_job,
-            start_namespace_switch_job
+            start_namespace_switch_job,
+            start_workspace_remap_job
         ])
         .run(tauri::generate_context!())
         .expect("error while running Codex Session Sync");

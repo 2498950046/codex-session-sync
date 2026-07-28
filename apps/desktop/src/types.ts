@@ -87,7 +87,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "resolve" | "switch";
+  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "resolve" | "switch" | "remap";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
@@ -180,6 +180,24 @@ export type NamespaceMappingState = {
   };
 };
 
+export type WorkspaceMappingRule = {
+  id: string;
+  remoteId: string;
+  namespaceId: string;
+  codexHomeKey: string;
+  remotePrefix: string;
+  localPrefix: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WorkspaceMappingState = {
+  remoteId: string;
+  namespaceId: string;
+  codexHomeKey: string;
+  mappings: WorkspaceMappingRule[];
+};
+
 export type ThreadConflictVersion = {
   title: string;
   archived: boolean;
@@ -215,7 +233,7 @@ export type CheckoutReport = {
 };
 
 export type SyncReport = {
-  kind: "pushed" | "pulled" | "merged" | "switched" | "no_changes" | "conflict";
+  kind: "pushed" | "pulled" | "merged" | "switched" | "remapped" | "no_changes" | "conflict";
   namespaceId: string;
   previousHead: string | null;
   head: string | null;

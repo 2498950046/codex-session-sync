@@ -145,6 +145,19 @@ button { cursor: pointer; }
 .mapping-tags { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
 .mapping-tags code { max-width: 100%; padding: 4px 6px; overflow: hidden; border-radius: 6px; color: #7dd7b8; background: #10251f; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .mapping-card .danger-button { border: 1px solid #6a343d; border-radius: 8px; padding: 8px 10px; color: #ffc7cc; background: #3a1c22; }
+.workspace-mapping-console { display: grid; gap: 14px; margin-top: 18px; padding-top: 18px; border-top: 1px solid #273341; }
+.workspace-mapping-builder { display: grid; grid-template-columns: minmax(220px, 1fr) minmax(280px, 1.2fr) auto; gap: 12px; align-items: end; }
+.workspace-mapping-builder > button { min-height: 43px; border: 0; border-radius: 10px; padding: 10px 14px; color: #06110e; background: #75e5be; font-weight: 800; }
+.workspace-mapping-builder > button:disabled { cursor: not-allowed; opacity: .45; }
+.workspace-mapping-list { display: grid; gap: 8px; }
+.workspace-mapping-list article { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid #293848; border-radius: 11px; background: #0b1017; }
+.workspace-mapping-list article > div { min-width: 0; display: flex; align-items: center; gap: 8px; }
+.workspace-mapping-list code { overflow: hidden; color: #8edbc1; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-mapping-list span { color: #708195; }
+.workspace-mapping-list .danger-button { border: 1px solid #6a343d; border-radius: 8px; padding: 8px 10px; color: #ffc7cc; background: #3a1c22; }
+.workspace-remap-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px; border: 1px solid #66562f; border-radius: 11px; background: #261f10; }
+.workspace-remap-row p { margin: 0; color: #c2aa75; font-size: 12px; }
+.workspace-remap-row button { flex: 0 0 auto; }
 .sync-console { margin-top: 18px; padding-top: 18px; border-top: 1px solid #273341; }
 .sync-status-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .sync-status-grid article { display: grid; gap: 7px; padding: 12px; border-radius: 10px; background: #0b1017; min-width: 0; }
@@ -201,10 +214,11 @@ button { cursor: pointer; }
   .result-grid { grid-template-columns: 1fr; }
   .recovery-row { grid-template-columns: 1fr; }
   .path-picker-row { grid-template-columns: 1fr; }
-  .remote-form, .namespace-editor, .sync-status-grid, .identity-grid, .mapping-builder { grid-template-columns: 1fr; }
+  .remote-form, .namespace-editor, .sync-status-grid, .identity-grid, .mapping-builder, .workspace-mapping-builder { grid-template-columns: 1fr; }
   .mapping-card { grid-template-columns: 1fr auto; }
   .mapping-card .mapping-tags { grid-column: 1 / -1; grid-row: 2; }
   .mapping-heading, .mapping-resolution { align-items: stretch; flex-direction: column; }
+  .workspace-mapping-list article, .workspace-mapping-list article > div, .workspace-remap-row { align-items: stretch; flex-direction: column; }
   .conflict-version-grid { grid-template-columns: 1fr; }
   .conflict-summary, .conflict-submit-row, .conflict-item header { align-items: stretch; flex-direction: column; }
   .conflict-submit-row button { width: 100%; }
