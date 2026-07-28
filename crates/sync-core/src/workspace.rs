@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::ops::Range;
@@ -75,6 +76,35 @@ impl WorkspacePathMapper {
         control: &OperationControl,
     ) -> Result<LocalSnapshot> {
         self.transform_snapshot_objects(snapshot, repository_root, control, false)
+    }
+
+    pub fn materialize_snapshot_objects_with_reference(
+        &self,
+        snapshot: &LocalSnapshot,
+        canonical_reference: &[ThreadBundle],
+        repository_root: &Path,
+        control: &OperationControl,
+    ) -> Result<LocalSnapshot> {
+        let mut reference_paths = BTreeMap::new();
+        for thread in canonical_reference {
+            let Some(path) = thread_workspace_path(thread) else {
+                continue;
+            };
+            if reference_paths
+                .insert(thread.thread_id.as_str(), path)
+                .is_some()
+            {
+                bail!("duplicate reference thread ID {}", thread.thread_id);
+            }
+        }
+
+        let mut canonical = snapshot.clone();
+        for thread in &mut canonical.threads {
+            if let Some(path) = reference_paths.get(thread.thread_id.as_str()) {
+                set_thread_workspace_path(thread, path);
+            }
+        }
+        self.materialize_snapshot_objects(&canonical, repository_root, control)
     }
 
     pub fn materialize_thread(&self, thread: &mut ThreadBundle) {
@@ -175,6 +205,20 @@ fn thread_workspace_path(thread: &ThreadBundle) -> Option<&str> {
             .get("cwd")?
             .as_str()
     })
+}
+
+fn set_thread_workspace_path(thread: &mut ThreadBundle, path: &str) {
+    thread.workspace.source_path = Some(path.to_string());
+    if let Some(rows) = thread.related_records.tables.get_mut("threads") {
+        for row in rows {
+            let Some(row) = row.as_object_mut() else {
+                continue;
+            };
+            if row.contains_key("cwd") {
+                row.insert("cwd".to_string(), Value::String(path.to_string()));
+            }
+        }
+    }
 }
 
 fn rewrite_rollout_session_meta_cwd(

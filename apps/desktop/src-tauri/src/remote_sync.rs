@@ -83,34 +83,26 @@ pub fn reapply_workspace_mappings(
     let record = tracking
         .load(codex_home, remote_id, namespace_id)?
         .context("active namespace has no tracking record")?;
-    let remote_head = client
-        .namespace_head(namespace_id)?
-        .context("remote namespace has no revision to remap")?;
-    if record.integrated_head.as_deref() != Some(remote_head.as_str()) {
-        bail!("remote namespace has advanced; pull before applying workspace mappings");
-    }
-    let revision = client.revision(&remote_head)?;
-    validate_revision_namespace(&revision, namespace_id)?;
-    if revision.payload.warning_count > 0 {
-        bail!("remote revision is incomplete and cannot be checked out safely");
+    let reference = record
+        .integrated_head
+        .as_deref()
+        .map(|head| client.revision(head))
+        .transpose()?;
+    if let Some(revision) = &reference {
+        validate_revision_namespace(revision, namespace_id)?;
     }
     let local_summary =
         create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
     if local_summary.warning_count > 0 {
         bail!("workspace remap is blocked because the local scan contains warnings");
     }
-    let local = workspace_mapper.canonicalize_snapshot_objects(
-        &load_local_snapshot(local_summary.manifest_path)?,
-        repository_root,
-        control,
-    )?;
-    if !thread_states_equal_ignoring_workspace_paths(&local.threads, &revision.payload.threads)? {
-        bail!("the active namespace has unpushed local changes; push before applying mappings");
-    }
-    let downloaded =
-        download_revision_objects(client, &revision.payload.threads, repository_root, control)?;
-    let snapshot = workspace_mapper.materialize_snapshot_objects(
-        &revision_to_snapshot(&revision)?,
+    let local = load_local_snapshot(local_summary.manifest_path)?;
+    let snapshot = workspace_mapper.materialize_snapshot_objects_with_reference(
+        &local,
+        reference
+            .as_ref()
+            .map(|revision| revision.payload.threads.as_slice())
+            .unwrap_or_default(),
         repository_root,
         control,
     )?;
@@ -126,7 +118,7 @@ pub fn reapply_workspace_mappings(
             remote_id,
             namespace_id,
             expected_generation: Some(record.generation),
-            integrated_head: Some(remote_head.clone()),
+            integrated_head: record.integrated_head.clone(),
             activate_namespace: true,
         },
         control,
@@ -134,11 +126,11 @@ pub fn reapply_workspace_mappings(
     Ok(SyncReport {
         kind: SyncOutcomeKind::Remapped,
         namespace_id,
-        previous_head: Some(remote_head.clone()),
-        head: Some(remote_head.clone()),
-        revision_id: Some(remote_head),
+        previous_head: record.integrated_head.clone(),
+        head: record.integrated_head.clone(),
+        revision_id: record.integrated_head,
         uploaded_objects: 0,
-        downloaded_objects: downloaded,
+        downloaded_objects: 0,
         thread_count,
         conflicts: Vec::new(),
         checkout: Some(checkout),
@@ -809,34 +801,6 @@ fn thread_states_equal(left: &[ThreadBundle], right: &[ThreadBundle]) -> Result<
     Ok(thread_state(left)? == thread_state(right)?)
 }
 
-fn thread_states_equal_ignoring_workspace_paths(
-    left: &[ThreadBundle],
-    right: &[ThreadBundle],
-) -> Result<bool> {
-    Ok(workspace_independent_thread_state(left)? == workspace_independent_thread_state(right)?)
-}
-
-fn workspace_independent_thread_state(
-    threads: &[ThreadBundle],
-) -> Result<BTreeMap<String, String>> {
-    let threads = threads
-        .iter()
-        .map(|thread| {
-            let mut thread = remote_thread_view(thread);
-            thread.workspace.source_path = None;
-            if let Some(rows) = thread.related_records.tables.get_mut("threads") {
-                for row in rows {
-                    if let Some(row) = row.as_object_mut() {
-                        row.remove("cwd");
-                    }
-                }
-            }
-            thread
-        })
-        .collect::<Vec<_>>();
-    thread_state(&threads)
-}
-
 fn thread_state(threads: &[ThreadBundle]) -> Result<BTreeMap<String, String>> {
     let mut state = BTreeMap::new();
     for thread in threads {
@@ -894,25 +858,6 @@ mod tests {
         right.related_records.tables.get_mut("threads").unwrap()[0]["rollout_path"] =
             serde_json::json!("/home/second/rollout.jsonl");
         assert!(thread_states_equal(&[left], &[right]).unwrap());
-    }
-
-    #[test]
-    fn workspace_remap_safety_ignores_only_workspace_paths() {
-        let mut left = test_thread("one");
-        let mut right = left.clone();
-        left.workspace.source_path = Some("D:/projects/demo".to_string());
-        right.workspace.source_path = Some("F:/workspace/demo".to_string());
-        left.related_records.tables.get_mut("threads").unwrap()[0]["cwd"] =
-            json!("D:/projects/demo");
-        right.related_records.tables.get_mut("threads").unwrap()[0]["cwd"] =
-            json!("F:/workspace/demo");
-        assert!(
-            thread_states_equal_ignoring_workspace_paths(&[left.clone()], &[right.clone()])
-                .unwrap()
-        );
-
-        right.title = "changed".to_string();
-        assert!(!thread_states_equal_ignoring_workspace_paths(&[left], &[right]).unwrap());
     }
 
     #[test]
@@ -1183,6 +1128,7 @@ mod tests {
                 .as_deref(),
             Some("C:/work")
         );
+        insert_fixture_thread_at(&home_b, "thread-b", "C:/work/new");
 
         let remapped_b = reapply_workspace_mappings(
             remote_id,
@@ -1197,16 +1143,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(remapped_b.kind, SyncOutcomeKind::Remapped);
-        assert_eq!(
-            sync_core::scan_codex_home(&home_b).unwrap().threads[0]
-                .workspace
-                .source_path
-                .as_deref(),
-            Some("F:/workspace")
-        );
+        let remapped_paths = sync_core::scan_codex_home(&home_b)
+            .unwrap()
+            .threads
+            .into_iter()
+            .map(|thread| (thread.thread_id, thread.workspace.source_path.unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(remapped_paths["thread-a"], "F:/workspace");
+        assert_eq!(remapped_paths["thread-b"], "F:/workspace/new");
         assert_eq!(rollout_cwd(&home_b, "thread-a"), "F:/workspace");
+        assert_eq!(rollout_cwd(&home_b, "thread-b"), "F:/workspace/new");
 
-        insert_fixture_thread_at(&home_b, "thread-b", "F:/workspace");
         let pushed_b = push_namespace(
             remote_id,
             namespace.id,
@@ -1237,7 +1184,7 @@ mod tests {
         );
         assert_eq!(
             object_cwd(&repository_b, pushed_b_threads["thread-b"]),
-            "C:/work"
+            "C:/work/new"
         );
 
         let pulled_a = pull_namespace(
