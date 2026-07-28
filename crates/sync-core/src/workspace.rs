@@ -1,8 +1,20 @@
-use anyhow::{Result, bail};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::Range;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use crate::{LocalSnapshot, ThreadBundle};
+use crate::local::{
+    install_prepared_repository_object, repository_object_path, validate_repository_object,
+};
+use crate::{LocalSnapshot, ObjectDescriptor, OperationControl, OperationProgress, ThreadBundle};
+
+const MAX_SESSION_META_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +59,24 @@ impl WorkspacePathMapper {
         snapshot
     }
 
+    pub fn materialize_snapshot_objects(
+        &self,
+        snapshot: &LocalSnapshot,
+        repository_root: &Path,
+        control: &OperationControl,
+    ) -> Result<LocalSnapshot> {
+        self.transform_snapshot_objects(snapshot, repository_root, control, true)
+    }
+
+    pub fn canonicalize_snapshot_objects(
+        &self,
+        snapshot: &LocalSnapshot,
+        repository_root: &Path,
+        control: &OperationControl,
+    ) -> Result<LocalSnapshot> {
+        self.transform_snapshot_objects(snapshot, repository_root, control, false)
+    }
+
     pub fn materialize_thread(&self, thread: &mut ThreadBundle) {
         map_thread_paths(thread, |path| self.remote_to_local(path));
     }
@@ -77,6 +107,343 @@ impl WorkspacePathMapper {
             })
             .max_by_key(|(prefix_length, _)| *prefix_length)
             .map(|(_, mapped)| mapped)
+    }
+
+    fn transform_snapshot_objects(
+        &self,
+        snapshot: &LocalSnapshot,
+        repository_root: &Path,
+        control: &OperationControl,
+        remote_to_local: bool,
+    ) -> Result<LocalSnapshot> {
+        let mut transformed = if remote_to_local {
+            self.materialize_snapshot(snapshot)
+        } else {
+            self.canonicalize_snapshot(snapshot)
+        };
+        for (index, (original, thread)) in snapshot
+            .threads
+            .iter()
+            .zip(&mut transformed.threads)
+            .enumerate()
+        {
+            control.check_cancelled()?;
+            let original_path = thread_workspace_path(original);
+            let target_path = thread_workspace_path(thread);
+            if original_path == target_path {
+                continue;
+            }
+            let target_path = target_path.with_context(|| {
+                format!(
+                    "thread {} workspace mapping removed its target path",
+                    thread.thread_id
+                )
+            })?;
+            let target_path = target_path.to_string();
+            let thread_id = thread.thread_id.clone();
+            control.report(OperationProgress {
+                phase: if remote_to_local {
+                    "materialize_workspace_paths".to_string()
+                } else {
+                    "canonicalize_workspace_paths".to_string()
+                },
+                message: thread.title.clone(),
+                completed: index as u64,
+                total: Some(snapshot.threads.len() as u64),
+                unit: "threads".to_string(),
+                cancellable: true,
+            });
+            rewrite_rollout_session_meta_cwd(
+                &mut thread.rollout,
+                &thread_id,
+                &target_path,
+                repository_root,
+                control,
+            )?;
+        }
+        Ok(transformed)
+    }
+}
+
+fn thread_workspace_path(thread: &ThreadBundle) -> Option<&str> {
+    thread.workspace.source_path.as_deref().or_else(|| {
+        thread
+            .related_records
+            .tables
+            .get("threads")?
+            .first()?
+            .get("cwd")?
+            .as_str()
+    })
+}
+
+fn rewrite_rollout_session_meta_cwd(
+    object: &mut crate::ContentObject,
+    thread_id: &str,
+    target_cwd: &str,
+    repository_root: &Path,
+    control: &OperationControl,
+) -> Result<()> {
+    let source = repository_object_path(repository_root, &object.sha256)?;
+    let input = File::open(&source)
+        .with_context(|| format!("failed to open rollout object {}", source.display()))?;
+    let mut reader = BufReader::new(input);
+    let mut first_line = Vec::new();
+    {
+        let mut limited = reader.by_ref().take(MAX_SESSION_META_BYTES + 1);
+        limited.read_until(b'\n', &mut first_line)?;
+    }
+    if first_line.is_empty() || first_line.len() as u64 > MAX_SESSION_META_BYTES {
+        bail!("thread {thread_id} rollout session metadata is missing or oversized");
+    }
+    let rewritten_first_line = rewrite_session_meta_cwd(&first_line, thread_id, target_cwd)?;
+    if rewritten_first_line == first_line {
+        validate_repository_object(
+            repository_root,
+            &ObjectDescriptor {
+                sha256: object.sha256.clone(),
+                byte_length: object.byte_length,
+            },
+        )?;
+        return Ok(());
+    }
+
+    fs::create_dir_all(repository_root.join("objects").join("tmp"))?;
+    let temporary = repository_root
+        .join("objects")
+        .join("tmp")
+        .join(format!("{}.workspace-object.tmp", Uuid::now_v7()));
+    let transform_result = (|| -> Result<ObjectDescriptor> {
+        let output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        let mut writer = BufWriter::new(output);
+        let mut source_hasher = Sha256::new();
+        let mut output_hasher = Sha256::new();
+        let mut source_length = first_line.len() as u64;
+        let mut output_length = rewritten_first_line.len() as u64;
+        source_hasher.update(&first_line);
+        output_hasher.update(&rewritten_first_line);
+        writer.write_all(&rewritten_first_line)?;
+
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            control.check_cancelled()?;
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            source_length = source_length
+                .checked_add(count as u64)
+                .context("source rollout length overflow")?;
+            output_length = output_length
+                .checked_add(count as u64)
+                .context("rewritten rollout length overflow")?;
+            source_hasher.update(&buffer[..count]);
+            output_hasher.update(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        drop(writer);
+
+        let source_sha256 = format!("sha256:{}", hex::encode(source_hasher.finalize()));
+        if source_length != object.byte_length || source_sha256 != object.sha256 {
+            bail!(
+                "source rollout object changed while rewriting thread {thread_id}: expected {} ({} bytes), got {} ({} bytes)",
+                object.sha256,
+                object.byte_length,
+                source_sha256,
+                source_length
+            );
+        }
+        Ok(ObjectDescriptor {
+            sha256: format!("sha256:{}", hex::encode(output_hasher.finalize())),
+            byte_length: output_length,
+        })
+    })();
+    let descriptor = match transform_result {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if let Err(error) = install_prepared_repository_object(repository_root, &temporary, &descriptor)
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    object.sha256 = descriptor.sha256;
+    object.byte_length = descriptor.byte_length;
+    object.source_path = None;
+    Ok(())
+}
+
+fn rewrite_session_meta_cwd(line: &[u8], thread_id: &str, target_cwd: &str) -> Result<Vec<u8>> {
+    let body_end = if line.ends_with(b"\r\n") {
+        line.len() - 2
+    } else if line.ends_with(b"\n") {
+        line.len() - 1
+    } else {
+        line.len()
+    };
+    let body = &line[..body_end];
+    let mut json_start = 0;
+    skip_json_whitespace(body, &mut json_start);
+    if body.get(json_start..json_start + 3) == Some(&[0xef, 0xbb, 0xbf]) {
+        json_start += 3;
+        skip_json_whitespace(body, &mut json_start);
+    }
+    let value: Value = serde_json::from_slice(&body[json_start..])
+        .context("failed to parse rollout session metadata")?;
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        bail!("first rollout record is not session_meta");
+    }
+    let payload = value
+        .get("payload")
+        .and_then(Value::as_object)
+        .context("rollout session_meta payload is not an object")?;
+    if payload.get("id").and_then(Value::as_str) != Some(thread_id) {
+        bail!("rollout session_meta thread ID does not match {thread_id}");
+    }
+    if payload.get("cwd").and_then(Value::as_str) == Some(target_cwd) {
+        return Ok(line.to_vec());
+    }
+
+    let top_object = body[json_start..]
+        .iter()
+        .position(|byte| *byte == b'{')
+        .map(|offset| json_start + offset)
+        .context("rollout session metadata is not a JSON object")?;
+    let payload_range = find_object_field_value(body, top_object, "payload")?
+        .context("rollout session metadata has no payload field")?;
+    if body.get(payload_range.start) != Some(&b'{') {
+        bail!("rollout session_meta payload is not a JSON object");
+    }
+    let cwd_range = find_object_field_value(body, payload_range.start, "cwd")?
+        .context("rollout session_meta payload has no cwd field")?;
+    let replacement = serde_json::to_vec(target_cwd)?;
+    let mut rewritten = Vec::with_capacity(line.len() + replacement.len());
+    rewritten.extend_from_slice(&body[..cwd_range.start]);
+    rewritten.extend_from_slice(&replacement);
+    rewritten.extend_from_slice(&body[cwd_range.end..]);
+    rewritten.extend_from_slice(&line[body_end..]);
+    Ok(rewritten)
+}
+
+fn find_object_field_value(
+    input: &[u8],
+    object_start: usize,
+    target_field: &str,
+) -> Result<Option<Range<usize>>> {
+    if input.get(object_start) != Some(&b'{') {
+        bail!("JSON object does not start with an opening brace");
+    }
+    let mut index = object_start + 1;
+    loop {
+        skip_json_whitespace(input, &mut index);
+        match input.get(index) {
+            Some(b'}') => return Ok(None),
+            Some(b'"') => {}
+            _ => bail!("invalid JSON object member"),
+        }
+        let key_start = index;
+        let key_end = skip_json_string(input, index)?;
+        let key: String = serde_json::from_slice(&input[key_start..key_end])?;
+        index = key_end;
+        skip_json_whitespace(input, &mut index);
+        if input.get(index) != Some(&b':') {
+            bail!("invalid JSON object member separator");
+        }
+        index += 1;
+        skip_json_whitespace(input, &mut index);
+        let value_start = index;
+        let value_end = skip_json_value(input, index)?;
+        if key == target_field {
+            return Ok(Some(value_start..value_end));
+        }
+        index = value_end;
+        skip_json_whitespace(input, &mut index);
+        match input.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => return Ok(None),
+            _ => bail!("invalid JSON object terminator"),
+        }
+    }
+}
+
+fn skip_json_whitespace(input: &[u8], index: &mut usize) {
+    while input.get(*index).is_some_and(u8::is_ascii_whitespace) {
+        *index += 1;
+    }
+}
+
+fn skip_json_string(input: &[u8], start: usize) -> Result<usize> {
+    if input.get(start) != Some(&b'"') {
+        bail!("JSON string does not start with a quote");
+    }
+    let mut index = start + 1;
+    while let Some(byte) = input.get(index) {
+        match byte {
+            b'"' => return Ok(index + 1),
+            b'\\' => index += 2,
+            _ => index += 1,
+        }
+    }
+    bail!("unterminated JSON string")
+}
+
+fn skip_json_value(input: &[u8], start: usize) -> Result<usize> {
+    match input.get(start) {
+        Some(b'"') => skip_json_string(input, start),
+        Some(b'{') | Some(b'[') => {
+            let mut stack = vec![input[start]];
+            let mut index = start + 1;
+            while let Some(byte) = input.get(index) {
+                match byte {
+                    b'"' => index = skip_json_string(input, index)?,
+                    b'{' | b'[' => {
+                        stack.push(*byte);
+                        index += 1;
+                    }
+                    b'}' => {
+                        if stack.pop() != Some(b'{') {
+                            bail!("mismatched JSON object delimiter");
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Ok(index);
+                        }
+                    }
+                    b']' => {
+                        if stack.pop() != Some(b'[') {
+                            bail!("mismatched JSON array delimiter");
+                        }
+                        index += 1;
+                        if stack.is_empty() {
+                            return Ok(index);
+                        }
+                    }
+                    _ => index += 1,
+                }
+            }
+            bail!("unterminated JSON container")
+        }
+        Some(_) => {
+            let mut index = start;
+            while input.get(index).is_some_and(|byte| {
+                !matches!(byte, b',' | b'}' | b']') && !byte.is_ascii_whitespace()
+            }) {
+                index += 1;
+            }
+            if index == start {
+                bail!("empty JSON value");
+            }
+            Ok(index)
+        }
+        None => bail!("missing JSON value"),
     }
 }
 
@@ -182,14 +549,16 @@ fn looks_like_windows_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Cursor;
     use std::path::PathBuf;
 
     use serde_json::json;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::{
         ContentObject, LOCAL_SNAPSHOT_SCHEMA_VERSION, RelatedRecords, THREAD_BUNDLE_SCHEMA_VERSION,
-        WorkspaceRef,
+        WorkspaceRef, install_repository_object,
     };
 
     #[test]
@@ -244,6 +613,63 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("duplicate prefix"));
+    }
+
+    #[test]
+    fn session_meta_cwd_rewrite_preserves_other_bytes_and_round_trips() {
+        let remote = b"  { \"payload\" : { \"id\" : \"thread\", \"cwd\" : \"D:\\\\projects\\\\demo\", \"other\" : [1, {\"cwd\":\"untouched\"}] }, \"type\" : \"session_meta\" }\r\n";
+        let local = rewrite_session_meta_cwd(remote, "thread", "F:\\workspace\\demo").unwrap();
+        assert_ne!(local, remote);
+        assert!(String::from_utf8_lossy(&local).contains("F:\\\\workspace\\\\demo"));
+        assert!(String::from_utf8_lossy(&local).contains("\"cwd\":\"untouched\""));
+        let restored = rewrite_session_meta_cwd(&local, "thread", "D:\\projects\\demo").unwrap();
+        assert_eq!(restored, remote);
+    }
+
+    #[test]
+    fn snapshot_object_mapping_round_trip_restores_the_remote_hash() {
+        let repository = tempdir().unwrap();
+        let bytes = b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread\",\"cwd\":\"D:/projects/demo\",\"model_provider\":\"openai\"}}\n{\"type\":\"message\",\"payload\":{\"text\":\"unchanged\"}}\n";
+        let descriptor = ObjectDescriptor {
+            sha256: format!("sha256:{}", hex::encode(Sha256::digest(bytes))),
+            byte_length: bytes.len() as u64,
+        };
+        install_repository_object(
+            repository.path(),
+            &descriptor,
+            Cursor::new(bytes),
+            &OperationControl::default(),
+        )
+        .unwrap();
+        let mapper = WorkspacePathMapper::new(vec![WorkspacePathMapping {
+            remote_prefix: "D:/projects".to_string(),
+            local_prefix: "F:/workspace".to_string(),
+        }])
+        .unwrap();
+        let mut remote = fixture_snapshot("D:/projects/demo");
+        remote.threads[0].rollout.sha256 = descriptor.sha256.clone();
+        remote.threads[0].rollout.byte_length = descriptor.byte_length;
+        remote.threads[0].rollout.source_path = None;
+
+        let local = mapper
+            .materialize_snapshot_objects(&remote, repository.path(), &OperationControl::default())
+            .unwrap();
+        assert_eq!(
+            local.threads[0].workspace.source_path.as_deref(),
+            Some("F:/workspace/demo")
+        );
+        assert_ne!(local.threads[0].rollout.sha256, descriptor.sha256);
+        let local_bytes = fs::read(
+            repository_object_path(repository.path(), &local.threads[0].rollout.sha256).unwrap(),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&local_bytes).contains("F:/workspace/demo"));
+
+        let restored = mapper
+            .canonicalize_snapshot_objects(&local, repository.path(), &OperationControl::default())
+            .unwrap();
+        assert_eq!(restored, remote);
+        assert_eq!(restored.threads[0].rollout.sha256, descriptor.sha256);
     }
 
     fn fixture_snapshot(cwd: &str) -> LocalSnapshot {

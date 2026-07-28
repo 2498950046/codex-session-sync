@@ -226,6 +226,50 @@ pub fn install_repository_object<R: Read>(
     Ok(true)
 }
 
+pub(crate) fn install_prepared_repository_object(
+    repository_root: &Path,
+    temporary: &Path,
+    descriptor: &ObjectDescriptor,
+) -> Result<bool> {
+    validate_sha256(&descriptor.sha256)
+        .map_err(|_| anyhow::anyhow!("invalid content object hash {}", descriptor.sha256))?;
+    ensure_repository_layout(repository_root)?;
+    let metadata = fs::metadata(temporary).with_context(|| {
+        format!(
+            "failed to inspect prepared content object {}",
+            temporary.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() != descriptor.byte_length {
+        bail!(
+            "prepared content object length mismatch for {}: expected {}, got {}",
+            descriptor.sha256,
+            descriptor.byte_length,
+            metadata.len()
+        );
+    }
+    let destination = object_path(repository_root, &descriptor.sha256)?;
+    if destination.exists() {
+        validate_object(&destination, &descriptor.sha256, descriptor.byte_length)?;
+        fs::remove_file(temporary)?;
+        return Ok(false);
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(temporary, &destination) {
+        Ok(()) => Ok(true),
+        Err(error) if destination.exists() => {
+            fs::remove_file(temporary)?;
+            validate_object(&destination, &descriptor.sha256, descriptor.byte_length)
+                .context(error)?;
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to install content object {}", destination.display())),
+    }
+}
+
 pub fn create_local_snapshot(
     codex_home: impl AsRef<Path>,
     repository_root: impl AsRef<Path>,
