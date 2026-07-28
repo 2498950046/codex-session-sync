@@ -20,7 +20,10 @@ use url::Url;
 use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_JSON_RESPONSE_BYTES: u64 = 72 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: u64 = 64 * 1024;
 
@@ -75,7 +78,6 @@ impl RemoteClient {
         headers.insert(AUTHORIZATION, token.authorization_header()?);
         let client = Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
             .redirect(Policy::none())
             .default_headers(headers)
             .user_agent(concat!("codex-session-sync/", env!("CARGO_PKG_VERSION")))
@@ -88,6 +90,7 @@ impl RemoteClient {
         let response = self
             .client
             .get(self.endpoint("api/v1/info")?)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to connect to synchronization server")?;
         let info: ProtocolInfoResponse = parse_json_response(response)?;
@@ -108,6 +111,7 @@ impl RemoteClient {
         let response = self
             .client
             .get(self.endpoint("api/v1/namespaces")?)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to list remote namespaces")?;
         Ok(parse_json_response::<NamespaceListResponse>(response)?.namespaces)
@@ -132,6 +136,7 @@ impl RemoteClient {
         let response = self
             .client
             .get(self.endpoint(&format!("api/v1/namespaces/{namespace_id}/head"))?)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to read namespace head")?;
         let response: NamespaceHeadResponse = parse_json_response(response)?;
@@ -202,6 +207,7 @@ impl RemoteClient {
         let response = self
             .client
             .get(self.endpoint(&format!("api/v1/revisions/{digest}"))?)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .with_context(|| format!("failed to fetch revision {revision_id}"))?;
         let revision: RevisionManifest = parse_json_response(response)?;
@@ -236,6 +242,7 @@ impl RemoteClient {
         payload: &T,
     ) -> Result<R> {
         let response = request
+            .timeout(REQUEST_TIMEOUT)
             .json(payload)
             .send()
             .context("synchronization server request failed")?;
@@ -335,6 +342,9 @@ mod tests {
     use axum::Router;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
     use sync_core::{
         CommitRevisionRequest, ContentObject, RelatedRecords, RevisionManifest, RevisionPayload,
         THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, WorkspaceRef,
@@ -363,6 +373,51 @@ mod tests {
         assert!(normalize_server_url("ftp://example.test").is_err());
         assert!(normalize_server_url("https://user:secret@example.test").is_err());
         assert!(normalize_server_url("https://example.test?token=secret").is_err());
+    }
+
+    #[test]
+    fn object_download_can_exceed_the_timeout_window_while_the_stream_keeps_making_progress() {
+        let content = b"slow-but-active-object";
+        let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(content)));
+        let descriptor = ObjectDescriptor {
+            sha256,
+            byte_length: content.len() as u64,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                content.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            for chunk in content.chunks(5) {
+                thread::sleep(Duration::from_millis(70));
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+            }
+        });
+
+        let client = RemoteClient::new(
+            &format!("http://{address}"),
+            SecretToken::new("test-token-that-is-long-enough-for-auth".to_string()).unwrap(),
+        )
+        .unwrap();
+        let downloaded = client
+            .download_object(&descriptor)
+            .unwrap()
+            .bytes()
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(downloaded.as_ref(), content);
     }
 
     #[test]

@@ -49,10 +49,12 @@ button { cursor: pointer; }
 .recovery-row { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; padding-top: 16px; border-top: 1px solid #27313e; }
 .recovery-button { min-width: 150px; border: 1px solid #6d5b35; border-radius: 11px; padding: 13px 18px; color: #ffe0a3; background: #342713; font-weight: 800; }
 .recovery-button:disabled { cursor: not-allowed; opacity: .45; }
-.task-modal-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(3, 6, 10, .76); backdrop-filter: blur(7px); }
-.task-modal { width: min(520px, 100%); display: grid; gap: 14px; padding: 26px; border: 1px solid #3a4c60; border-radius: 18px; background: #111923; box-shadow: 0 30px 90px rgba(0, 0, 0, .62); }
+.task-modal-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; overflow-y: auto; padding: 24px; background: rgba(3, 6, 10, .76); backdrop-filter: blur(7px); }
+.task-modal { width: min(520px, 100%); max-height: calc(100vh - 48px); max-height: calc(100dvh - 48px); display: grid; gap: 14px; overflow-y: auto; padding: 26px; border: 1px solid #3a4c60; border-radius: 18px; background: #111923; box-shadow: 0 30px 90px rgba(0, 0, 0, .62); }
+.task-modal.task-modal-failed { border-color: #7a3a43; }
 .task-modal h2 { margin: 0; text-transform: capitalize; }
 .task-modal p { min-height: 38px; margin: 0; color: #a9b6c4; overflow-wrap: anywhere; }
+.task-modal p.task-modal-error { max-height: min(42vh, 320px); max-height: min(42dvh, 320px); overflow-y: auto; padding-right: 8px; color: #ffb6bd; white-space: pre-wrap; }
 .task-modal small { color: #7f91a3; }
 .progress-track { height: 10px; overflow: hidden; border-radius: 999px; background: #293644; }
 .progress-fill { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #5ac8a4, #8be8c8); transition: width .18s ease; }

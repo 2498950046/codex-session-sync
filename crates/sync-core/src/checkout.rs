@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -508,14 +511,14 @@ fn apply_directory_swaps(swaps: &[CheckoutDirectorySwap]) -> Result<()> {
             );
         }
         if swap.live.exists() {
-            fs::rename(&swap.live, &swap.backup).with_context(|| {
+            rename_checkout_directory(&swap.live, &swap.backup).with_context(|| {
                 format!(
                     "failed to move current session directory {} to backup",
                     swap.live.display()
                 )
             })?;
         }
-        fs::rename(&swap.staged, &swap.live).with_context(|| {
+        rename_checkout_directory(&swap.staged, &swap.live).with_context(|| {
             format!(
                 "failed to install staged session directory {}",
                 swap.live.display()
@@ -523,6 +526,33 @@ fn apply_directory_swaps(swaps: &[CheckoutDirectorySwap]) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn rename_checkout_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    const WINDOWS_RENAME_ATTEMPTS: usize = 20;
+    const WINDOWS_RENAME_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    let mut attempt = 1;
+    loop {
+        match fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && attempt < WINDOWS_RENAME_ATTEMPTS
+                    && is_transient_windows_rename_error(&error) =>
+            {
+                thread::sleep(WINDOWS_RENAME_RETRY_DELAY);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_windows_rename_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        || error.kind() == io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 fn replace_databases(
@@ -783,7 +813,7 @@ fn rollback_checkout(
                     "failed-state path already exists: {}",
                     failed.display()
                 ));
-            } else if let Err(error) = fs::rename(&swap.live, &failed) {
+            } else if let Err(error) = rename_checkout_directory(&swap.live, &failed) {
                 failures.push(format!(
                     "failed to preserve checkout directory {}: {error}",
                     swap.live.display()
@@ -792,7 +822,8 @@ fn rollback_checkout(
         }
         if swap_started
             && swap.backup.exists()
-            && let Err(error) = fs::rename(&swap.backup, &swap.live)
+            && !swap.live.exists()
+            && let Err(error) = rename_checkout_directory(&swap.backup, &swap.live)
         {
             failures.push(format!(
                 "failed to restore session directory {}: {error}",
@@ -910,6 +941,44 @@ mod tests {
         assert_eq!(scanned.threads[0].thread_id, "new");
         assert!(report.local_backup_dir.join("sessions").is_dir());
         assert!(report.backup_dir.join("databases/0.sqlite").is_file());
+        let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        assert_eq!(journal.status, CheckoutStatus::Completed);
+    }
+
+    #[test]
+    fn checkout_accepts_older_thread_rows_when_newer_schema_adds_defaulted_columns() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let connection = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE threads ADD COLUMN recency_at INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL DEFAULT 'legacy';
+                 ALTER TABLE threads ADD COLUMN name TEXT;
+                 CREATE TRIGGER threads_recency_at_after_insert
+                 AFTER INSERT ON threads
+                 WHEN NEW.recency_at_ms = 0
+                 BEGIN
+                     UPDATE threads
+                     SET recency_at = NEW.updated_at,
+                         recency_at_ms = NEW.updated_at * 1000
+                     WHERE id = NEW.id;
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+
+        let report = checkout_local_snapshot(&manifest, &codex_home, &repository, true).unwrap();
+        let scanned = crate::scan_codex_home(&codex_home).unwrap();
+
+        assert_eq!(scanned.threads.len(), 1);
+        assert_eq!(scanned.threads[0].thread_id, "new");
         let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
         assert_eq!(journal.status, CheckoutStatus::Completed);
     }
