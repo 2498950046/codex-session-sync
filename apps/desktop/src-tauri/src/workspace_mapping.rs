@@ -349,9 +349,10 @@ impl WorkspaceMappingStore {
         if file.metadata()?.len() > MAX_CONFIG_BYTES {
             bail!("workspace mapping file exceeds the {MAX_CONFIG_BYTES} byte safety limit");
         }
-        let file: WorkspaceMappingFile = serde_json::from_reader(BufReader::new(file))
+        let mut file: WorkspaceMappingFile = serde_json::from_reader(BufReader::new(file))
             .context("failed to parse workspace mappings")?;
         validate_file(&file)?;
+        deduplicate_legacy_verbatim_remote_rules(&mut file.mappings);
         Ok(file)
     }
 
@@ -483,6 +484,10 @@ fn suggested_subdirectory(remote_path: &str) -> String {
 }
 
 fn normalize_path_for_match(path: &str) -> String {
+    sync_core::normalize_workspace_path_for_match(path)
+}
+
+fn normalize_path_for_legacy_match(path: &str) -> String {
     let normalized = path.replace('\\', "/").trim_end_matches('/').to_string();
     if normalized.starts_with("//")
         || normalized
@@ -496,6 +501,37 @@ fn normalize_path_for_match(path: &str) -> String {
     }
 }
 
+fn deduplicate_legacy_verbatim_remote_rules(mappings: &mut Vec<WorkspaceMappingRule>) {
+    type ScopePath = (Uuid, Uuid, String, String);
+
+    let mut legacy_variants = BTreeMap::<ScopePath, BTreeSet<String>>::new();
+    for mapping in mappings.iter() {
+        legacy_variants
+            .entry((
+                mapping.remote_id,
+                mapping.namespace_id,
+                mapping.codex_home_key.clone(),
+                normalize_path_for_match(&mapping.remote_prefix),
+            ))
+            .or_default()
+            .insert(normalize_path_for_legacy_match(&mapping.remote_prefix));
+    }
+    let collapsible = legacy_variants
+        .into_iter()
+        .filter_map(|(key, variants)| (variants.len() > 1).then_some(key))
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    mappings.retain(|mapping| {
+        let key = (
+            mapping.remote_id,
+            mapping.namespace_id,
+            mapping.codex_home_key.clone(),
+            normalize_path_for_match(&mapping.remote_prefix),
+        );
+        !collapsible.contains(&key) || seen.insert(key)
+    });
+}
+
 fn validate_file(file: &WorkspaceMappingFile) -> Result<()> {
     if file.schema_version != WORKSPACE_MAPPING_SCHEMA_VERSION {
         bail!(
@@ -507,12 +543,16 @@ fn validate_file(file: &WorkspaceMappingFile) -> Result<()> {
         bail!("workspace mapping file exceeds the {MAX_MAPPINGS} rule limit");
     }
     let mut ids = BTreeSet::new();
-    let mut scopes = BTreeMap::<(Uuid, Uuid, String), Vec<WorkspacePathMapping>>::new();
     for mapping in &file.mappings {
         validate_rule(mapping)?;
         if !ids.insert(mapping.id) {
             bail!("workspace mapping file contains duplicate rule IDs");
         }
+    }
+    let mut effective_mappings = file.mappings.clone();
+    deduplicate_legacy_verbatim_remote_rules(&mut effective_mappings);
+    let mut scopes = BTreeMap::<(Uuid, Uuid, String), Vec<WorkspacePathMapping>>::new();
+    for mapping in &effective_mappings {
         scopes
             .entry((
                 mapping.remote_id,
@@ -632,6 +672,83 @@ mod tests {
         assert_eq!(plan.unmapped_paths.len(), 1);
         assert_eq!(plan.unmapped_paths[0].remote_path, "Z:/missing/project");
         assert_eq!(plan.unmapped_paths[0].suggested_subdirectory, "project");
+    }
+
+    #[test]
+    fn pull_plan_coalesces_windows_verbatim_and_regular_drive_paths() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let store = WorkspaceMappingStore::new(directory.path());
+
+        let plan = store
+            .pull_plan(
+                &codex_home,
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                None,
+                vec![
+                    r"\\?\Z:\missing\cpa".to_string(),
+                    "Z:/missing/cpa".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(plan.unmapped_paths.len(), 1);
+        assert_eq!(plan.unmapped_paths[0].suggested_subdirectory, "cpa");
+    }
+
+    #[test]
+    fn legacy_verbatim_duplicate_rules_keep_the_first_mapping() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let first_target = directory.path().join("cpa");
+        let duplicate_target = directory.path().join("cpa-2");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::create_dir_all(&first_target).unwrap();
+        fs::create_dir_all(&duplicate_target).unwrap();
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let codex_home_key = codex_home_key(&codex_home).unwrap();
+        let store = WorkspaceMappingStore::new(directory.path());
+        let file = WorkspaceMappingFile {
+            schema_version: WORKSPACE_MAPPING_SCHEMA_VERSION,
+            mappings: vec![
+                WorkspaceMappingRule {
+                    id: Uuid::now_v7(),
+                    remote_id,
+                    namespace_id,
+                    codex_home_key: codex_home_key.clone(),
+                    remote_prefix: r"\\?\C:\Users\jyh\Documents\Codex\cpa".to_string(),
+                    local_prefix: first_target.to_string_lossy().into_owned(),
+                    created_at: "2026-07-27T00:00:00Z".to_string(),
+                    updated_at: "2026-07-27T00:00:00Z".to_string(),
+                },
+                WorkspaceMappingRule {
+                    id: Uuid::now_v7(),
+                    remote_id,
+                    namespace_id,
+                    codex_home_key: codex_home_key.clone(),
+                    remote_prefix: "C:/Users/jyh/Documents/Codex/cpa".to_string(),
+                    local_prefix: duplicate_target.to_string_lossy().into_owned(),
+                    created_at: "2026-07-28T00:00:00Z".to_string(),
+                    updated_at: "2026-07-28T00:00:00Z".to_string(),
+                },
+            ],
+        };
+        store.save(&file).unwrap();
+
+        let state = store.state(&codex_home, remote_id, namespace_id).unwrap();
+        assert_eq!(state.mappings.len(), 1);
+        assert_eq!(
+            state.mappings[0].local_prefix,
+            first_target.to_string_lossy()
+        );
+        let mapper = store.mapper(&codex_home, remote_id, namespace_id).unwrap();
+        assert_eq!(
+            mapper.remote_to_local("C:/Users/jyh/Documents/Codex/cpa"),
+            Some(first_target.to_string_lossy().replace('\\', "/"))
+        );
     }
 
     #[test]

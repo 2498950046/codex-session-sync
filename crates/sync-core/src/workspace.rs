@@ -139,8 +139,12 @@ impl WorkspacePathMapper {
                 } else {
                     (&mapping.local_prefix, &mapping.remote_prefix)
                 };
-                replace_prefix(path, from, to)
-                    .map(|mapped| (normalize_for_match(from).chars().count(), mapped))
+                replace_prefix(path, from, to).map(|mapped| {
+                    (
+                        normalize_workspace_path_for_match(from).chars().count(),
+                        mapped,
+                    )
+                })
             })
             .max_by_key(|(prefix_length, _)| *prefix_length)
             .map(|(_, mapped)| mapped)
@@ -521,7 +525,7 @@ fn normalize_prefix(prefix: &str) -> Result<String> {
     if prefix.is_empty() {
         bail!("workspace path mapping prefixes must not be empty");
     }
-    let normalized = prefix.replace('\\', "/");
+    let normalized = normalize_path_syntax(prefix);
     let trimmed = normalized.trim_end_matches('/');
     if trimmed.is_empty() {
         bail!("workspace path mapping prefixes must not be filesystem roots");
@@ -551,9 +555,10 @@ fn reject_ambiguous_mappings(mappings: &[WorkspacePathMapping], remote_side: boo
 }
 
 fn replace_prefix(path: &str, from: &str, to: &str) -> Option<String> {
-    let normalized_path = path.replace('\\', "/");
-    let match_path = normalize_for_match(&normalized_path);
-    let match_from = normalize_for_match(from);
+    let normalized_path = normalize_path_syntax(path);
+    let normalized_from = normalize_path_syntax(from);
+    let match_path = normalize_workspace_path_for_match(&normalized_path);
+    let match_from = normalize_workspace_path_for_match(&normalized_from);
     if match_path != match_from
         && !match_path
             .strip_prefix(&match_from)
@@ -561,7 +566,7 @@ fn replace_prefix(path: &str, from: &str, to: &str) -> Option<String> {
     {
         return None;
     }
-    let suffix = &normalized_path[from.len().min(normalized_path.len())..];
+    let suffix = &normalized_path[normalized_from.len().min(normalized_path.len())..];
     let separator = if to.contains('\\') && !to.contains('/') {
         '\\'
     } else {
@@ -581,16 +586,39 @@ fn replace_prefix(path: &str, from: &str, to: &str) -> Option<String> {
 }
 
 fn paths_equal(left: &str, right: &str) -> bool {
-    normalize_for_match(left) == normalize_for_match(right)
+    normalize_workspace_path_for_match(left) == normalize_workspace_path_for_match(right)
 }
 
-fn normalize_for_match(path: &str) -> String {
-    let normalized = path.replace('\\', "/").trim_end_matches('/').to_string();
+pub fn normalize_workspace_path_for_match(path: &str) -> String {
+    let normalized = normalize_path_syntax(path)
+        .trim_end_matches('/')
+        .to_string();
     if looks_like_windows_path(&normalized) {
         normalized.to_ascii_lowercase()
     } else {
         normalized
     }
+}
+
+fn normalize_path_syntax(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let Some(verbatim) = normalized.strip_prefix("//?/") else {
+        return normalized;
+    };
+    if verbatim
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC/"))
+    {
+        return format!("//{}", &verbatim[4..]);
+    }
+    if verbatim
+        .as_bytes()
+        .get(1)
+        .is_some_and(|value| *value == b':')
+    {
+        return verbatim.to_string();
+    }
+    normalized
 }
 
 fn looks_like_windows_path(path: &str) -> bool {
@@ -628,6 +656,24 @@ mod tests {
             Some("D:/projects/demo".to_string())
         );
         assert_eq!(mapper.remote_to_local("D:/projects-old/demo"), None);
+    }
+
+    #[test]
+    fn mapping_treats_windows_verbatim_drive_paths_as_regular_drive_paths() {
+        let mapper = WorkspacePathMapper::new(vec![WorkspacePathMapping {
+            remote_prefix: r"\\?\C:\Users\jyh\Documents\Codex\cpa".to_string(),
+            local_prefix: "F:/history/cpa".to_string(),
+        }])
+        .unwrap();
+
+        assert_eq!(
+            mapper.remote_to_local("C:/Users/jyh/Documents/Codex/cpa/src"),
+            Some("F:/history/cpa/src".to_string())
+        );
+        assert_eq!(
+            mapper.remote_to_local(r"\\?\C:\Users\jyh\Documents\Codex\cpa\src"),
+            Some("F:/history/cpa/src".to_string())
+        );
     }
 
     #[test]
