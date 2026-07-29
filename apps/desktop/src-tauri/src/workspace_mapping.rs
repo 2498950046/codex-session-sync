@@ -80,6 +80,8 @@ pub enum WorkspaceDirectoryState {
 pub struct WorkspacePathMappingSummary {
     pub id: Uuid,
     pub remote_prefix: String,
+    pub local_prefix: String,
+    pub inherited: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -308,12 +310,8 @@ impl WorkspaceMappingStore {
         }
 
         let mut entries = BTreeMap::<String, WorkspacePathEntry>::new();
-        for mapping in scoped_mappings {
-            let entry = workspace_path_entry(&mut entries, &mapping.local_prefix);
-            entry.mappings.push(WorkspacePathMappingSummary {
-                id: mapping.id,
-                remote_prefix: mapping.remote_prefix.clone(),
-            });
+        for mapping in &scoped_mappings {
+            workspace_path_entry(&mut entries, &mapping.local_prefix);
         }
         for usage in workspace_paths {
             let entry = workspace_path_entry(&mut entries, &usage.path);
@@ -365,6 +363,17 @@ impl WorkspaceMappingStore {
         }
 
         for (identity, entry) in &mut entries {
+            for mapping in &scoped_mappings {
+                let mapping_identity = normalize_path_for_match(&mapping.local_prefix);
+                if path_is_same_or_child(identity, &mapping_identity) {
+                    entry.mappings.push(WorkspacePathMappingSummary {
+                        id: mapping.id,
+                        remote_prefix: mapping.remote_prefix.clone(),
+                        local_prefix: mapping.local_prefix.clone(),
+                        inherited: identity != &mapping_identity,
+                    });
+                }
+            }
             entry.directory_state = workspace_directory_state(Path::new(&entry.path))?;
             let protected = protected_paths
                 .iter()
@@ -1867,6 +1876,81 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("no longer"));
         assert!(stale.join("appeared.txt").is_file());
+    }
+
+    #[test]
+    fn cleanup_report_marks_child_paths_as_inheriting_a_parent_mapping() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let codex_home = directory.path().join("codex-home");
+        let local_root = directory.path().join("history/yaxin");
+        let missing_child = local_root.join("data-platform");
+        for path in [&repository, &codex_home, &local_root] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let database = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        database
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)",
+                [],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO threads (id, cwd, archived) VALUES ('active', ?1, 0)",
+                [missing_child.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(database);
+
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let store = WorkspaceMappingStore::new(&repository);
+        store
+            .create(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                "D:/yaxin".to_string(),
+                local_root.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+
+        let report = store
+            .cleanup_report(&codex_home, remote_id, namespace_id)
+            .unwrap();
+        let root_entry = report
+            .entries
+            .iter()
+            .find(|entry| {
+                normalize_path_for_match(&entry.path)
+                    == normalize_path_for_match(&local_root.to_string_lossy())
+            })
+            .unwrap();
+        assert_eq!(root_entry.mappings.len(), 1);
+        assert!(!root_entry.mappings[0].inherited);
+
+        let child_entry = report
+            .entries
+            .iter()
+            .find(|entry| {
+                normalize_path_for_match(&entry.path)
+                    == normalize_path_for_match(&missing_child.to_string_lossy())
+            })
+            .unwrap();
+        assert_eq!(child_entry.active_count, 1);
+        assert_eq!(
+            child_entry.directory_state,
+            WorkspaceDirectoryState::Missing
+        );
+        assert_eq!(child_entry.mappings.len(), 1);
+        assert_eq!(child_entry.mappings[0].remote_prefix, "D:/yaxin");
+        assert_eq!(
+            normalize_path_for_match(&child_entry.mappings[0].local_prefix),
+            normalize_path_for_match(&local_root.to_string_lossy())
+        );
+        assert!(child_entry.mappings[0].inherited);
+        assert!(!child_entry.cleanup_eligible);
     }
 
     #[test]

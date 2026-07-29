@@ -207,6 +207,8 @@ export type WorkspacePathEntry = {
   mappings: Array<{
     id: string;
     remotePrefix: string;
+    localPrefix: string;
+    inherited: boolean;
   }>;
   codexProjectNames: string[];
   directoryState: WorkspaceDirectoryState;

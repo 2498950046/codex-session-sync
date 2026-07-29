@@ -130,16 +130,28 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
   let selectedProfileNamespaceId = namespaceId;
   let manualOverrideNamespaceId: string | null = null;
   let mappings = [...namespaceMappingState.mappings];
-  let workspaceMappings: WorkspaceMappingRule[] = [{
-    id: "019fa1a0-5555-7555-8555-555555555555",
-    remoteId,
-    namespaceId: workNamespaceId,
-    codexHomeKey: "c:/users/demo/.codex",
-    remotePrefix: "D:/projects/cpa",
-    localPrefix: "F:/history/cpa",
-    createdAt: "2026-07-27T00:00:00Z",
-    updatedAt: "2026-07-27T00:00:00Z",
-  }];
+  let workspaceMappings: WorkspaceMappingRule[] = [
+    {
+      id: "019fa1a0-5555-7555-8555-555555555555",
+      remoteId,
+      namespaceId: workNamespaceId,
+      codexHomeKey: "c:/users/demo/.codex",
+      remotePrefix: "D:/projects/cpa",
+      localPrefix: "F:/history/cpa",
+      createdAt: "2026-07-27T00:00:00Z",
+      updatedAt: "2026-07-27T00:00:00Z",
+    },
+    {
+      id: "019fa1a0-6666-7666-8666-666666666666",
+      remoteId,
+      namespaceId: workNamespaceId,
+      codexHomeKey: "c:/users/demo/.codex",
+      remotePrefix: "D:/yaxin",
+      localPrefix: "F:/history/yaxin",
+      createdAt: "2026-07-27T00:00:00Z",
+      updatedAt: "2026-07-27T00:00:00Z",
+    },
+  ];
   let workspaceCleanupPaths = [
     "F:/history/cpa-3",
     "F:/history/do-c-2",
@@ -250,9 +262,10 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
     if (command === "get_workspace_cleanup_report") return {
       scannedRoots: ["F:/history"],
       entries: [
-        { path: "F:/history/cpa", activeCount: 1, archivedCount: 2, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/cpa").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix })), codexProjectNames: ["cpa"], directoryState: "nonEmpty", cleanupEligible: false },
+        { path: "F:/history/cpa", activeCount: 1, archivedCount: 2, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/cpa").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix, localPrefix: mapping.localPrefix, inherited: false })), codexProjectNames: ["cpa"], directoryState: "nonEmpty", cleanupEligible: false },
         { path: "F:/history/do-c", activeCount: 3, archivedCount: 1, mappings: [], codexProjectNames: ["do-c"], directoryState: "nonEmpty", cleanupEligible: false },
-        { path: "F:/history/yaxin", activeCount: 0, archivedCount: 4, mappings: [], codexProjectNames: ["yaxin"], directoryState: "nonEmpty", cleanupEligible: false },
+        { path: "F:/history/yaxin", activeCount: 0, archivedCount: 4, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/yaxin").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix, localPrefix: mapping.localPrefix, inherited: false })), codexProjectNames: ["yaxin"], directoryState: "nonEmpty", cleanupEligible: false },
+        { path: "F:/history/yaxin/data-platform", activeCount: 5, archivedCount: 0, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/yaxin").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix, localPrefix: mapping.localPrefix, inherited: true })), codexProjectNames: ["data-platform"], directoryState: "missing", cleanupEligible: false },
         ...workspaceCleanupPaths.map((path) => ({ path, activeCount: 0, archivedCount: 0, mappings: [], codexProjectNames: path.endsWith("new-chat-5") ? [] : [path.split("/").at(-1) ?? path], directoryState: path.endsWith("do-c-2") ? "missing" : "empty", cleanupEligible: true })),
       ],
       candidates: workspaceCleanupPaths.map((path) => ({ path })),
