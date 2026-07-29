@@ -193,6 +193,7 @@ impl ScannedThread {
 pub(crate) struct MetadataScanReport {
     pub(crate) codex_home: PathBuf,
     pub(crate) database_paths: Vec<PathBuf>,
+    pub(crate) database_workspace_paths: Vec<String>,
     pub(crate) active_count: usize,
     pub(crate) archived_count: usize,
     pub(crate) total_rollout_bytes: u64,
@@ -259,6 +260,25 @@ pub fn scan_codex_home_dashboard_with_control(
             .collect(),
         warnings: report.warnings,
     })
+}
+
+pub fn scan_codex_home_workspace_paths(codex_home: impl AsRef<Path>) -> Result<Vec<String>> {
+    let report = scan_codex_home_metadata_with_control(codex_home, &OperationControl::default())?;
+    let mut paths = BTreeMap::new();
+    for path in report.database_workspace_paths.into_iter().chain(
+        report
+            .threads
+            .into_iter()
+            .filter_map(|thread| thread.workspace.source_path),
+    ) {
+        let path = path.trim();
+        if !path.is_empty() {
+            paths
+                .entry(crate::workspace::normalize_workspace_path_for_match(path))
+                .or_insert_with(|| path.to_string());
+        }
+    }
+    Ok(paths.into_values().collect())
 }
 
 pub fn scan_codex_home_with_control(
@@ -328,6 +348,10 @@ pub(crate) fn scan_codex_home_metadata_with_control(
     let database_paths = discover_database_paths(&codex_home);
     let mut warnings = Vec::new();
     let db_records = load_database_records(&database_paths, &mut warnings);
+    let database_workspace_paths = db_records
+        .values()
+        .filter_map(|record| record.cwd.clone())
+        .collect::<Vec<_>>();
 
     let mut rollouts = BTreeMap::<String, RolloutRecord>::new();
     let mut rollout_count = 0_u64;
@@ -450,6 +474,7 @@ pub(crate) fn scan_codex_home_metadata_with_control(
     Ok(MetadataScanReport {
         codex_home,
         database_paths,
+        database_workspace_paths,
         active_count,
         archived_count,
         total_rollout_bytes,
@@ -941,6 +966,28 @@ mod tests {
             Some("/tmp/db-demo")
         );
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn workspace_path_scan_includes_database_rows_without_rollouts() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT)", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, cwd) VALUES ('database-only', 'F:/history/referenced')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            scan_codex_home_workspace_paths(temp.path()).unwrap(),
+            vec!["F:/history/referenced".to_string()]
+        );
     }
 
     #[test]

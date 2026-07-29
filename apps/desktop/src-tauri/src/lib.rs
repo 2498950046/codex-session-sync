@@ -38,8 +38,9 @@ use sync_core::{
 use tauri::State;
 use uuid::Uuid;
 use workspace_mapping::{
-    AutomaticWorkspaceMappingResult, WorkspaceMappingState, WorkspaceMappingStore,
-    WorkspacePathSelection, WorkspacePullPlan, collect_workspace_paths,
+    AutomaticWorkspaceMappingResult, WorkspaceCleanupReport, WorkspaceCleanupResult,
+    WorkspaceMappingState, WorkspaceMappingStore, WorkspacePathSelection, WorkspacePullPlan,
+    collect_workspace_paths,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +91,14 @@ struct CreateAutomaticWorkspaceMappingsRequest {
     namespace_id: String,
     expected_head: Option<String>,
     mappings: Vec<WorkspacePathSelection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupWorkspaceDirectoriesRequest {
+    remote_id: String,
+    namespace_id: String,
+    paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -625,6 +634,52 @@ async fn get_workspace_mapping_state(
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_workspace_cleanup_report(
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+) -> Result<WorkspaceCleanupReport, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        WorkspaceMappingStore::new(repository).cleanup_report(
+            &codex_home,
+            parse_uuid(&remote_id)?,
+            parse_uuid(&namespace_id)?,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn quarantine_workspace_directories(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    request: CleanupWorkspaceDirectoriesRequest,
+    confirmed_codex_closed: bool,
+) -> Result<WorkspaceCleanupResult, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&request.remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&request.namespace_id).map_err(|error| error.to_string())?;
+    let lease = jobs.try_acquire_codex_home(&codex_home)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        WorkspaceMappingStore::new(repository)
+            .quarantine_empty_directories(&codex_home, remote_id, namespace_id, request.paths)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1196,6 +1251,8 @@ pub fn run() {
             set_automatic_namespace_selection,
             clear_manual_namespace_override,
             get_workspace_mapping_state,
+            get_workspace_cleanup_report,
+            quarantine_workspace_directories,
             get_workspace_pull_plan,
             create_workspace_mapping,
             create_automatic_workspace_mappings,

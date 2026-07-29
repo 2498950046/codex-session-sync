@@ -1,17 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, Write};
+use std::io::{BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sync_core::{WorkspacePathMapper, WorkspacePathMapping, codex_home_key};
+use sync_core::{
+    WorkspacePathMapper, WorkspacePathMapping, codex_home_key, scan_codex_home_workspace_paths,
+};
 use uuid::Uuid;
 
 const WORKSPACE_MAPPING_SCHEMA_VERSION: u32 = 1;
 const MAX_MAPPINGS: usize = 128;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+const MAX_CLEANUP_SCAN_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +54,32 @@ pub struct WorkspacePullPlan {
     pub mapped_path_count: usize,
     pub existing_path_count: usize,
     pub unmapped_paths: Vec<WorkspacePathCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCleanupCandidate {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCleanupReport {
+    pub scanned_roots: Vec<String>,
+    pub candidates: Vec<WorkspaceCleanupCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantinedWorkspaceDirectory {
+    pub original_path: String,
+    pub quarantine_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCleanupResult {
+    pub quarantined: Vec<QuarantinedWorkspaceDirectory>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -150,6 +179,163 @@ impl WorkspaceMappingStore {
             existing_path_count,
             unmapped_paths,
         })
+    }
+
+    pub fn cleanup_report(
+        &self,
+        codex_home: &Path,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+    ) -> Result<WorkspaceCleanupReport> {
+        let codex_home_key = codex_home_key(codex_home)?;
+        let file = self.load()?;
+        let mut scan_roots = BTreeMap::<String, PathBuf>::new();
+        for mapping in file.mappings.iter().filter(|mapping| {
+            mapping.remote_id == remote_id
+                && mapping.namespace_id == namespace_id
+                && mapping.codex_home_key == codex_home_key
+        }) {
+            let Some(parent) = Path::new(&mapping.local_prefix).parent() else {
+                continue;
+            };
+            if parent.as_os_str().is_empty() || parent.parent().is_none() || !parent.is_dir() {
+                continue;
+            }
+            let root = fs::canonicalize(parent).with_context(|| {
+                format!("failed to normalize workspace parent {}", parent.display())
+            })?;
+            scan_roots
+                .entry(normalize_path_for_match(&root.to_string_lossy()))
+                .or_insert(root);
+        }
+
+        let repository_root = self.repository_root()?;
+        let mut protected_paths = file
+            .mappings
+            .iter()
+            .map(|mapping| normalize_path_for_match(&mapping.local_prefix))
+            .collect::<BTreeSet<_>>();
+        protected_paths.insert(normalize_path_for_match(&codex_home.to_string_lossy()));
+        protected_paths.insert(normalize_path_for_match(&repository_root.to_string_lossy()));
+        for path in scan_codex_home_workspace_paths(codex_home)? {
+            protected_paths.insert(normalize_path_for_match(&path));
+        }
+
+        let mut candidates = BTreeMap::<String, WorkspaceCleanupCandidate>::new();
+        for root in scan_roots.values() {
+            let mut entry_count = 0_usize;
+            for entry in fs::read_dir(root)
+                .with_context(|| format!("failed to inspect workspace parent {}", root.display()))?
+            {
+                entry_count += 1;
+                if entry_count > MAX_CLEANUP_SCAN_ENTRIES {
+                    bail!(
+                        "workspace parent {} exceeds the {MAX_CLEANUP_SCAN_ENTRIES} entry safety limit",
+                        root.display()
+                    );
+                }
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if !metadata.is_dir() || is_symlink_or_reparse_point(&metadata) {
+                    continue;
+                }
+                let path = fs::canonicalize(entry.path())?;
+                if path.parent() != Some(root.as_path()) || !directory_is_empty(&path)? {
+                    continue;
+                }
+                let normalized = normalize_path_for_match(&path.to_string_lossy());
+                if protected_paths
+                    .iter()
+                    .any(|protected| paths_overlap(&normalized, protected))
+                {
+                    continue;
+                }
+                candidates.insert(
+                    normalized,
+                    WorkspaceCleanupCandidate {
+                        path: display_workspace_path(&path),
+                    },
+                );
+            }
+        }
+
+        Ok(WorkspaceCleanupReport {
+            scanned_roots: scan_roots
+                .into_values()
+                .map(|path| display_workspace_path(&path))
+                .collect(),
+            candidates: candidates.into_values().collect(),
+        })
+    }
+
+    pub fn quarantine_empty_directories(
+        &self,
+        codex_home: &Path,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+        requested_paths: Vec<String>,
+    ) -> Result<WorkspaceCleanupResult> {
+        if requested_paths.is_empty() {
+            bail!("at least one workspace cleanup path is required");
+        }
+        if requested_paths.len() > MAX_MAPPINGS {
+            bail!("workspace cleanup exceeds the {MAX_MAPPINGS} path safety limit");
+        }
+
+        let report = self.cleanup_report(codex_home, remote_id, namespace_id)?;
+        let available = report
+            .candidates
+            .into_iter()
+            .map(|candidate| (normalize_path_for_match(&candidate.path), candidate.path))
+            .collect::<BTreeMap<_, _>>();
+        let mut selected = Vec::with_capacity(requested_paths.len());
+        let mut seen = BTreeSet::new();
+        for requested in requested_paths {
+            let normalized = normalize_path_for_match(requested.trim());
+            if !seen.insert(normalized.clone()) {
+                bail!("workspace cleanup request contains duplicate paths");
+            }
+            let path = available.get(&normalized).with_context(|| {
+                format!(
+                    "workspace cleanup path is no longer an unreferenced empty directory: {}",
+                    requested.trim()
+                )
+            })?;
+            selected.push(PathBuf::from(path));
+        }
+
+        let quarantine_root = self
+            .repository_root()?
+            .join("quarantine")
+            .join("empty-workspaces");
+        fs::create_dir_all(&quarantine_root).with_context(|| {
+            format!(
+                "failed to create workspace quarantine {}",
+                quarantine_root.display()
+            )
+        })?;
+        let mut quarantined = Vec::<QuarantinedWorkspaceDirectory>::new();
+        for original in selected {
+            let name = original
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("workspace");
+            let quarantine = quarantine_root.join(format!("{}-{name}", Uuid::now_v7()));
+            if let Err(error) = move_empty_directory(&original, &quarantine) {
+                for moved in quarantined.iter().rev() {
+                    let _ = move_empty_directory(
+                        Path::new(&moved.quarantine_path),
+                        Path::new(&moved.original_path),
+                    );
+                }
+                return Err(error);
+            }
+            quarantined.push(QuarantinedWorkspaceDirectory {
+                original_path: display_workspace_path(&original),
+                quarantine_path: display_workspace_path(&quarantine),
+            });
+        }
+        Ok(WorkspaceCleanupResult { quarantined })
     }
 
     pub fn create_automatic(
@@ -378,6 +564,14 @@ impl WorkspaceMappingStore {
         fs::rename(&temporary, &self.path)?;
         Ok(())
     }
+
+    fn repository_root(&self) -> Result<PathBuf> {
+        self.path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .context("workspace mapping path has no repository root")
+    }
 }
 
 pub fn collect_workspace_paths(threads: &[sync_core::ThreadBundle]) -> Vec<String> {
@@ -456,6 +650,96 @@ fn path_is_same_or_child(path: &str, parent: &str) -> bool {
         || path
             .strip_prefix(&parent)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn paths_overlap(left: &str, right: &str) -> bool {
+    path_is_same_or_child(left, right) || path_is_same_or_child(right, left)
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool> {
+    Ok(fs::read_dir(path)?.next().transpose()?.is_none())
+}
+
+fn display_workspace_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(regular) = path.strip_prefix(r"\\?\") {
+            return regular.to_string();
+        }
+    }
+    path.into_owned()
+}
+
+fn is_symlink_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn move_empty_directory(source: &Path, destination: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect empty workspace {}", source.display()))?;
+    if !metadata.is_dir() || is_symlink_or_reparse_point(&metadata) {
+        bail!("workspace cleanup accepts only regular non-symlink directories");
+    }
+    if !directory_is_empty(source)? {
+        bail!(
+            "workspace directory {} is no longer empty; cleanup was refused",
+            source.display()
+        );
+    }
+    match fs::rename(source, destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::CrossesDevices => {
+            fs::create_dir(destination).with_context(|| {
+                format!(
+                    "failed to create quarantined workspace {}",
+                    destination.display()
+                )
+            })?;
+            if !directory_is_empty(source)? {
+                let _ = fs::remove_dir(destination);
+                bail!(
+                    "workspace directory {} changed during cleanup; cleanup was refused",
+                    source.display()
+                );
+            }
+            if let Err(error) = fs::remove_dir(source) {
+                let _ = fs::remove_dir(destination);
+                return Err(error).with_context(|| {
+                    format!("failed to quarantine empty workspace {}", source.display())
+                });
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to move empty workspace {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
+    }
+    if !directory_is_empty(destination)? {
+        let _ = fs::rename(destination, source);
+        bail!("quarantined workspace changed during cleanup; the original was restored");
+    }
+    Ok(())
 }
 
 fn suggested_subdirectory(remote_path: &str) -> String {
@@ -590,6 +874,7 @@ fn validate_rule(mapping: &WorkspaceMappingRule) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::*;
@@ -789,5 +1074,124 @@ mod tests {
             mapper.remote_to_local("D:/work/demo"),
             mapper.remote_to_local("E:/personal/demo")
         );
+    }
+
+    #[test]
+    fn cleanup_finds_only_unmapped_unreferenced_empty_directories_and_quarantines_them() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let codex_home = directory.path().join("codex-home");
+        let history = directory.path().join("history");
+        let mapped = history.join("mapped");
+        let referenced = history.join("referenced");
+        let stale = history.join("stale");
+        let nonempty = history.join("nonempty");
+        for path in [
+            &repository,
+            &codex_home,
+            &mapped,
+            &referenced,
+            &stale,
+            &nonempty,
+        ] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(nonempty.join("keep.txt"), b"keep").unwrap();
+        let database = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        database
+            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT)", [])
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO threads (id, cwd) VALUES ('referenced', ?1)",
+                [referenced.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(database);
+
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let store = WorkspaceMappingStore::new(&repository);
+        store
+            .create(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                "D:/mapped".to_string(),
+                mapped.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+
+        let report = store
+            .cleanup_report(&codex_home, remote_id, namespace_id)
+            .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            normalize_path_for_match(&report.candidates[0].path),
+            normalize_path_for_match(&stale.to_string_lossy())
+        );
+
+        let result = store
+            .quarantine_empty_directories(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                vec![report.candidates[0].path.clone()],
+            )
+            .unwrap();
+        assert_eq!(result.quarantined.len(), 1);
+        assert!(!stale.exists());
+        assert!(Path::new(&result.quarantined[0].quarantine_path).is_dir());
+        assert!(mapped.is_dir());
+        assert!(referenced.is_dir());
+        assert!(nonempty.is_dir());
+        assert!(
+            store
+                .cleanup_report(&codex_home, remote_id, namespace_id)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cleanup_revalidates_a_directory_that_changed_after_inspection() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let codex_home = directory.path().join("codex-home");
+        let history = directory.path().join("history");
+        let mapped = history.join("mapped");
+        let stale = history.join("stale");
+        for path in [&repository, &codex_home, &mapped, &stale] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let store = WorkspaceMappingStore::new(&repository);
+        store
+            .create(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                "D:/mapped".to_string(),
+                mapped.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+        let report = store
+            .cleanup_report(&codex_home, remote_id, namespace_id)
+            .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        fs::write(stale.join("appeared.txt"), b"changed").unwrap();
+
+        let error = store
+            .quarantine_empty_directories(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                vec![report.candidates[0].path.clone()],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("no longer"));
+        assert!(stale.join("appeared.txt").is_file());
     }
 }

@@ -20,6 +20,8 @@ import type {
   SyncReport,
   ThreadConflict,
   ThreadConflictVersion,
+  WorkspaceCleanupReport,
+  WorkspaceCleanupResult,
   WorkspaceMappingState,
   WorkspacePullPlan,
 } from "./types";
@@ -188,6 +190,8 @@ export default function App() {
   const [namespaceStatus, setNamespaceStatus] = useState<RemoteNamespaceStatus | null>(null);
   const [mappingState, setMappingState] = useState<NamespaceMappingState | null>(null);
   const [workspaceMappingState, setWorkspaceMappingState] = useState<WorkspaceMappingState | null>(null);
+  const [workspaceCleanupReport, setWorkspaceCleanupReport] = useState<WorkspaceCleanupReport | null>(null);
+  const [workspaceCleanupMessage, setWorkspaceCleanupMessage] = useState<string | null>(null);
   const [pendingWorkspaceSync, setPendingWorkspaceSync] = useState<PendingWorkspaceSync | null>(null);
   const [workspaceSetupMessage, setWorkspaceSetupMessage] = useState<string | null>(null);
   const [workspaceEditorParent, setWorkspaceEditorParent] = useState("");
@@ -390,6 +394,8 @@ export default function App() {
     if (!selectedProfile) return;
     setMappingState(null);
     setWorkspaceMappingState(null);
+    setWorkspaceCleanupReport(null);
+    setWorkspaceCleanupMessage(null);
     setRemoteName(selectedProfile.displayName);
     setRemoteUrl(selectedProfile.serverUrl);
     setRemoteToken("");
@@ -418,6 +424,8 @@ export default function App() {
 
   useEffect(() => {
     setConfirmedReplaceTarget(null);
+    setWorkspaceCleanupReport(null);
+    setWorkspaceCleanupMessage(null);
   }, [codexHome, selectedRemoteId, selectedNamespaceId]);
 
   useEffect(() => {
@@ -746,6 +754,7 @@ export default function App() {
         },
       });
       setWorkspaceMappingState(state);
+      setWorkspaceCleanupReport(null);
       setRemoteWorkspacePrefix("");
       setLocalWorkspacePrefix("");
     } catch (reason) {
@@ -764,6 +773,7 @@ export default function App() {
         namespaceId: selectedNamespaceId,
         mappingId,
       }));
+      setWorkspaceCleanupReport(null);
     } catch (reason) {
       setError(String(reason));
     }
@@ -783,6 +793,65 @@ export default function App() {
       }));
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function inspectWorkspaceCleanup() {
+    if (!selectedRemoteId || !selectedNamespaceId || busy) return;
+    setRemoteLoading(true);
+    setError(null);
+    setWorkspaceCleanupMessage(null);
+    try {
+      const cleanup = await invoke<WorkspaceCleanupReport>("get_workspace_cleanup_report", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+      });
+      setWorkspaceCleanupReport(cleanup);
+      if (cleanup.candidates.length === 0) {
+        setWorkspaceCleanupMessage(cleanup.scannedRoots.length === 0
+          ? "当前映射没有可安全检查的项目父目录。"
+          : "扫描完成，没有发现无引用空目录。");
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setRemoteLoading(false);
+    }
+  }
+
+  async function cleanupWorkspaceDirectories(paths: string[]) {
+    if (!selectedRemoteId || !selectedNamespaceId || busy || !canWrite || paths.length === 0) return;
+    const description = paths.length === 1 ? paths[0] : `${paths.length} 个目录`;
+    if (!window.confirm(`安全删除 ${description}？\n\n删除前会重新确认目录为空且没有映射或会话引用，随后移入可恢复隔离区。`)) return;
+    setRemoteLoading(true);
+    setError(null);
+    setWorkspaceCleanupMessage(null);
+    try {
+      const result = await invoke<WorkspaceCleanupResult>("quarantine_workspace_directories", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        request: {
+          remoteId: selectedRemoteId,
+          namespaceId: selectedNamespaceId,
+          paths,
+        },
+        confirmedCodexClosed: confirmedClosed,
+      });
+      const refreshed = await invoke<WorkspaceCleanupReport>("get_workspace_cleanup_report", {
+        repositoryRoot: repositoryRoot.trim(),
+        codexHome: codexHome.trim(),
+        remoteId: selectedRemoteId,
+        namespaceId: selectedNamespaceId,
+      });
+      setWorkspaceCleanupReport(refreshed);
+      setWorkspaceCleanupMessage(`已安全删除 ${result.quarantined.length} 个空目录，内容保留在本地同步仓库的 quarantine/empty-workspaces。`);
+    } catch (reason) {
+      setError(String(reason));
+      await refreshProcesses();
+    } finally {
+      setRemoteLoading(false);
     }
   }
 
@@ -1107,9 +1176,14 @@ export default function App() {
         </div>}
 
         {selectedNamespace && workspaceMappingState && <div className="workspace-mapping-console">
-          <div className="mapping-heading"><div><h3>项目路径</h3><p>拉取或切换时自动检查。原路径在本机可用或已有映射时不会处理；其余项目只需统一选择一次父目录。</p></div><span>{workspaceMappingState.mappings.length} 条本机规则</span></div>
+          <div className="mapping-heading"><div><h3>项目路径</h3><p>拉取或切换时自动检查。原路径在本机可用或已有映射时不会处理；其余项目只需统一选择一次父目录。</p></div><div className="workspace-mapping-heading-actions"><span>{workspaceMappingState.mappings.length} 条本机规则</span><button type="button" className="secondary-button" onClick={() => void inspectWorkspaceCleanup()} disabled={busy}>扫描空目录</button></div></div>
           {workspaceSetupMessage && <p className="success-copy workspace-setup-message">{workspaceSetupMessage}</p>}
+          {workspaceCleanupMessage && <p className="success-copy workspace-setup-message">{workspaceCleanupMessage}</p>}
           <div className="workspace-mapping-list">{workspaceMappingState.mappings.map((mapping) => <article key={mapping.id}><div><code>{mapping.remotePrefix}</code><span>→</span><code>{mapping.localPrefix}</code></div><button className="danger-button" onClick={() => void deleteWorkspaceMapping(mapping.id)} disabled={busy}>删除</button></article>)}{workspaceMappingState.mappings.length === 0 && !pendingWorkspaceSync && <p className="muted-copy">无需提前配置。首次拉取发现跨电脑路径时，应用会引导你批量设置。</p>}</div>
+          {workspaceCleanupReport && workspaceCleanupReport.candidates.length > 0 && <div className="workspace-cleanup-results">
+            <div className="workspace-cleanup-heading"><div><strong>发现 {workspaceCleanupReport.candidates.length} 个无引用空目录</strong><span>这些目录没有任何路径映射或活动/归档会话引用。删除操作会先重新校验，再移入可恢复隔离区。</span></div><button type="button" className="danger-button" onClick={() => void cleanupWorkspaceDirectories(workspaceCleanupReport.candidates.map((candidate) => candidate.path))} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>一键删除全部</button></div>
+            <div className="workspace-cleanup-list">{workspaceCleanupReport.candidates.map((candidate) => <article key={candidate.path}><code title={candidate.path}>{candidate.path}</code><button type="button" className="danger-button" onClick={() => void cleanupWorkspaceDirectories([candidate.path])} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>删除</button></article>)}</div>
+          </div>}
           <details className="advanced-mapping">
             <summary>高级：手动添加根路径规则</summary>
             <div className="workspace-mapping-builder">

@@ -198,6 +198,22 @@ export type WorkspaceMappingState = {
   mappings: WorkspaceMappingRule[];
 };
 
+export type WorkspaceCleanupCandidate = {
+  path: string;
+};
+
+export type WorkspaceCleanupReport = {
+  scannedRoots: string[];
+  candidates: WorkspaceCleanupCandidate[];
+};
+
+export type WorkspaceCleanupResult = {
+  quarantined: Array<{
+    originalPath: string;
+    quarantinePath: string;
+  }>;
+};
+
 export type WorkspacePathCandidate = {
   remotePath: string;
   suggestedSubdirectory: string;

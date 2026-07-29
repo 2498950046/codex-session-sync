@@ -149,6 +149,10 @@ button { cursor: pointer; }
 .mapping-tags code { max-width: 100%; padding: 4px 6px; overflow: hidden; border-radius: 6px; color: #7dd7b8; background: #10251f; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .mapping-card .danger-button { border: 1px solid #6a343d; border-radius: 8px; padding: 8px 10px; color: #ffc7cc; background: #3a1c22; }
 .workspace-mapping-console { display: grid; gap: 14px; margin-top: 18px; padding-top: 18px; border-top: 1px solid #273341; }
+.workspace-mapping-heading-actions { display: flex; align-items: center; gap: 10px; }
+.workspace-mapping-heading-actions > span { color: #778697; font-size: 12px; }
+.workspace-mapping-heading-actions .secondary-button { border: 1px solid #405064; border-radius: 9px; padding: 8px 11px; color: #dce7f1; background: #17202b; font-weight: 800; }
+.workspace-mapping-heading-actions button:disabled { cursor: not-allowed; opacity: .45; }
 .workspace-setup-message { margin: 0; }
 .migration-panel { display: grid; gap: 14px; margin-top: 18px; padding: 20px; }
 .migration-panel .section-heading { margin-bottom: 0; }
@@ -201,6 +205,16 @@ button { cursor: pointer; }
 .workspace-mapping-list code { overflow: hidden; color: #8edbc1; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-mapping-list span { color: #708195; }
 .workspace-mapping-list .danger-button { border: 1px solid #6a343d; border-radius: 8px; padding: 8px 10px; color: #ffc7cc; background: #3a1c22; }
+.workspace-cleanup-results { display: grid; gap: 10px; padding: 13px; border: 1px solid #7a4a36; border-radius: 12px; background: #281712; }
+.workspace-cleanup-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.workspace-cleanup-heading > div { min-width: 0; display: grid; gap: 5px; }
+.workspace-cleanup-heading strong { color: #ffbd87; font-size: 12px; }
+.workspace-cleanup-heading span { color: #c28e73; font-size: 11px; line-height: 1.5; }
+.workspace-cleanup-results .danger-button { flex: 0 0 auto; border: 1px solid #89444d; border-radius: 8px; padding: 8px 10px; color: #ffd4d7; background: #4a2027; font-weight: 800; }
+.workspace-cleanup-results button:disabled { cursor: not-allowed; opacity: .45; }
+.workspace-cleanup-list { display: grid; gap: 7px; }
+.workspace-cleanup-list article { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid #623a30; border-radius: 9px; background: #1b1110; }
+.workspace-cleanup-list code { min-width: 0; overflow: hidden; color: #f0a982; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-remap-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px; border: 1px solid #66562f; border-radius: 11px; background: #261f10; }
 .workspace-remap-row p { margin: 0; color: #c2aa75; font-size: 12px; }
 .workspace-remap-row button { flex: 0 0 auto; }
@@ -269,8 +283,9 @@ button { cursor: pointer; }
   .remote-form, .namespace-editor, .sync-status-grid, .identity-grid, .mapping-builder, .workspace-mapping-builder { grid-template-columns: 1fr; }
   .mapping-card { grid-template-columns: 1fr auto; }
   .mapping-card .mapping-tags { grid-column: 1 / -1; grid-row: 2; }
-  .mapping-heading, .mapping-resolution { align-items: stretch; flex-direction: column; }
-  .workspace-mapping-list article, .workspace-mapping-list article > div, .workspace-remap-row { align-items: stretch; flex-direction: column; }
+  .mapping-heading, .mapping-resolution, .workspace-cleanup-heading { align-items: stretch; flex-direction: column; }
+  .workspace-mapping-heading-actions { align-items: stretch; flex-direction: column; }
+  .workspace-mapping-list article, .workspace-mapping-list article > div, .workspace-cleanup-list article, .workspace-remap-row { align-items: stretch; flex-direction: column; }
   .conflict-version-grid { grid-template-columns: 1fr; }
   .conflict-summary, .conflict-submit-row, .conflict-item header { align-items: stretch; flex-direction: column; }
   .conflict-submit-row button { width: 100%; }

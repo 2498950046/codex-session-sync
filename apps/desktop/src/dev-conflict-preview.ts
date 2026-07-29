@@ -131,6 +131,11 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
   let manualOverrideNamespaceId: string | null = null;
   let mappings = [...namespaceMappingState.mappings];
   let workspaceMappings: WorkspaceMappingRule[] = [];
+  let workspaceCleanupPaths = [
+    "F:/history/cpa-3",
+    "F:/history/do-c-2",
+    "F:/history/new-chat-5",
+  ];
 
   function workspacePullPlan(requestedNamespaceId: string): WorkspacePullPlan {
     return {
@@ -233,6 +238,20 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
       codexHomeKey: "c:/users/demo/.codex",
       mappings: workspaceMappings,
     };
+    if (command === "get_workspace_cleanup_report") return {
+      scannedRoots: ["F:/history"],
+      candidates: workspaceCleanupPaths.map((path) => ({ path })),
+    };
+    if (command === "quarantine_workspace_directories") {
+      const paths = (args as { request?: { paths?: string[] } } | undefined)?.request?.paths ?? [];
+      workspaceCleanupPaths = workspaceCleanupPaths.filter((path) => !paths.includes(path));
+      return {
+        quarantined: paths.map((path) => ({
+          originalPath: path,
+          quarantinePath: `C:/Users/demo/.codex-session-sync/quarantine/empty-workspaces/${path.split("/").at(-1)}`,
+        })),
+      };
+    }
     if (command === "get_workspace_pull_plan") {
       const requestedNamespaceId = String((args as { namespaceId?: string } | undefined)?.namespaceId ?? namespaceId);
       return workspacePullPlan(requestedNamespaceId);
