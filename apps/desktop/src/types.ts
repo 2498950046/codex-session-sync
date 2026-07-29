@@ -198,17 +198,26 @@ export type WorkspaceMappingState = {
   mappings: WorkspaceMappingRule[];
 };
 
-export type WorkspaceCleanupCandidate = {
+export type WorkspaceDirectoryState = "unknown" | "missing" | "empty" | "nonEmpty" | "notDirectory";
+
+export type WorkspacePathEntry = {
   path: string;
+  activeCount: number;
+  archivedCount: number;
+  mappings: Array<{
+    id: string;
+    remotePrefix: string;
+  }>;
+  codexProjectNames: string[];
+  directoryState: WorkspaceDirectoryState;
+  cleanupEligible: boolean;
 };
+
+export type WorkspaceCleanupCandidate = { path: string };
 
 export type WorkspaceCleanupReport = {
   scannedRoots: string[];
-  workspacePaths: Array<{
-    path: string;
-    activeCount: number;
-    archivedCount: number;
-  }>;
+  entries: WorkspacePathEntry[];
   candidates: WorkspaceCleanupCandidate[];
 };
 
@@ -217,6 +226,10 @@ export type WorkspaceCleanupResult = {
     originalPath: string;
     quarantinePath: string;
   }>;
+  removedCodexProjects: number;
+  removedThreadAssignments: number;
+  backupPath: string | null;
+  journalPath: string;
 };
 
 export type WorkspacePathCandidate = {

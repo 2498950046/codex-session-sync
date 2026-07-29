@@ -23,6 +23,7 @@ import type {
   WorkspaceCleanupReport,
   WorkspaceCleanupResult,
   WorkspaceMappingState,
+  WorkspacePathEntry,
   WorkspacePullPlan,
 } from "./types";
 
@@ -212,6 +213,18 @@ export default function App() {
   const busy = isActive(job) || remoteLoading;
   const canWrite = confirmedClosed && processes.length === 0 && isTauriRuntime;
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
+  const workspacePathEntries = useMemo<WorkspacePathEntry[]>(() => {
+    if (workspaceCleanupReport) return workspaceCleanupReport.entries;
+    return (workspaceMappingState?.mappings ?? []).map((mapping) => ({
+      path: mapping.localPrefix,
+      activeCount: 0,
+      archivedCount: 0,
+      mappings: [{ id: mapping.id, remotePrefix: mapping.remotePrefix }],
+      codexProjectNames: [],
+      directoryState: "unknown",
+      cleanupEligible: false,
+    }));
+  }, [workspaceCleanupReport, workspaceMappingState]);
   const selectedProfile = profiles.find((profile) => profile.id === selectedRemoteId) ?? null;
   const selectedNamespace = namespaces.find((namespace) => namespace.id === selectedNamespaceId) ?? null;
   const writeBlockedReason = busy
@@ -810,9 +823,7 @@ export default function App() {
       });
       setWorkspaceCleanupReport(cleanup);
       if (cleanup.candidates.length === 0) {
-        setWorkspaceCleanupMessage(cleanup.scannedRoots.length === 0
-          ? `已统计 ${cleanup.workspacePaths.length} 个会话项目路径；当前映射没有可安全检查的项目父目录。`
-          : `已统计 ${cleanup.workspacePaths.length} 个会话项目路径，没有发现无引用空目录。`);
+        setWorkspaceCleanupMessage(`已聚合 ${cleanup.entries.length} 个项目路径，没有发现可安全清理的空目录或残留 Codex 项目。`);
       }
     } catch (reason) {
       setError(String(reason));
@@ -823,8 +834,8 @@ export default function App() {
 
   async function cleanupWorkspaceDirectories(paths: string[]) {
     if (!selectedRemoteId || !selectedNamespaceId || busy || !canWrite || paths.length === 0) return;
-    const description = paths.length === 1 ? paths[0] : `${paths.length} 个目录`;
-    if (!window.confirm(`安全删除 ${description}？\n\n删除前会重新确认目录为空且没有映射或会话引用，随后移入可恢复隔离区。`)) return;
+    const description = paths.length === 1 ? paths[0] : `${paths.length} 个项目路径`;
+    if (!window.confirm(`安全清理 ${description}？\n\n操作会重新确认没有路径映射或活动/归档会话引用；空目录会移入可恢复隔离区，同时清除 Codex 左侧菜单中的残留项目记录。`)) return;
     setRemoteLoading(true);
     setError(null);
     setWorkspaceCleanupMessage(null);
@@ -846,7 +857,12 @@ export default function App() {
         namespaceId: selectedNamespaceId,
       });
       setWorkspaceCleanupReport(refreshed);
-      setWorkspaceCleanupMessage(`已安全删除 ${result.quarantined.length} 个空目录，内容保留在本地同步仓库的 quarantine/empty-workspaces。`);
+      const details = [
+        result.quarantined.length > 0 ? `隔离 ${result.quarantined.length} 个空目录` : null,
+        result.removedCodexProjects > 0 ? `清除 ${result.removedCodexProjects} 个 Codex 项目` : null,
+        result.removedThreadAssignments > 0 ? `移除 ${result.removedThreadAssignments} 条残留分配` : null,
+      ].filter(Boolean).join("，");
+      setWorkspaceCleanupMessage(`清理完成：${details}。备份和操作日志已保存，可在 Codex 完全关闭时恢复。`);
     } catch (reason) {
       setError(String(reason));
       await refreshProcesses();
@@ -1176,18 +1192,16 @@ export default function App() {
         </div>}
 
         {selectedNamespace && workspaceMappingState && <div className="workspace-mapping-console">
-          <div className="mapping-heading"><div><h3>项目路径</h3><p>拉取或切换时自动检查。原路径在本机可用或已有映射时不会处理；其余项目只需统一选择一次父目录。</p></div><div className="workspace-mapping-heading-actions"><span>{workspaceMappingState.mappings.length} 条本机规则</span><button type="button" className="secondary-button" onClick={() => void inspectWorkspaceCleanup()} disabled={busy}>扫描项目路径</button></div></div>
+          <div className="mapping-heading"><div><h3>项目路径</h3><p>将路径映射、活动/归档会话、Codex 左侧项目和空目录状态聚合显示；清理时会同时处理磁盘空目录与残留菜单记录。</p></div><div className="workspace-mapping-heading-actions"><span>{workspacePathEntries.length} 个路径</span><button type="button" className="secondary-button" onClick={() => void inspectWorkspaceCleanup()} disabled={busy}>刷新路径状态</button></div></div>
           {workspaceSetupMessage && <p className="success-copy workspace-setup-message">{workspaceSetupMessage}</p>}
           {workspaceCleanupMessage && <p className="success-copy workspace-setup-message">{workspaceCleanupMessage}</p>}
-          <div className="workspace-mapping-list">{workspaceMappingState.mappings.map((mapping) => <article key={mapping.id}><div><code>{mapping.remotePrefix}</code><span>→</span><code>{mapping.localPrefix}</code></div><button className="danger-button" onClick={() => void deleteWorkspaceMapping(mapping.id)} disabled={busy}>删除</button></article>)}{workspaceMappingState.mappings.length === 0 && !pendingWorkspaceSync && <p className="muted-copy">无需提前配置。首次拉取发现跨电脑路径时，应用会引导你批量设置。</p>}</div>
-          {workspaceCleanupReport && <div className="workspace-usage-results">
-            <div className="workspace-usage-heading"><div><strong>会话项目路径</strong><span>按本机路径统计活动及归档会话；缺失或空 rollout 的 SQLite 会话也会计入。</span></div><b>{workspaceCleanupReport.workspacePaths.length} 个路径</b></div>
-            {workspaceCleanupReport.workspacePaths.length > 0 ? <div className="workspace-usage-list">{workspaceCleanupReport.workspacePaths.map((usage) => <article key={usage.path}><code title={usage.path}>{usage.path}</code><div><span className="active-usage">活动 {usage.activeCount}</span><span className="archived-usage">归档 {usage.archivedCount}</span></div></article>)}</div> : <p className="muted-copy workspace-usage-empty">当前 Codex Home 没有记录会话项目路径。</p>}
-          </div>}
-          {workspaceCleanupReport && workspaceCleanupReport.candidates.length > 0 && <div className="workspace-cleanup-results">
-            <div className="workspace-cleanup-heading"><div><strong>发现 {workspaceCleanupReport.candidates.length} 个无引用空目录</strong><span>这些目录没有任何路径映射或活动/归档会话引用。删除操作会先重新校验，再移入可恢复隔离区。</span></div><button type="button" className="danger-button" onClick={() => void cleanupWorkspaceDirectories(workspaceCleanupReport.candidates.map((candidate) => candidate.path))} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>一键删除全部</button></div>
-            <div className="workspace-cleanup-list">{workspaceCleanupReport.candidates.map((candidate) => <article key={candidate.path}><code title={candidate.path}>{candidate.path}</code><button type="button" className="danger-button" onClick={() => void cleanupWorkspaceDirectories([candidate.path])} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>删除</button></article>)}</div>
-          </div>}
+          <div className="workspace-path-summary"><span>映射 {workspacePathEntries.filter((entry) => entry.mappings.length > 0).length}</span><span>Codex 项目 {workspacePathEntries.filter((entry) => entry.codexProjectNames.length > 0).length}</span><span>可清理 {workspaceCleanupReport?.candidates.length ?? 0}</span>{workspaceCleanupReport && workspaceCleanupReport.candidates.length > 0 && <button type="button" className="danger-button" onClick={() => void cleanupWorkspaceDirectories(workspaceCleanupReport.candidates.map((candidate) => candidate.path))} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>一键安全清理</button>}</div>
+          <div className="workspace-path-list">{workspacePathEntries.map((entry) => <article key={entry.path} className={entry.cleanupEligible ? "workspace-path-cleanable" : ""}>
+            <div className="workspace-path-main"><code title={entry.path}>{entry.path}</code><div className="workspace-path-badges">{entry.activeCount > 0 && <span className="active-usage">活动 {entry.activeCount}</span>}{entry.archivedCount > 0 && <span className="archived-usage">归档 {entry.archivedCount}</span>}{entry.codexProjectNames.length > 0 && <span className="codex-project-usage">Codex 项目</span>}{entry.directoryState === "empty" && <span className="empty-directory-usage">空目录</span>}{entry.directoryState === "missing" && <span className="missing-directory-usage">目录缺失</span>}{entry.directoryState === "notDirectory" && <span className="blocked-directory-usage">非普通目录</span>}{entry.directoryState === "unknown" && <span className="unknown-directory-usage">待扫描</span>}</div></div>
+            {entry.mappings.map((mapping) => <div className="workspace-path-mapping" key={mapping.id}><span><code>{mapping.remotePrefix}</code> → 当前路径</span><button type="button" className="danger-button" onClick={() => void deleteWorkspaceMapping(mapping.id)} disabled={busy}>删除映射</button></div>)}
+            {entry.codexProjectNames.length > 0 && <small>Codex 左侧项目：{entry.codexProjectNames.join("、")}</small>}
+            {entry.cleanupEligible && <button type="button" className="danger-button workspace-path-cleanup-button" onClick={() => void cleanupWorkspaceDirectories([entry.path])} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}>{entry.directoryState === "missing" ? "清理残留菜单" : entry.codexProjectNames.length > 0 ? "清理空目录和菜单" : "清理空目录"}</button>}
+          </article>)}{workspacePathEntries.length === 0 && <p className="muted-copy">没有项目路径记录。刷新后会聚合显示本机映射、会话路径和 Codex 左侧项目。</p>}</div>
           <details className="advanced-mapping">
             <summary>高级：手动添加根路径规则</summary>
             <div className="workspace-mapping-builder">

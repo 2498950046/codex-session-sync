@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sync_core::{
-    WorkspacePathMapper, WorkspacePathMapping, WorkspacePathUsage, codex_home_key,
-    scan_codex_home_workspace_usage,
+    WorkspacePathMapper, WorkspacePathMapping, codex_home_key, scan_codex_home_workspace_usage,
 };
 use uuid::Uuid;
 
@@ -16,6 +17,8 @@ const WORKSPACE_MAPPING_SCHEMA_VERSION: u32 = 1;
 const MAX_MAPPINGS: usize = 128;
 const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_CLEANUP_SCAN_ENTRIES: usize = 4096;
+const MAX_CODEX_GLOBAL_STATE_BYTES: u64 = 16 * 1024 * 1024;
+const WORKSPACE_CLEANUP_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -65,13 +68,41 @@ pub struct WorkspaceCleanupCandidate {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct WorkspaceCleanupReport {
-    pub scanned_roots: Vec<String>,
-    pub workspace_paths: Vec<WorkspacePathUsage>,
-    pub candidates: Vec<WorkspaceCleanupCandidate>,
+pub enum WorkspaceDirectoryState {
+    Missing,
+    Empty,
+    NonEmpty,
+    NotDirectory,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePathMappingSummary {
+    pub id: Uuid,
+    pub remote_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePathEntry {
+    pub path: String,
+    pub active_count: usize,
+    pub archived_count: usize,
+    pub mappings: Vec<WorkspacePathMappingSummary>,
+    pub codex_project_names: Vec<String>,
+    pub directory_state: WorkspaceDirectoryState,
+    pub cleanup_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCleanupReport {
+    pub scanned_roots: Vec<String>,
+    pub entries: Vec<WorkspacePathEntry>,
+    pub candidates: Vec<WorkspaceCleanupCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct QuarantinedWorkspaceDirectory {
     pub original_path: String,
@@ -82,6 +113,54 @@ pub struct QuarantinedWorkspaceDirectory {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceCleanupResult {
     pub quarantined: Vec<QuarantinedWorkspaceDirectory>,
+    pub removed_codex_projects: usize,
+    pub removed_thread_assignments: usize,
+    pub backup_path: Option<String>,
+    pub journal_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexProjectPath {
+    project_name: String,
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct CodexGlobalState {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    value: Value,
+    project_paths: Vec<CodexProjectPath>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceCleanupStatus {
+    Preparing,
+    BackedUp,
+    ProjectStateUpdated,
+    Completed,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCleanupJournal {
+    schema_version: u32,
+    operation_id: Uuid,
+    codex_home: PathBuf,
+    requested_paths: Vec<String>,
+    status: WorkspaceCleanupStatus,
+    global_state_path: Option<PathBuf>,
+    global_state_backup: Option<PathBuf>,
+    original_state_sha256: Option<String>,
+    updated_state_sha256: Option<String>,
+    planned_quarantines: Vec<QuarantinedWorkspaceDirectory>,
+    removed_codex_projects: usize,
+    removed_thread_assignments: usize,
+    created_at: String,
+    updated_at: String,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -191,28 +270,32 @@ impl WorkspaceMappingStore {
     ) -> Result<WorkspaceCleanupReport> {
         let codex_home_key = codex_home_key(codex_home)?;
         let file = self.load()?;
+        let global_state = load_codex_global_state(codex_home)?;
+        let workspace_paths = scan_codex_home_workspace_usage(codex_home)?;
+        let scoped_mappings = file
+            .mappings
+            .iter()
+            .filter(|mapping| {
+                mapping.remote_id == remote_id
+                    && mapping.namespace_id == namespace_id
+                    && mapping.codex_home_key == codex_home_key
+            })
+            .collect::<Vec<_>>();
         let mut scan_roots = BTreeMap::<String, PathBuf>::new();
-        for mapping in file.mappings.iter().filter(|mapping| {
-            mapping.remote_id == remote_id
-                && mapping.namespace_id == namespace_id
-                && mapping.codex_home_key == codex_home_key
-        }) {
-            let Some(parent) = Path::new(&mapping.local_prefix).parent() else {
-                continue;
-            };
-            if parent.as_os_str().is_empty() || parent.parent().is_none() || !parent.is_dir() {
-                continue;
-            }
-            let root = fs::canonicalize(parent).with_context(|| {
-                format!("failed to normalize workspace parent {}", parent.display())
-            })?;
-            scan_roots
-                .entry(normalize_path_for_match(&root.to_string_lossy()))
-                .or_insert(root);
+        for path in scoped_mappings
+            .iter()
+            .map(|mapping| mapping.local_prefix.as_str())
+            .chain(global_state.as_ref().into_iter().flat_map(|state| {
+                state
+                    .project_paths
+                    .iter()
+                    .map(|project| project.path.as_str())
+            }))
+        {
+            insert_cleanup_scan_root(&mut scan_roots, Path::new(path))?;
         }
 
         let repository_root = self.repository_root()?;
-        let workspace_paths = scan_codex_home_workspace_usage(codex_home)?;
         let mut protected_paths = file
             .mappings
             .iter()
@@ -224,7 +307,38 @@ impl WorkspaceMappingStore {
             protected_paths.insert(normalize_path_for_match(&usage.path));
         }
 
-        let mut candidates = BTreeMap::<String, WorkspaceCleanupCandidate>::new();
+        let mut entries = BTreeMap::<String, WorkspacePathEntry>::new();
+        for mapping in scoped_mappings {
+            let entry = workspace_path_entry(&mut entries, &mapping.local_prefix);
+            entry.mappings.push(WorkspacePathMappingSummary {
+                id: mapping.id,
+                remote_prefix: mapping.remote_prefix.clone(),
+            });
+        }
+        for usage in workspace_paths {
+            let entry = workspace_path_entry(&mut entries, &usage.path);
+            entry.active_count += usage.active_count;
+            entry.archived_count += usage.archived_count;
+        }
+        let project_path_identities = global_state
+            .as_ref()
+            .map(|state| {
+                state
+                    .project_paths
+                    .iter()
+                    .map(|project| normalize_path_for_match(&project.path))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(state) = &global_state {
+            for project in &state.project_paths {
+                let entry = workspace_path_entry(&mut entries, &project.path);
+                if !entry.codex_project_names.contains(&project.project_name) {
+                    entry.codex_project_names.push(project.project_name.clone());
+                }
+            }
+        }
+
         for root in scan_roots.values() {
             let mut entry_count = 0_usize;
             for entry in fs::read_dir(root)
@@ -246,29 +360,44 @@ impl WorkspaceMappingStore {
                 if path.parent() != Some(root.as_path()) || !directory_is_empty(&path)? {
                     continue;
                 }
-                let normalized = normalize_path_for_match(&path.to_string_lossy());
-                if protected_paths
-                    .iter()
-                    .any(|protected| paths_overlap(&normalized, protected))
-                {
-                    continue;
-                }
-                candidates.insert(
-                    normalized,
-                    WorkspaceCleanupCandidate {
-                        path: display_workspace_path(&path),
-                    },
-                );
+                workspace_path_entry(&mut entries, &display_workspace_path(&path));
             }
         }
+
+        for (identity, entry) in &mut entries {
+            entry.directory_state = workspace_directory_state(Path::new(&entry.path))?;
+            let protected = protected_paths
+                .iter()
+                .any(|protected| paths_overlap(identity, protected));
+            let overlaps_other_project = project_path_identities
+                .iter()
+                .any(|project| project != identity && paths_overlap(identity, project));
+            let removable_directory = entry.directory_state == WorkspaceDirectoryState::Empty;
+            let removable_missing_project = entry.directory_state
+                == WorkspaceDirectoryState::Missing
+                && !entry.codex_project_names.is_empty();
+            entry.cleanup_eligible = entry.active_count == 0
+                && entry.archived_count == 0
+                && entry.mappings.is_empty()
+                && !protected
+                && !overlaps_other_project
+                && (removable_directory || removable_missing_project);
+        }
+        let candidates = entries
+            .values()
+            .filter(|entry| entry.cleanup_eligible)
+            .map(|entry| WorkspaceCleanupCandidate {
+                path: entry.path.clone(),
+            })
+            .collect();
 
         Ok(WorkspaceCleanupReport {
             scanned_roots: scan_roots
                 .into_values()
                 .map(|path| display_workspace_path(&path))
                 .collect(),
-            workspace_paths,
-            candidates: candidates.into_values().collect(),
+            entries: entries.into_values().collect(),
+            candidates,
         })
     }
 
@@ -286,60 +415,157 @@ impl WorkspaceMappingStore {
             bail!("workspace cleanup exceeds the {MAX_MAPPINGS} path safety limit");
         }
 
+        let repository_root = self.repository_root()?;
+        recover_incomplete_workspace_cleanups(&repository_root, codex_home)?;
         let report = self.cleanup_report(codex_home, remote_id, namespace_id)?;
         let available = report
-            .candidates
+            .entries
             .into_iter()
-            .map(|candidate| (normalize_path_for_match(&candidate.path), candidate.path))
+            .filter(|entry| entry.cleanup_eligible)
+            .map(|entry| (normalize_path_for_match(&entry.path), entry))
             .collect::<BTreeMap<_, _>>();
-        let mut selected = Vec::with_capacity(requested_paths.len());
+        let mut selected = Vec::<WorkspacePathEntry>::with_capacity(requested_paths.len());
         let mut seen = BTreeSet::new();
         for requested in requested_paths {
             let normalized = normalize_path_for_match(requested.trim());
             if !seen.insert(normalized.clone()) {
                 bail!("workspace cleanup request contains duplicate paths");
             }
-            let path = available.get(&normalized).with_context(|| {
+            let entry = available.get(&normalized).with_context(|| {
                 format!(
-                    "workspace cleanup path is no longer an unreferenced empty directory: {}",
+                    "workspace cleanup path is no longer an unreferenced empty or missing Codex project: {}",
                     requested.trim()
                 )
             })?;
-            selected.push(PathBuf::from(path));
+            selected.push(entry.clone());
         }
 
-        let quarantine_root = self
-            .repository_root()?
-            .join("quarantine")
-            .join("empty-workspaces");
-        fs::create_dir_all(&quarantine_root).with_context(|| {
-            format!(
-                "failed to create workspace quarantine {}",
-                quarantine_root.display()
-            )
-        })?;
-        let mut quarantined = Vec::<QuarantinedWorkspaceDirectory>::new();
-        for original in selected {
+        let operation_id = Uuid::now_v7();
+        let quarantine_root = repository_root.join("quarantine").join("empty-workspaces");
+        let mut planned_quarantines = Vec::new();
+        for (index, entry) in selected.iter().enumerate() {
+            if entry.directory_state != WorkspaceDirectoryState::Empty {
+                continue;
+            }
+            let original = PathBuf::from(&entry.path);
             let name = original
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("workspace");
-            let quarantine = quarantine_root.join(format!("{}-{name}", Uuid::now_v7()));
-            if let Err(error) = move_empty_directory(&original, &quarantine) {
-                for moved in quarantined.iter().rev() {
-                    let _ = move_empty_directory(
-                        Path::new(&moved.quarantine_path),
-                        Path::new(&moved.original_path),
-                    );
-                }
-                return Err(error);
-            }
-            quarantined.push(QuarantinedWorkspaceDirectory {
+            let quarantine = quarantine_root.join(format!("{operation_id}-{index}-{name}"));
+            planned_quarantines.push(QuarantinedWorkspaceDirectory {
                 original_path: display_workspace_path(&original),
                 quarantine_path: display_workspace_path(&quarantine),
             });
         }
-        Ok(WorkspaceCleanupResult { quarantined })
+
+        let selected_identities = selected
+            .iter()
+            .map(|entry| normalize_path_for_match(&entry.path))
+            .collect::<BTreeSet<_>>();
+        let global_state = load_codex_global_state(codex_home)?;
+        let mut updated_state = None;
+        let mut removed_codex_projects = 0;
+        let mut removed_thread_assignments = 0;
+        if let Some(state) = &global_state {
+            let mut value = state.value.clone();
+            let result = remove_codex_project_paths(&mut value, &selected_identities)?;
+            removed_codex_projects = result.removed_projects;
+            removed_thread_assignments = result.removed_assignments;
+            if result.changed {
+                updated_state = Some(serde_json::to_vec(&value)?);
+            }
+        }
+
+        if planned_quarantines.is_empty() && updated_state.is_none() {
+            bail!("workspace cleanup no longer has any directory or Codex project state to change");
+        }
+
+        let journal_dir = repository_root.join("journal");
+        let backup_dir = repository_root
+            .join("backups")
+            .join(format!("workspace-cleanup-{operation_id}"));
+        let journal_path = journal_dir.join(format!("workspace-cleanup-{operation_id}.json"));
+        let global_state_backup = global_state
+            .as_ref()
+            .filter(|_| updated_state.is_some())
+            .map(|_| backup_dir.join("codex-global-state.json"));
+        let now = Utc::now().to_rfc3339();
+        let mut journal = WorkspaceCleanupJournal {
+            schema_version: WORKSPACE_CLEANUP_JOURNAL_SCHEMA_VERSION,
+            operation_id,
+            codex_home: codex_home.to_path_buf(),
+            requested_paths: selected.iter().map(|entry| entry.path.clone()).collect(),
+            status: WorkspaceCleanupStatus::Preparing,
+            global_state_path: global_state.as_ref().map(|state| state.path.clone()),
+            global_state_backup: global_state_backup.clone(),
+            original_state_sha256: global_state
+                .as_ref()
+                .filter(|_| updated_state.is_some())
+                .map(|state| sha256_bytes(&state.bytes)),
+            updated_state_sha256: updated_state.as_ref().map(|bytes| sha256_bytes(bytes)),
+            planned_quarantines: planned_quarantines.clone(),
+            removed_codex_projects,
+            removed_thread_assignments,
+            created_at: now.clone(),
+            updated_at: now,
+            error: None,
+        };
+        write_workspace_cleanup_journal(&journal_path, &journal)?;
+
+        let result = (|| -> Result<()> {
+            if let (Some(state), Some(backup)) = (&global_state, &global_state_backup) {
+                write_new_file(backup, &state.bytes)?;
+            }
+            journal.status = WorkspaceCleanupStatus::BackedUp;
+            journal.updated_at = Utc::now().to_rfc3339();
+            write_workspace_cleanup_journal(&journal_path, &journal)?;
+
+            if let (Some(state), Some(bytes)) = (&global_state, &updated_state) {
+                replace_file_if_hash_matches(
+                    &state.path,
+                    journal.original_state_sha256.as_deref().unwrap_or_default(),
+                    bytes,
+                )?;
+            }
+            journal.status = WorkspaceCleanupStatus::ProjectStateUpdated;
+            journal.updated_at = Utc::now().to_rfc3339();
+            write_workspace_cleanup_journal(&journal_path, &journal)?;
+
+            fs::create_dir_all(&quarantine_root).with_context(|| {
+                format!(
+                    "failed to create workspace quarantine {}",
+                    quarantine_root.display()
+                )
+            })?;
+            for planned in &planned_quarantines {
+                move_empty_directory(
+                    Path::new(&planned.original_path),
+                    Path::new(&planned.quarantine_path),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            journal.error = Some(format!("{error:#}"));
+            if let Err(rollback_error) = rollback_workspace_cleanup(&journal_path, &mut journal) {
+                return Err(error.context(format!(
+                    "workspace cleanup rollback also failed: {rollback_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+
+        journal.status = WorkspaceCleanupStatus::Completed;
+        journal.updated_at = Utc::now().to_rfc3339();
+        write_workspace_cleanup_journal(&journal_path, &journal)?;
+        Ok(WorkspaceCleanupResult {
+            quarantined: planned_quarantines,
+            removed_codex_projects,
+            removed_thread_assignments,
+            backup_path: global_state_backup.map(|path| display_workspace_path(&path)),
+            journal_path: display_workspace_path(&journal_path),
+        })
     }
 
     pub fn create_automatic(
@@ -656,6 +882,435 @@ fn path_is_same_or_child(path: &str, parent: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn insert_cleanup_scan_root(
+    scan_roots: &mut BTreeMap<String, PathBuf>,
+    workspace_path: &Path,
+) -> Result<()> {
+    let Some(parent) = workspace_path.parent() else {
+        return Ok(());
+    };
+    if parent.as_os_str().is_empty() || parent.parent().is_none() || !parent.is_dir() {
+        return Ok(());
+    }
+    let root = fs::canonicalize(parent)
+        .with_context(|| format!("failed to normalize workspace parent {}", parent.display()))?;
+    scan_roots
+        .entry(normalize_path_for_match(&root.to_string_lossy()))
+        .or_insert(root);
+    Ok(())
+}
+
+fn workspace_path_entry<'a>(
+    entries: &'a mut BTreeMap<String, WorkspacePathEntry>,
+    path: &str,
+) -> &'a mut WorkspacePathEntry {
+    let display = display_workspace_path(Path::new(path.trim()));
+    let identity = normalize_path_for_match(&display);
+    entries
+        .entry(identity)
+        .or_insert_with(|| WorkspacePathEntry {
+            path: display,
+            active_count: 0,
+            archived_count: 0,
+            mappings: Vec::new(),
+            codex_project_names: Vec::new(),
+            directory_state: WorkspaceDirectoryState::Missing,
+            cleanup_eligible: false,
+        })
+}
+
+fn workspace_directory_state(path: &Path) -> Result<WorkspaceDirectoryState> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(WorkspaceDirectoryState::Missing);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect workspace path {}", path.display()));
+        }
+    };
+    if !metadata.is_dir() || is_symlink_or_reparse_point(&metadata) {
+        return Ok(WorkspaceDirectoryState::NotDirectory);
+    }
+    if directory_is_empty(path)? {
+        Ok(WorkspaceDirectoryState::Empty)
+    } else {
+        Ok(WorkspaceDirectoryState::NonEmpty)
+    }
+}
+
+fn load_codex_global_state(codex_home: &Path) -> Result<Option<CodexGlobalState>> {
+    let path = codex_home.join(".codex-global-state.json");
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect Codex global state {}", path.display())
+            });
+        }
+    };
+    if !metadata.is_file() {
+        bail!(
+            "Codex global state is not a regular file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_CODEX_GLOBAL_STATE_BYTES {
+        bail!("Codex global state exceeds the {MAX_CODEX_GLOBAL_STATE_BYTES} byte safety limit");
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to read Codex global state {}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse Codex global state {}", path.display()))?;
+    let object = value
+        .as_object()
+        .context("Codex global state is not a JSON object")?;
+    let mut project_paths = Vec::new();
+    if let Some(projects) = object.get("local-projects") {
+        let projects = projects
+            .as_object()
+            .context("Codex global state local-projects field is not an object")?;
+        for (project_id, project) in projects {
+            let project = project
+                .as_object()
+                .with_context(|| format!("Codex project {project_id} is not an object"))?;
+            let name = project
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(project_id);
+            let Some(root_paths) = project.get("rootPaths") else {
+                continue;
+            };
+            let root_paths = root_paths
+                .as_array()
+                .with_context(|| format!("Codex project {project_id} rootPaths is not an array"))?;
+            for root in root_paths {
+                let root = root.as_str().with_context(|| {
+                    format!("Codex project {project_id} contains a non-string root path")
+                })?;
+                if !root.trim().is_empty() {
+                    project_paths.push(CodexProjectPath {
+                        project_name: name.to_string(),
+                        path: display_workspace_path(Path::new(root)),
+                    });
+                }
+            }
+        }
+    }
+    Ok(Some(CodexGlobalState {
+        path,
+        bytes,
+        value,
+        project_paths,
+    }))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CodexProjectCleanupResult {
+    changed: bool,
+    removed_projects: usize,
+    removed_assignments: usize,
+}
+
+fn remove_codex_project_paths(
+    state: &mut Value,
+    selected_paths: &BTreeSet<String>,
+) -> Result<CodexProjectCleanupResult> {
+    let state = state
+        .as_object_mut()
+        .context("Codex global state is not a JSON object")?;
+    let mut result = CodexProjectCleanupResult::default();
+    let mut removed_project_ids = BTreeSet::new();
+
+    if let Some(projects) = state.get_mut("local-projects") {
+        let projects = projects
+            .as_object_mut()
+            .context("Codex global state local-projects field is not an object")?;
+        let project_ids = projects.keys().cloned().collect::<Vec<_>>();
+        for project_id in project_ids {
+            let project = projects
+                .get_mut(&project_id)
+                .and_then(Value::as_object_mut)
+                .with_context(|| format!("Codex project {project_id} is not an object"))?;
+            let Some(root_paths) = project.get_mut("rootPaths") else {
+                continue;
+            };
+            let root_paths = root_paths
+                .as_array_mut()
+                .with_context(|| format!("Codex project {project_id} rootPaths is not an array"))?;
+            let before = root_paths.len();
+            root_paths.retain(|path| {
+                path.as_str()
+                    .is_none_or(|path| !selected_paths.contains(&normalize_path_for_match(path)))
+            });
+            result.changed |= root_paths.len() != before;
+            if before > 0 && root_paths.is_empty() {
+                removed_project_ids.insert(project_id);
+            }
+        }
+        for project_id in &removed_project_ids {
+            projects.remove(project_id);
+        }
+    }
+    result.removed_projects = removed_project_ids.len();
+
+    for key in ["active-workspace-roots", "electron-saved-workspace-roots"] {
+        if let Some(paths) = state.get_mut(key) {
+            let paths = paths
+                .as_array_mut()
+                .with_context(|| format!("Codex global state {key} field is not an array"))?;
+            let before = paths.len();
+            paths.retain(|path| {
+                path.as_str()
+                    .is_none_or(|path| !selected_paths.contains(&normalize_path_for_match(path)))
+            });
+            result.changed |= paths.len() != before;
+        }
+    }
+    if let Some(order) = state.get_mut("project-order") {
+        let order = order
+            .as_array_mut()
+            .context("Codex global state project-order field is not an array")?;
+        let before = order.len();
+        order.retain(|project_id| {
+            project_id
+                .as_str()
+                .is_none_or(|project_id| !removed_project_ids.contains(project_id))
+        });
+        result.changed |= order.len() != before;
+    }
+    if state
+        .get("selected-project")
+        .and_then(Value::as_object)
+        .and_then(|selected| selected.get("projectId"))
+        .and_then(Value::as_str)
+        .is_some_and(|project_id| removed_project_ids.contains(project_id))
+    {
+        state.remove("selected-project");
+        result.changed = true;
+    }
+    if let Some(assignments) = state.get_mut("thread-project-assignments") {
+        let assignments = assignments
+            .as_object_mut()
+            .context("Codex global state thread-project-assignments field is not an object")?;
+        let before = assignments.len();
+        assignments.retain(|_, assignment| {
+            let project_removed = assignment
+                .get("projectId")
+                .and_then(Value::as_str)
+                .is_some_and(|project_id| removed_project_ids.contains(project_id));
+            let path_removed = assignment
+                .get("cwd")
+                .and_then(Value::as_str)
+                .is_some_and(|path| {
+                    selected_paths
+                        .iter()
+                        .any(|selected| path_is_same_or_child(path, selected))
+                });
+            !project_removed && !path_removed
+        });
+        result.removed_assignments = before - assignments.len();
+        result.changed |= result.removed_assignments > 0;
+    }
+    if let Some(hints) = state.get_mut("thread-workspace-root-hints") {
+        let hints = hints
+            .as_object_mut()
+            .context("Codex global state thread-workspace-root-hints field is not an object")?;
+        let before = hints.len();
+        hints.retain(|_, path| {
+            path.as_str().is_none_or(|path| {
+                !selected_paths
+                    .iter()
+                    .any(|selected| path_is_same_or_child(path, selected))
+            })
+        });
+        result.changed |= hints.len() != before;
+    }
+    if let Some(writable_roots) = state.get_mut("thread-writable-roots") {
+        let writable_roots = writable_roots
+            .as_object_mut()
+            .context("Codex global state thread-writable-roots field is not an object")?;
+        for roots in writable_roots.values_mut() {
+            let roots = roots
+                .as_array_mut()
+                .context("Codex thread writable roots entry is not an array")?;
+            let before = roots.len();
+            roots.retain(|path| {
+                path.as_str().is_none_or(|path| {
+                    !selected_paths
+                        .iter()
+                        .any(|selected| path_is_same_or_child(path, selected))
+                })
+            });
+            result.changed |= roots.len() != before;
+        }
+    }
+    Ok(result)
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to create backup file {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn replace_file_if_hash_matches(path: &Path, expected_sha256: &str, bytes: &[u8]) -> Result<()> {
+    let live = fs::read(path)
+        .with_context(|| format!("failed to read file before replacement {}", path.display()))?;
+    let actual = sha256_bytes(&live);
+    if actual != expected_sha256 {
+        bail!(
+            "file changed while workspace cleanup was preparing: {}",
+            path.display()
+        );
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}.workspace-cleanup-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("codex-global-state"),
+        Uuid::now_v7()
+    ));
+    write_new_file(&temporary, bytes)?;
+    fs::remove_file(path)?;
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    let installed = fs::read(path)?;
+    if sha256_bytes(&installed) != sha256_bytes(bytes) {
+        bail!("workspace cleanup replacement failed validation");
+    }
+    Ok(())
+}
+
+fn write_workspace_cleanup_journal(path: &Path, journal: &WorkspaceCleanupJournal) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary =
+        path.with_file_name(format!(".workspace-cleanup-journal-{}.tmp", Uuid::now_v7()));
+    write_new_file(&temporary, &serde_json::to_vec_pretty(journal)?)?;
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+fn recover_incomplete_workspace_cleanups(repository_root: &Path, codex_home: &Path) -> Result<()> {
+    let journal_dir = repository_root.join("journal");
+    let entries = match fs::read_dir(&journal_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("failed to inspect workspace cleanup journals"),
+    };
+    let target_home = normalize_path_for_match(&codex_home.to_string_lossy());
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("workspace-cleanup-") || !name.ends_with(".json") {
+            continue;
+        }
+        let mut journal: WorkspaceCleanupJournal =
+            serde_json::from_reader(BufReader::new(File::open(&path)?)).with_context(|| {
+                format!(
+                    "failed to read workspace cleanup journal {}",
+                    path.display()
+                )
+            })?;
+        if journal.schema_version != WORKSPACE_CLEANUP_JOURNAL_SCHEMA_VERSION {
+            bail!("unsupported workspace cleanup journal schema version");
+        }
+        if normalize_path_for_match(&journal.codex_home.to_string_lossy()) != target_home
+            || matches!(
+                journal.status,
+                WorkspaceCleanupStatus::Completed | WorkspaceCleanupStatus::RolledBack
+            )
+        {
+            continue;
+        }
+        rollback_workspace_cleanup(&path, &mut journal)?;
+    }
+    Ok(())
+}
+
+fn rollback_workspace_cleanup(
+    journal_path: &Path,
+    journal: &mut WorkspaceCleanupJournal,
+) -> Result<()> {
+    for planned in journal.planned_quarantines.iter().rev() {
+        let original = Path::new(&planned.original_path);
+        let quarantine = Path::new(&planned.quarantine_path);
+        if quarantine.exists() && !original.exists() {
+            if let Some(parent) = original.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to recreate workspace parent during rollback {}",
+                        parent.display()
+                    )
+                })?;
+            }
+            move_empty_directory(quarantine, original)?;
+        } else if quarantine.exists() && original.exists() {
+            bail!(
+                "cannot roll back workspace cleanup because both paths exist: {} and {}",
+                original.display(),
+                quarantine.display()
+            );
+        }
+    }
+    if let (Some(live), Some(backup), Some(original_hash), Some(updated_hash)) = (
+        journal.global_state_path.as_deref(),
+        journal.global_state_backup.as_deref(),
+        journal.original_state_sha256.as_deref(),
+        journal.updated_state_sha256.as_deref(),
+    ) {
+        let backup_bytes = fs::read(backup).with_context(|| {
+            format!(
+                "failed to read workspace cleanup backup {}",
+                backup.display()
+            )
+        })?;
+        if sha256_bytes(&backup_bytes) != original_hash {
+            bail!("workspace cleanup global-state backup failed hash validation");
+        }
+        match fs::read(live) {
+            Ok(live_bytes) if sha256_bytes(&live_bytes) == original_hash => {}
+            Ok(live_bytes) if sha256_bytes(&live_bytes) == updated_hash => {
+                replace_file_if_hash_matches(live, updated_hash, &backup_bytes)?;
+            }
+            Ok(_) => bail!(
+                "Codex global state changed after workspace cleanup; refusing rollback overwrite"
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                write_new_file(live, &backup_bytes)?;
+            }
+            Err(error) => return Err(error).context("failed to inspect Codex global state"),
+        }
+    }
+    journal.status = WorkspaceCleanupStatus::RolledBack;
+    journal.updated_at = Utc::now().to_rfc3339();
+    write_workspace_cleanup_journal(journal_path, journal)?;
+    Ok(())
+}
+
 fn paths_overlap(left: &str, right: &str) -> bool {
     path_is_same_or_child(left, right) || path_is_same_or_child(right, left)
 }
@@ -879,6 +1534,7 @@ fn validate_rule(mapping: &WorkspaceMappingRule) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
@@ -1132,9 +1788,17 @@ mod tests {
         let report = store
             .cleanup_report(&codex_home, remote_id, namespace_id)
             .unwrap();
-        assert_eq!(report.workspace_paths.len(), 1);
-        assert_eq!(report.workspace_paths[0].active_count, 0);
-        assert_eq!(report.workspace_paths[0].archived_count, 1);
+        let referenced_entry = report
+            .entries
+            .iter()
+            .find(|entry| {
+                normalize_path_for_match(&entry.path)
+                    == normalize_path_for_match(&referenced.to_string_lossy())
+            })
+            .unwrap();
+        assert_eq!(referenced_entry.active_count, 0);
+        assert_eq!(referenced_entry.archived_count, 1);
+        assert!(!referenced_entry.cleanup_eligible);
         assert_eq!(report.candidates.len(), 1);
         assert_eq!(
             normalize_path_for_match(&report.candidates[0].path),
@@ -1203,5 +1867,242 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("no longer"));
         assert!(stale.join("appeared.txt").is_file());
+    }
+
+    #[test]
+    fn cleanup_aggregates_mappings_sessions_projects_and_removes_stale_codex_menu_state() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let codex_home = directory.path().join("codex-home");
+        let history = directory.path().join("history");
+        let referenced = history.join("cpa");
+        let stale = history.join("cpa-3");
+        let missing = history.join("do-c-2");
+        for path in [&repository, &codex_home, &referenced, &stale] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let database = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        database
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)",
+                [],
+            )
+            .unwrap();
+        database
+            .execute(
+                "INSERT INTO threads (id, cwd, archived) VALUES
+                    ('active', ?1, 0),
+                    ('archived', ?1, 1)",
+                [referenced.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(database);
+        let global_state_path = codex_home.join(".codex-global-state.json");
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&json!({
+                "active-workspace-roots": [stale],
+                "electron-saved-workspace-roots": [referenced, stale, missing],
+                "local-projects": {
+                    "project-cpa": { "id": "project-cpa", "name": "cpa", "rootPaths": [referenced] },
+                    "project-stale": { "id": "project-stale", "name": "cpa-3", "rootPaths": [stale] },
+                    "project-missing": { "id": "project-missing", "name": "do-c-2", "rootPaths": [missing] }
+                },
+                "project-order": ["project-cpa", "project-stale", "project-missing"],
+                "selected-project": { "type": "local", "projectId": "project-stale" },
+                "thread-project-assignments": {
+                    "stale-thread": { "projectId": "project-stale", "cwd": stale },
+                    "missing-thread": { "projectId": "project-missing", "cwd": missing }
+                },
+                "thread-workspace-root-hints": {
+                    "stale-thread": stale,
+                    "missing-thread": missing
+                },
+                "thread-writable-roots": {
+                    "stale-thread": [stale],
+                    "missing-thread": [missing]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let remote_id = Uuid::now_v7();
+        let namespace_id = Uuid::now_v7();
+        let store = WorkspaceMappingStore::new(&repository);
+        store
+            .create(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                "D:/projects/cpa".to_string(),
+                referenced.to_string_lossy().into_owned(),
+            )
+            .unwrap();
+
+        let report = store
+            .cleanup_report(&codex_home, remote_id, namespace_id)
+            .unwrap();
+        let referenced_entry = report
+            .entries
+            .iter()
+            .find(|entry| path_is_same_or_child(&entry.path, &referenced.to_string_lossy()))
+            .unwrap();
+        assert_eq!(referenced_entry.active_count, 1);
+        assert_eq!(referenced_entry.archived_count, 1);
+        assert_eq!(referenced_entry.mappings.len(), 1);
+        assert_eq!(referenced_entry.codex_project_names, vec!["cpa"]);
+        assert!(!referenced_entry.cleanup_eligible);
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report.candidates.iter().any(|candidate| {
+            normalize_path_for_match(&candidate.path)
+                == normalize_path_for_match(&stale.to_string_lossy())
+        }));
+        assert!(report.candidates.iter().any(|candidate| {
+            normalize_path_for_match(&candidate.path)
+                == normalize_path_for_match(&missing.to_string_lossy())
+        }));
+
+        let result = store
+            .quarantine_empty_directories(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                report
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.path.clone())
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(result.quarantined.len(), 1);
+        assert_eq!(result.removed_codex_projects, 2);
+        assert_eq!(result.removed_thread_assignments, 2);
+        assert!(
+            result
+                .backup_path
+                .as_ref()
+                .is_some_and(|path| Path::new(path).is_file())
+        );
+        assert!(Path::new(&result.journal_path).is_file());
+        assert!(!stale.exists());
+        assert!(!missing.exists());
+
+        let state: Value = serde_json::from_slice(&fs::read(global_state_path).unwrap()).unwrap();
+        let projects = state["local-projects"].as_object().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert!(projects.contains_key("project-cpa"));
+        assert_eq!(state["project-order"], json!(["project-cpa"]));
+        assert_eq!(state["electron-saved-workspace-roots"], json!([referenced]));
+        assert!(state.get("selected-project").is_none());
+        assert!(
+            state["thread-project-assignments"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state["thread-workspace-root-hints"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            state["thread-writable-roots"]["stale-thread"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .cleanup_report(&codex_home, remote_id, namespace_id)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn project_state_cleanup_preserves_a_multi_root_project_with_an_unselected_root() {
+        let mut state = json!({
+            "local-projects": {
+                "multi": { "rootPaths": ["F:/history/stale", "F:/history/keep"] }
+            },
+            "project-order": ["multi"],
+            "thread-project-assignments": {},
+            "electron-saved-workspace-roots": ["F:/history/stale", "F:/history/keep"]
+        });
+        let selected = BTreeSet::from([normalize_path_for_match("F:/history/stale")]);
+
+        let result = remove_codex_project_paths(&mut state, &selected).unwrap();
+
+        assert!(result.changed);
+        assert_eq!(result.removed_projects, 0);
+        assert_eq!(
+            state["local-projects"]["multi"]["rootPaths"],
+            json!(["F:/history/keep"])
+        );
+        assert_eq!(state["project-order"], json!(["multi"]));
+    }
+
+    #[test]
+    fn incomplete_workspace_cleanup_restores_project_state_and_quarantined_directory() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let codex_home = directory.path().join("codex-home");
+        let original = directory.path().join("history/stale");
+        let quarantine = repository.join("quarantine/empty-workspaces/stale");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::create_dir_all(&quarantine).unwrap();
+        let live = codex_home.join(".codex-global-state.json");
+        let original_bytes = serde_json::to_vec(&json!({
+            "local-projects": { "stale": { "rootPaths": [original] } }
+        }))
+        .unwrap();
+        let updated_bytes = serde_json::to_vec(&json!({ "local-projects": {} })).unwrap();
+        fs::write(&live, &updated_bytes).unwrap();
+        let operation_id = Uuid::now_v7();
+        let backup = repository
+            .join("backups")
+            .join(format!("workspace-cleanup-{operation_id}"))
+            .join("codex-global-state.json");
+        write_new_file(&backup, &original_bytes).unwrap();
+        let journal_path = repository
+            .join("journal")
+            .join(format!("workspace-cleanup-{operation_id}.json"));
+        let now = Utc::now().to_rfc3339();
+        write_workspace_cleanup_journal(
+            &journal_path,
+            &WorkspaceCleanupJournal {
+                schema_version: WORKSPACE_CLEANUP_JOURNAL_SCHEMA_VERSION,
+                operation_id,
+                codex_home: codex_home.clone(),
+                requested_paths: vec![display_workspace_path(&original)],
+                status: WorkspaceCleanupStatus::ProjectStateUpdated,
+                global_state_path: Some(live.clone()),
+                global_state_backup: Some(backup),
+                original_state_sha256: Some(sha256_bytes(&original_bytes)),
+                updated_state_sha256: Some(sha256_bytes(&updated_bytes)),
+                planned_quarantines: vec![QuarantinedWorkspaceDirectory {
+                    original_path: display_workspace_path(&original),
+                    quarantine_path: display_workspace_path(&quarantine),
+                }],
+                removed_codex_projects: 1,
+                removed_thread_assignments: 0,
+                created_at: now.clone(),
+                updated_at: now,
+                error: None,
+            },
+        )
+        .unwrap();
+
+        recover_incomplete_workspace_cleanups(&repository, &codex_home).unwrap();
+
+        assert_eq!(fs::read(live).unwrap(), original_bytes);
+        assert!(original.is_dir());
+        assert!(!quarantine.exists());
+        let journal: WorkspaceCleanupJournal =
+            serde_json::from_reader(File::open(journal_path).unwrap()).unwrap();
+        assert_eq!(journal.status, WorkspaceCleanupStatus::RolledBack);
     }
 }
