@@ -1,17 +1,31 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import { HashRouter } from "./router";
 import App from "./App";
+import { ThemeProvider } from "./theme";
 import "./styles.css";
 
 async function bootstrap() {
   const preview = new URLSearchParams(window.location.search).get("preview");
-  if (import.meta.env.DEV && (preview === "conflict" || preview === "mapping")) {
+  if (!window.location.hash) {
+    const lastRoute = window.localStorage.getItem("codex-session-sync.last-route");
+    const previewRoute = preview === "mapping" ? "/advanced/automatic"
+      : preview === "conflict" || preview === "job" || preview === "failure" ? "/sync"
+        : preview === "empty" || preview === "process-running" || preview === "ready" ? "/overview"
+          : null;
+    window.location.hash = previewRoute ?? (lastRoute?.startsWith("/") ? lastRoute : "/overview");
+  }
+  if (import.meta.env.DEV && ["ready", "empty", "process-running", "job", "mapping", "conflict", "failure"].includes(preview ?? "")) {
     const { installDevelopmentPreview } = await import("./dev-conflict-preview");
-    await installDevelopmentPreview(preview);
+    await installDevelopmentPreview(preview as "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure");
   }
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
-      <App />
+      <ThemeProvider>
+        <HashRouter>
+          <App />
+        </HashRouter>
+      </ThemeProvider>
     </StrictMode>,
   );
 }

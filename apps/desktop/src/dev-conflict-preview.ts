@@ -125,7 +125,7 @@ const namespaceMappingState: NamespaceMappingState = {
   },
 };
 
-export async function installDevelopmentPreview(_preview: "conflict" | "mapping") {
+export async function installDevelopmentPreview(preview: "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure") {
   let automaticEnabled = true;
   let selectedProfileNamespaceId = namespaceId;
   let manualOverrideNamespaceId: string | null = null;
@@ -214,8 +214,14 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
   mockIPC((command, args) => {
     if (command === "get_default_codex_home") return "C:/Users/demo/.codex";
     if (command === "get_default_repository_root") return "C:/Users/demo/.codex-session-sync";
-    if (command === "list_codex_processes") return [];
-    if (command === "list_remote_profiles") return [{
+    if (command === "list_codex_processes") return preview === "process-running" ? [{
+      pid: 4242,
+      name: "Codex",
+      executable: "C:/Program Files/Codex/Codex.exe",
+      commandLine: [],
+      kind: "desktop",
+    }] : [];
+    if (command === "list_remote_profiles") return preview === "empty" ? [] : [{
       id: remoteId,
       displayName: "个人服务器",
       serverUrl: "https://sync.example.test",
@@ -345,6 +351,11 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
     if (command === "start_scan_job") return job("preview-scan", "scan", "running");
     if (command === "get_job") {
       const jobId = String((args as { jobId?: string } | undefined)?.jobId);
+      if (preview === "job") return job(jobId, jobId === "preview-scan" ? "scan" : "pull", "running");
+      if (preview === "failure") return {
+        ...job(jobId, jobId === "preview-scan" ? "scan" : "pull", "failed"),
+        error: "预览任务失败：服务器返回的对象未通过哈希校验。",
+      };
       return job(jobId, jobId === "preview-scan" ? "scan" : jobId === "preview-remap" ? "remap" : "pull", "completed");
     }
     if (command === "take_job_result") {
