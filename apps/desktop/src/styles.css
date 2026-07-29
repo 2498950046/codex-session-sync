@@ -32,7 +32,7 @@ button { cursor: pointer; }
 .panel { border: 1px solid #27313e; background: rgba(17, 23, 32, .88); border-radius: 18px; box-shadow: 0 24px 80px rgba(0, 0, 0, .22); }
 .workspace-panel, .operation-panel { display: grid; gap: 16px; padding: 20px; }
 .workspace-panel { grid-template-columns: 1fr 1fr; }
-.workspace-panel .action-row, .workspace-panel .safety-check { grid-column: 1 / -1; }
+.workspace-panel .action-row { grid-column: 1 / -1; }
 .operation-panel { margin-top: 16px; }
 .operation-panel .section-heading { margin-bottom: 0; }
 .operation-panel .section-heading p { margin: 5px 0 0; color: #778697; font-size: 13px; }
@@ -284,7 +284,7 @@ button { cursor: pointer; }
   .content-grid { grid-template-columns: 1fr; }
   .scan-panel { align-items: stretch; flex-direction: column; }
   .workspace-panel { grid-template-columns: 1fr; }
-  .workspace-panel .action-row, .workspace-panel .safety-check { grid-column: auto; }
+  .workspace-panel .action-row { grid-column: auto; }
   .action-row { align-items: stretch; flex-direction: column; }
   .result-grid { grid-template-columns: 1fr; }
   .recovery-row { grid-template-columns: 1fr; }

@@ -164,7 +164,6 @@ export default function App() {
   const [repositoryRoot, setRepositoryRoot] = useState("");
   const [manifestPath, setManifestPath] = useState("");
   const [journalPath, setJournalPath] = useState("");
-  const [confirmedClosed, setConfirmedClosed] = useState(false);
   const [confirmedReplaceTarget, setConfirmedReplaceTarget] = useState<string | null>(null);
   const [processes, setProcesses] = useState<CodexProcess[]>([]);
   const [job, setJob] = useState<JobSnapshot | null>(null);
@@ -211,7 +210,7 @@ export default function App() {
   const [remoteLoading, setRemoteLoading] = useState(false);
 
   const busy = isActive(job) || remoteLoading;
-  const canWrite = confirmedClosed && processes.length === 0 && isTauriRuntime;
+  const canWrite = processes.length === 0 && isTauriRuntime;
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
   const workspacePathEntries = useMemo<WorkspacePathEntry[]>(() => {
     if (workspaceCleanupReport) return workspaceCleanupReport.entries;
@@ -233,9 +232,7 @@ export default function App() {
       ? "请在 Codex Session Sync 桌面应用中操作"
       : processes.length > 0
         ? "请先完全退出 Codex，然后点击“重新检测”"
-        : !confirmedClosed
-          ? "请先勾选上方“我已完全退出 Codex”"
-          : null;
+        : null;
   const workflowNextStep = remoteLoading
     ? "正在读取远端状态，请稍候。"
     : !codexHome.trim() || !repositoryRoot.trim()
@@ -249,10 +246,8 @@ export default function App() {
             : !selectedNamespaceId
               ? "下一步：选择一个命名空间。"
               : processes.length > 0
-                ? "下一步：完全退出 Codex，再点击“重新检测”。"
-                : !confirmedClosed
-                  ? "下一步：勾选“我已完全退出 Codex”，即可启用同步操作。"
-                  : "准备完成：可以推送、拉取或切换命名空间。拉取时会自动检查项目路径。";
+                ? "配置和扫描仍可使用；如需同步或修改会话，请完全退出 Codex 后点击“重新检测”。"
+                : "准备完成：可以推送、拉取或切换命名空间。拉取时会自动检查项目路径。";
   const mappingCriteriaValid = Boolean(
     (matchApiKey && mappingState?.context.apiKeyAvailable)
     || (matchProvider && mappingState?.context.provider)
@@ -848,7 +843,7 @@ export default function App() {
           namespaceId: selectedNamespaceId,
           paths,
         },
-        confirmedCodexClosed: confirmedClosed,
+        confirmedCodexClosed: true,
       });
       const refreshed = await invoke<WorkspaceCleanupReport>("get_workspace_cleanup_report", {
         repositoryRoot: repositoryRoot.trim(),
@@ -882,7 +877,7 @@ export default function App() {
         codexHome: codexHome.trim(),
         repositoryRoot: repositoryRoot.trim(),
         rolloutPath: warning.path,
-        confirmedCodexClosed: confirmedClosed,
+        confirmedCodexClosed: true,
       });
       setQuarantineMessage(`空文件已移入隔离区：${result.quarantinePath}`);
       const scanned = await invoke<JobSnapshot>("start_scan_job", { codexHome: codexHome.trim() });
@@ -1101,7 +1096,7 @@ export default function App() {
     codexHome: codexHome.trim(),
     remoteId: selectedRemoteId,
     namespaceId: selectedNamespaceId,
-    confirmedCodexClosed: confirmedClosed,
+    confirmedCodexClosed: true,
   };
 
   return (
@@ -1118,7 +1113,7 @@ export default function App() {
       </header>
 
       <section className="process-banner">
-        <div><strong>写入安全检查</strong><span>Push、Pull、冲突解决与命名空间切换前必须完全退出 Codex。</span></div>
+        <div><strong>Codex 运行状态</strong><span>扫描和配置不受影响；仅同步、导入、恢复及清理等一致性操作要求 Codex 完全退出。</span></div>
         <button className="secondary-button" onClick={() => void refreshProcesses()} disabled={busy || !isTauriRuntime}>重新检测</button>
       </section>
       <section className="next-step-banner" aria-live="polite">
@@ -1131,9 +1126,8 @@ export default function App() {
         <div className="field"><label htmlFor="repository-root">本地同步仓库</label><input id="repository-root" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} disabled={busy} /></div>
         <div className="action-row">
           <button className="secondary-button" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}>扫描本机会话</button>
-          <button onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !canWrite}>创建本地快照</button>
+          <button onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建本地快照</button>
         </div>
-        <label className="safety-check"><input type="checkbox" checked={confirmedClosed} onChange={(event) => setConfirmedClosed(event.target.checked)} /><span>我已完全退出 Codex；同步期间不会重新启动</span></label>
       </section>
 
       <section className="panel remote-panel">
@@ -1304,8 +1298,8 @@ export default function App() {
       <section className="panel operation-panel">
         <div className="section-heading"><div><h2>本地快照工具</h2><p>保留原有的验证、增量导入和恢复入口，便于诊断与手动操作。</p></div></div>
         <div className="field"><label htmlFor="manifest-path">快照清单路径</label><input id="manifest-path" value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} placeholder="~/.codex-session-sync/snapshots/<id>.json" /></div>
-        <div className="action-row compact-actions"><button className="secondary-button" onClick={() => void start("start_validation_job", { manifestPath: manifestPath.trim(), repositoryRoot: repositoryRoot.trim() })} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button><button className="danger-button" onClick={() => void start("start_import_job", { manifestPath: manifestPath.trim(), codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !manifestPath.trim() || !canWrite}>增量导入</button></div>
-        <div className="recovery-row"><div className="field"><label htmlFor="journal-path">未完成操作的 Journal 路径</label><div className="path-picker-row"><input id="journal-path" value={journalPath} onChange={(event) => setJournalPath(event.target.value)} placeholder="选择 checkout-*.json" /><button type="button" className="path-picker-button" onClick={() => void selectJournalFile()} disabled={busy || !isTauriRuntime}>选择文件</button></div></div><button className="recovery-button" onClick={() => void start("start_recovery_job", { journalPath: journalPath.trim(), confirmedCodexClosed: confirmedClosed })} disabled={busy || !journalPath.trim() || !canWrite}>从备份恢复</button></div>
+        <div className="action-row compact-actions"><button className="secondary-button" onClick={() => void start("start_validation_job", { manifestPath: manifestPath.trim(), repositoryRoot: repositoryRoot.trim() })} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button><button className="danger-button" onClick={() => void start("start_import_job", { manifestPath: manifestPath.trim(), codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !manifestPath.trim() || !canWrite}>增量导入</button></div>
+        <div className="recovery-row"><div className="field"><label htmlFor="journal-path">未完成操作的 Journal 路径</label><div className="path-picker-row"><input id="journal-path" value={journalPath} onChange={(event) => setJournalPath(event.target.value)} placeholder="选择 checkout-*.json" /><button type="button" className="path-picker-button" onClick={() => void selectJournalFile()} disabled={busy || !isTauriRuntime}>选择文件</button></div></div><button className="recovery-button" onClick={() => void start("start_recovery_job", { journalPath: journalPath.trim(), confirmedCodexClosed: true })} disabled={busy || !journalPath.trim() || !canWrite}>从备份恢复</button></div>
       </section>
 
       {(snapshot || validation || importReport || recoveredJournal) && <section className="result-grid">
