@@ -240,6 +240,11 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
     };
     if (command === "get_workspace_cleanup_report") return {
       scannedRoots: ["F:/history"],
+      workspacePaths: [
+        { path: "F:/history/cpa", activeCount: 1, archivedCount: 2 },
+        { path: "F:/history/do-c", activeCount: 3, archivedCount: 1 },
+        { path: "F:/history/yaxin", activeCount: 0, archivedCount: 4 },
+      ],
       candidates: workspaceCleanupPaths.map((path) => ({ path })),
     };
     if (command === "quarantine_workspace_directories") {

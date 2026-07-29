@@ -205,6 +205,20 @@ button { cursor: pointer; }
 .workspace-mapping-list code { overflow: hidden; color: #8edbc1; text-overflow: ellipsis; white-space: nowrap; }
 .workspace-mapping-list span { color: #708195; }
 .workspace-mapping-list .danger-button { border: 1px solid #6a343d; border-radius: 8px; padding: 8px 10px; color: #ffc7cc; background: #3a1c22; }
+.workspace-usage-results { display: grid; gap: 10px; padding: 13px; border: 1px solid #2e5360; border-radius: 12px; background: #111f25; }
+.workspace-usage-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.workspace-usage-heading > div { min-width: 0; display: grid; gap: 5px; }
+.workspace-usage-heading strong { color: #9fdded; font-size: 12px; }
+.workspace-usage-heading span { color: #7fa7b2; font-size: 11px; line-height: 1.5; }
+.workspace-usage-heading b { flex: 0 0 auto; color: #91c8d6; font-size: 11px; }
+.workspace-usage-list { display: grid; gap: 7px; }
+.workspace-usage-list article { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid #294650; border-radius: 9px; background: #0d181d; }
+.workspace-usage-list code { min-width: 0; overflow: hidden; color: #b6dce5; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-usage-list article > div { display: flex; flex: 0 0 auto; gap: 6px; }
+.workspace-usage-list article span { border-radius: 999px; padding: 3px 7px; font-size: 10px; font-weight: 800; }
+.workspace-usage-list .active-usage { color: #8fe0bd; background: #15362a; }
+.workspace-usage-list .archived-usage { color: #b6c0cc; background: #29313b; }
+.workspace-usage-empty { margin: 0; }
 .workspace-cleanup-results { display: grid; gap: 10px; padding: 13px; border: 1px solid #7a4a36; border-radius: 12px; background: #281712; }
 .workspace-cleanup-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .workspace-cleanup-heading > div { min-width: 0; display: grid; gap: 5px; }
@@ -283,9 +297,9 @@ button { cursor: pointer; }
   .remote-form, .namespace-editor, .sync-status-grid, .identity-grid, .mapping-builder, .workspace-mapping-builder { grid-template-columns: 1fr; }
   .mapping-card { grid-template-columns: 1fr auto; }
   .mapping-card .mapping-tags { grid-column: 1 / -1; grid-row: 2; }
-  .mapping-heading, .mapping-resolution, .workspace-cleanup-heading { align-items: stretch; flex-direction: column; }
+  .mapping-heading, .mapping-resolution, .workspace-usage-heading, .workspace-cleanup-heading { align-items: stretch; flex-direction: column; }
   .workspace-mapping-heading-actions { align-items: stretch; flex-direction: column; }
-  .workspace-mapping-list article, .workspace-mapping-list article > div, .workspace-cleanup-list article, .workspace-remap-row { align-items: stretch; flex-direction: column; }
+  .workspace-mapping-list article, .workspace-mapping-list article > div, .workspace-usage-list article, .workspace-cleanup-list article, .workspace-remap-row { align-items: stretch; flex-direction: column; }
   .conflict-version-grid { grid-template-columns: 1fr; }
   .conflict-summary, .conflict-submit-row, .conflict-item header { align-items: stretch; flex-direction: column; }
   .conflict-submit-row button { width: 100%; }

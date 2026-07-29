@@ -12,7 +12,7 @@ pub use checkout::*;
 pub use codex::{
     default_codex_home, quarantine_empty_rollout, scan_codex_home, scan_codex_home_dashboard,
     scan_codex_home_dashboard_with_control, scan_codex_home_with_control,
-    scan_codex_home_workspace_paths,
+    scan_codex_home_workspace_paths, scan_codex_home_workspace_usage,
 };
 pub use local::{
     collect_object_descriptors, create_local_snapshot, create_local_snapshot_with_control,

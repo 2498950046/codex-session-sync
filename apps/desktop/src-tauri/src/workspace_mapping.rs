@@ -7,7 +7,8 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sync_core::{
-    WorkspacePathMapper, WorkspacePathMapping, codex_home_key, scan_codex_home_workspace_paths,
+    WorkspacePathMapper, WorkspacePathMapping, WorkspacePathUsage, codex_home_key,
+    scan_codex_home_workspace_usage,
 };
 use uuid::Uuid;
 
@@ -66,6 +67,7 @@ pub struct WorkspaceCleanupCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceCleanupReport {
     pub scanned_roots: Vec<String>,
+    pub workspace_paths: Vec<WorkspacePathUsage>,
     pub candidates: Vec<WorkspaceCleanupCandidate>,
 }
 
@@ -210,6 +212,7 @@ impl WorkspaceMappingStore {
         }
 
         let repository_root = self.repository_root()?;
+        let workspace_paths = scan_codex_home_workspace_usage(codex_home)?;
         let mut protected_paths = file
             .mappings
             .iter()
@@ -217,8 +220,8 @@ impl WorkspaceMappingStore {
             .collect::<BTreeSet<_>>();
         protected_paths.insert(normalize_path_for_match(&codex_home.to_string_lossy()));
         protected_paths.insert(normalize_path_for_match(&repository_root.to_string_lossy()));
-        for path in scan_codex_home_workspace_paths(codex_home)? {
-            protected_paths.insert(normalize_path_for_match(&path));
+        for usage in &workspace_paths {
+            protected_paths.insert(normalize_path_for_match(&usage.path));
         }
 
         let mut candidates = BTreeMap::<String, WorkspaceCleanupCandidate>::new();
@@ -264,6 +267,7 @@ impl WorkspaceMappingStore {
                 .into_values()
                 .map(|path| display_workspace_path(&path))
                 .collect(),
+            workspace_paths,
             candidates: candidates.into_values().collect(),
         })
     }
@@ -1099,11 +1103,14 @@ mod tests {
         fs::write(nonempty.join("keep.txt"), b"keep").unwrap();
         let database = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
         database
-            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT)", [])
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)",
+                [],
+            )
             .unwrap();
         database
             .execute(
-                "INSERT INTO threads (id, cwd) VALUES ('referenced', ?1)",
+                "INSERT INTO threads (id, cwd, archived) VALUES ('referenced', ?1, 1)",
                 [referenced.to_string_lossy().as_ref()],
             )
             .unwrap();
@@ -1125,6 +1132,9 @@ mod tests {
         let report = store
             .cleanup_report(&codex_home, remote_id, namespace_id)
             .unwrap();
+        assert_eq!(report.workspace_paths.len(), 1);
+        assert_eq!(report.workspace_paths[0].active_count, 0);
+        assert_eq!(report.workspace_paths[0].archived_count, 1);
         assert_eq!(report.candidates.len(), 1);
         assert_eq!(
             normalize_path_for_match(&report.candidates[0].path),

@@ -204,6 +204,11 @@ export type WorkspaceCleanupCandidate = {
 
 export type WorkspaceCleanupReport = {
   scannedRoots: string[];
+  workspacePaths: Array<{
+    path: string;
+    activeCount: number;
+    archivedCount: number;
+  }>;
   candidates: WorkspaceCleanupCandidate[];
 };
 

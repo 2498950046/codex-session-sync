@@ -23,6 +23,14 @@ pub struct WorkspaceRef {
     pub source_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePathUsage {
+    pub path: String,
+    pub active_count: usize,
+    pub archived_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct RelatedRecords {
