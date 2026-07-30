@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -470,7 +471,20 @@ pub fn snapshot_to_revision(
         namespace_id,
         parent_revision,
         created_at: snapshot.created_at.clone(),
-        threads: snapshot.threads.iter().map(remote_thread_view).collect(),
+        threads: snapshot
+            .threads
+            .iter()
+            .map(|thread| {
+                let mut remote = remote_thread_view(thread);
+                remote.rollout.storage = thread.rollout.storage.clone();
+                for (remote_attachment, attachment) in
+                    remote.attachments.iter_mut().zip(&thread.attachments)
+                {
+                    remote_attachment.storage = attachment.storage.clone();
+                }
+                remote
+            })
+            .collect(),
         warning_count: snapshot.warning_count,
     })
     .map_err(Into::into)
@@ -651,15 +665,39 @@ pub fn semantic_thread_hash(thread: &ThreadBundle) -> Result<String> {
 pub fn remote_thread_view(thread: &ThreadBundle) -> ThreadBundle {
     let mut thread = thread.clone();
     thread.rollout.source_path = None;
+    thread.rollout.storage = None;
     for attachment in &mut thread.attachments {
         attachment.source_path = None;
+        attachment.storage = None;
     }
     thread.related_records.source_database = None;
-    for rows in thread.related_records.tables.values_mut() {
+    for (table, rows) in &mut thread.related_records.tables {
         for row in rows {
             if let Some(row) = row.as_object_mut() {
                 row.remove("rollout_path");
                 row.remove("codex_home");
+                // SQLite scans materialize every column in the local schema. Treat
+                // nullable additions and known sentinel defaults as equivalent to
+                // an older source schema that did not contain those columns.
+                row.retain(|_, value| !value.is_null());
+                if table == "threads" {
+                    let updated_at = row.get("updated_at").and_then(Value::as_i64);
+                    let updated_at_ms = row
+                        .get("updated_at_ms")
+                        .and_then(Value::as_i64)
+                        .or_else(|| updated_at.and_then(|value| value.checked_mul(1_000)));
+                    let recency_at = row.get("recency_at").and_then(Value::as_i64);
+                    let recency_at_ms = row.get("recency_at_ms").and_then(Value::as_i64);
+                    if recency_at == Some(0) || recency_at == updated_at {
+                        row.remove("recency_at");
+                    }
+                    if recency_at_ms == Some(0) || recency_at_ms == updated_at_ms {
+                        row.remove("recency_at_ms");
+                    }
+                    if row.get("history_mode").and_then(Value::as_str) == Some("legacy") {
+                        row.remove("history_mode");
+                    }
+                }
             }
         }
     }
@@ -714,6 +752,7 @@ mod tests {
                 media_type: "application/x-ndjson".to_string(),
                 logical_path: Some(format!("sessions/rollout-{id}.jsonl")),
                 source_path: None,
+                storage: None,
             },
             related_records: RelatedRecords {
                 source_database: None,
@@ -721,6 +760,49 @@ mod tests {
             },
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn semantic_hash_ignores_columns_added_by_newer_sqlite_schema_defaults() {
+        let older = thread("thread", 'a');
+        let mut newer = older.clone();
+        let row = newer.related_records.tables.get_mut("threads").unwrap()[0]
+            .as_object_mut()
+            .unwrap();
+        row.insert("recency_at".to_string(), json!(0));
+        row.insert("recency_at_ms".to_string(), json!(0));
+        row.insert("history_mode".to_string(), json!("legacy"));
+        row.insert("name".to_string(), Value::Null);
+
+        assert_eq!(
+            semantic_thread_hash(&older).unwrap(),
+            semantic_thread_hash(&newer).unwrap()
+        );
+    }
+
+    #[test]
+    fn semantic_hash_ignores_recency_synthesized_from_updated_at() {
+        let mut older = thread("thread", 'a');
+        let row = older.related_records.tables.get_mut("threads").unwrap()[0]
+            .as_object_mut()
+            .unwrap();
+        row.insert("updated_at".to_string(), json!(1_700_000_000));
+        row.insert("updated_at_ms".to_string(), json!(1_700_000_000_123_i64));
+        let mut newer = older.clone();
+        let row = newer.related_records.tables.get_mut("threads").unwrap()[0]
+            .as_object_mut()
+            .unwrap();
+        row.insert("recency_at".to_string(), json!(1_700_000_000));
+        row.insert("recency_at_ms".to_string(), json!(1_700_000_000_123_i64));
+
+        let older_row = older.related_records.tables["threads"][0]
+            .as_object()
+            .unwrap();
+        assert!(!older_row.contains_key("recency_at"));
+        assert_eq!(
+            semantic_thread_hash(&older).unwrap(),
+            semantic_thread_hash(&newer).unwrap()
+        );
     }
 
     #[test]

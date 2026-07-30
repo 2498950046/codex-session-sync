@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -22,6 +22,9 @@ use crate::models::{
 };
 use crate::operation::{OperationControl, OperationProgress};
 use crate::protocol::{ObjectDescriptor, validate_sha256};
+use crate::storage_v2::{
+    ContentStore, FilesystemContentStore, StorageRef, load_v2_snapshot, write_v2_snapshot,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,7 +38,8 @@ struct BackupManifest {
 #[derive(Debug)]
 struct PreparedThread {
     bundle: ThreadBundle,
-    object_path: PathBuf,
+    content: crate::storage_v2::ContentRef,
+    repository_root: PathBuf,
     target_path: PathBuf,
     temporary_path: PathBuf,
 }
@@ -64,6 +68,8 @@ struct SourceObjectIndexEntry {
     byte_length: u64,
     modified_unix_nanos: u64,
     sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage: Option<StorageRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +85,13 @@ pub fn default_repository_root() -> PathBuf {
 }
 
 pub fn load_local_snapshot(manifest_path: impl AsRef<Path>) -> Result<LocalSnapshot> {
-    let snapshot: LocalSnapshot = read_json(manifest_path.as_ref())?;
+    let manifest_path = manifest_path.as_ref();
+    let snapshot = if is_v2_snapshot_path(manifest_path)? {
+        let repository_root = snapshot_repository_root(manifest_path)?;
+        load_v2_snapshot(manifest_path, &repository_root)?.0
+    } else {
+        read_json(manifest_path)?
+    };
     validate_snapshot_structure(&snapshot)?;
     Ok(snapshot)
 }
@@ -91,11 +103,29 @@ pub fn store_local_snapshot(
     validate_snapshot_structure(snapshot)?;
     let repository_root = repository_root.as_ref();
     ensure_repository_layout(repository_root)?;
-    let manifest_path = repository_root
-        .join("snapshots")
-        .join(format!("{}.json", snapshot.snapshot_id));
-    atomic_write_json(&manifest_path, snapshot)?;
-    Ok(manifest_path)
+    if snapshot
+        .threads
+        .iter()
+        .all(|thread| thread.rollout.storage.is_some())
+    {
+        let contents = snapshot
+            .threads
+            .iter()
+            .map(|thread| {
+                (
+                    thread.thread_id.clone(),
+                    content_ref_from_object(&thread.rollout),
+                )
+            })
+            .collect();
+        write_v2_snapshot(snapshot, &contents, repository_root)
+    } else {
+        let manifest_path = repository_root
+            .join("snapshots/v1")
+            .join(format!("{}.json", snapshot.snapshot_id));
+        atomic_write_json(&manifest_path, snapshot)?;
+        Ok(manifest_path)
+    }
 }
 
 pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<ObjectDescriptor>> {
@@ -126,14 +156,23 @@ pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<Object
 }
 
 pub fn repository_object_path(repository_root: impl AsRef<Path>, sha256: &str) -> Result<PathBuf> {
-    object_path(repository_root.as_ref(), sha256)
+    let legacy = object_path(repository_root.as_ref(), sha256)?;
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    let whole = crate::storage_v2::typed_object_path(
+        repository_root.as_ref(),
+        crate::storage_v2::StorageObjectKind::Whole,
+        sha256,
+    )?;
+    Ok(whole)
 }
 
 pub fn validate_repository_object(
     repository_root: impl AsRef<Path>,
     descriptor: &ObjectDescriptor,
 ) -> Result<()> {
-    let path = object_path(repository_root.as_ref(), &descriptor.sha256)?;
+    let path = repository_object_path(repository_root.as_ref(), &descriptor.sha256)?;
     validate_object(&path, &descriptor.sha256, descriptor.byte_length)
 }
 
@@ -226,6 +265,50 @@ pub fn install_repository_object<R: Read>(
     Ok(true)
 }
 
+pub(crate) fn install_prepared_repository_object(
+    repository_root: &Path,
+    temporary: &Path,
+    descriptor: &ObjectDescriptor,
+) -> Result<bool> {
+    validate_sha256(&descriptor.sha256)
+        .map_err(|_| anyhow::anyhow!("invalid content object hash {}", descriptor.sha256))?;
+    ensure_repository_layout(repository_root)?;
+    let metadata = fs::metadata(temporary).with_context(|| {
+        format!(
+            "failed to inspect prepared content object {}",
+            temporary.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.len() != descriptor.byte_length {
+        bail!(
+            "prepared content object length mismatch for {}: expected {}, got {}",
+            descriptor.sha256,
+            descriptor.byte_length,
+            metadata.len()
+        );
+    }
+    let destination = object_path(repository_root, &descriptor.sha256)?;
+    if destination.exists() {
+        validate_object(&destination, &descriptor.sha256, descriptor.byte_length)?;
+        fs::remove_file(temporary)?;
+        return Ok(false);
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(temporary, &destination) {
+        Ok(()) => Ok(true),
+        Err(error) if destination.exists() => {
+            fs::remove_file(temporary)?;
+            validate_object(&destination, &descriptor.sha256, descriptor.byte_length)
+                .context(error)?;
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to install content object {}", destination.display())),
+    }
+}
+
 pub fn create_local_snapshot(
     codex_home: impl AsRef<Path>,
     repository_root: impl AsRef<Path>,
@@ -268,7 +351,7 @@ pub fn create_local_snapshot_with_control(
             cancellable: true,
         });
         let source_path = thread.rollout.source_path.clone();
-        let sha256 = store_snapshot_object(
+        let (sha256, storage) = store_snapshot_object(
             &source_path,
             thread.rollout.byte_length,
             repository_root,
@@ -276,7 +359,9 @@ pub fn create_local_snapshot_with_control(
             control,
         )?;
         unique_objects.insert(sha256.clone());
-        threads.push(thread.into_bundle(sha256));
+        let mut bundle = thread.into_bundle(sha256);
+        bundle.rollout.storage = Some(storage);
+        threads.push(bundle);
     }
 
     let snapshot_id = Uuid::now_v7().to_string();
@@ -287,16 +372,33 @@ pub fn create_local_snapshot_with_control(
         threads,
         warning_count: report.warnings.len(),
     };
-    let manifest_path = repository_root
-        .join("snapshots")
-        .join(format!("{snapshot_id}.json"));
+    let contents = snapshot
+        .threads
+        .iter()
+        .map(|thread| {
+            Ok((
+                thread.thread_id.clone(),
+                crate::storage_v2::ContentRef {
+                    logical_sha256: thread.rollout.sha256.clone(),
+                    byte_length: thread.rollout.byte_length,
+                    storage: thread
+                        .rollout
+                        .storage
+                        .clone()
+                        .context("snapshot rollout has no v2 storage reference")?,
+                    media_type: Some(thread.rollout.media_type.clone()),
+                    logical_path: thread.rollout.logical_path.clone(),
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
     control.check_cancelled()?;
     control.report(OperationProgress::indeterminate(
         "snapshot_manifest",
         "正在写入快照清单",
     ));
     atomic_write_json(&index_path, &source_index)?;
-    atomic_write_json(&manifest_path, &snapshot)?;
+    let manifest_path = write_v2_snapshot(&snapshot, &contents, repository_root)?;
 
     Ok(SnapshotSummary {
         snapshot_id,
@@ -330,7 +432,7 @@ pub fn validate_local_snapshot_with_control(
 ) -> Result<SnapshotValidationReport> {
     let manifest_path = manifest_path.as_ref();
     let repository_root = repository_root.as_ref();
-    let snapshot: LocalSnapshot = read_json(manifest_path)?;
+    let snapshot = load_local_snapshot(manifest_path)?;
     validate_snapshot_structure(&snapshot)?;
 
     let mut unique_objects = BTreeSet::new();
@@ -345,8 +447,26 @@ pub fn validate_local_snapshot_with_control(
             unit: "objects".to_string(),
             cancellable: true,
         });
-        let object_path = object_path(repository_root, &descriptor.sha256)?;
-        validate_object(&object_path, &descriptor.sha256, descriptor.byte_length)?;
+        if let Some(storage) = snapshot
+            .threads
+            .iter()
+            .find(|thread| thread.rollout.sha256 == descriptor.sha256)
+            .and_then(|thread| thread.rollout.storage.clone())
+        {
+            FilesystemContentStore::open(repository_root.to_path_buf())?.validate(
+                &crate::storage_v2::ContentRef {
+                    logical_sha256: descriptor.sha256.clone(),
+                    byte_length: descriptor.byte_length,
+                    storage,
+                    media_type: None,
+                    logical_path: None,
+                },
+                control,
+            )?;
+        } else {
+            let object_path = repository_object_path(repository_root, &descriptor.sha256)?;
+            validate_object(&object_path, &descriptor.sha256, descriptor.byte_length)?;
+        }
         unique_objects.insert(descriptor.sha256.clone());
     }
 
@@ -399,7 +519,7 @@ pub fn import_local_snapshot_with_control(
     ));
     let validation =
         validate_local_snapshot_with_control(manifest_path, &repository_root, control)?;
-    let snapshot: LocalSnapshot = read_json(manifest_path)?;
+    let snapshot = load_local_snapshot(manifest_path)?;
     control.check_cancelled()?;
     let target_report = scan_codex_home_with_control(&target_codex_home, control)?;
     let existing = target_report
@@ -442,7 +562,8 @@ pub fn import_local_snapshot_with_control(
         ensure_importable_thread(thread)?;
         prepared.push(PreparedThread {
             bundle: thread.clone(),
-            object_path: object_path(&repository_root, &thread.rollout.sha256)?,
+            content: content_ref_from_object(&thread.rollout),
+            repository_root: repository_root.clone(),
             target_path,
             temporary_path,
         });
@@ -687,12 +808,20 @@ fn apply_import(
         if let Some(parent) = thread.temporary_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        copy_verified_object(
-            &thread.object_path,
-            &thread.temporary_path,
-            &thread.bundle.rollout.sha256,
-            Some(control),
-        )?;
+        if thread.bundle.rollout.storage.is_some() {
+            FilesystemContentStore::open(thread.repository_root.clone())?.materialize(
+                &thread.content,
+                &thread.temporary_path,
+                control,
+            )?;
+        } else {
+            copy_verified_object(
+                &object_path(&thread.repository_root, &thread.bundle.rollout.sha256)?,
+                &thread.temporary_path,
+                &thread.bundle.rollout.sha256,
+                Some(control),
+            )?;
+        }
     }
 
     control.check_cancelled()?;
@@ -793,6 +922,25 @@ pub(crate) fn insert_thread_row(
         .first()
         .and_then(Value::as_object)
         .context("snapshot thread record is not a JSON object")?;
+    let created_at_ms = thread.created_at_ms.or_else(|| {
+        row.get("created_at_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                row.get("created_at")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+    });
+    let updated_at_ms = thread.updated_at_ms.or_else(|| {
+        row.get("updated_at_ms")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                row.get("updated_at")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+    });
+    let recency_at_ms = updated_at_ms.or(created_at_ms);
 
     let mut columns = Vec::new();
     let mut values = Vec::new();
@@ -803,6 +951,30 @@ pub(crate) fn insert_thread_row(
             Some(Value::String(
                 target_codex_home.to_string_lossy().into_owned(),
             ))
+        } else if column == "created_at_ms" {
+            row.get(column)
+                .cloned()
+                .or_else(|| created_at_ms.map(Value::from))
+        } else if column == "updated_at_ms" {
+            row.get(column)
+                .cloned()
+                .or_else(|| updated_at_ms.map(Value::from))
+        } else if column == "created_at" {
+            row.get(column)
+                .cloned()
+                .or_else(|| created_at_ms.map(|value| Value::from(value / 1_000)))
+        } else if column == "updated_at" {
+            row.get(column)
+                .cloned()
+                .or_else(|| updated_at_ms.map(|value| Value::from(value / 1_000)))
+        } else if column == "recency_at_ms" {
+            row.get(column)
+                .cloned()
+                .or_else(|| recency_at_ms.map(Value::from))
+        } else if column == "recency_at" {
+            row.get(column)
+                .cloned()
+                .or_else(|| recency_at_ms.map(|value| Value::from(value / 1_000)))
         } else {
             row.get(column).cloned()
         };
@@ -1020,6 +1192,15 @@ pub(crate) fn ensure_repository_layout(root: &Path) -> Result<()> {
         "snapshots",
         "backups",
         "journal",
+        "snapshots/v1",
+        "snapshots/v2",
+        "objects/whole/sha256",
+        "objects/chunks/sha256",
+        "objects/chunk-manifests/sha256",
+        "objects/threads/sha256",
+        "objects/revision-roots/sha256",
+        "trash",
+        "quarantine",
     ] {
         fs::create_dir_all(root.join(directory))?;
     }
@@ -1086,7 +1267,7 @@ fn store_snapshot_object(
     repository_root: &Path,
     source_index: &mut SourceObjectIndex,
     control: &OperationControl,
-) -> Result<String> {
+) -> Result<(String, StorageRef)> {
     let before = source_fingerprint(source)?;
     if before.byte_length != expected_length {
         bail!(
@@ -1100,88 +1281,79 @@ fn store_snapshot_object(
     if let Some(entry) = source_index.entries.get(&source_key)
         && entry.byte_length == before.byte_length
         && entry.modified_unix_nanos == before.modified_unix_nanos
-        && let Ok(destination) = object_path(repository_root, &entry.sha256)
-        && fs::metadata(&destination)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == before.byte_length)
+        && let Some(storage) = entry.storage.clone()
     {
-        return Ok(entry.sha256.clone());
-    }
-
-    let temporary = repository_root
-        .join("objects")
-        .join("tmp")
-        .join(format!("{}.object.tmp", Uuid::now_v7()));
-    let copy_result = (|| -> Result<String> {
-        let input = File::open(source)?;
-        let mut reader = BufReader::new(input);
-        let output = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        let mut writer = BufWriter::new(output);
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            control.check_cancelled()?;
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-            writer.write_all(&buffer[..count])?;
-        }
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        drop(writer);
-
-        let after = source_fingerprint(source)?;
-        if after != before {
-            bail!(
-                "rollout changed while creating snapshot: {}",
-                source.display()
-            );
-        }
-        let sha256 = format!("sha256:{}", hex::encode(hasher.finalize()));
-        let destination = object_path(repository_root, &sha256)?;
-        if destination.exists() {
-            validate_object(&destination, &sha256, before.byte_length)?;
-            fs::remove_file(&temporary)?;
-        } else {
-            if let Some(parent) = destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            match fs::rename(&temporary, &destination) {
-                Ok(()) => {}
-                Err(error) if destination.exists() => {
-                    fs::remove_file(&temporary)?;
-                    validate_object(&destination, &sha256, before.byte_length).context(error)?;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to install content object {}", destination.display())
-                    });
-                }
-            }
-        }
-        Ok(sha256)
-    })();
-    if copy_result.is_err() {
-        match fs::remove_file(&temporary) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(_) => {}
+        let content = crate::storage_v2::ContentRef {
+            logical_sha256: entry.sha256.clone(),
+            byte_length: entry.byte_length,
+            storage: storage.clone(),
+            media_type: None,
+            logical_path: None,
+        };
+        if FilesystemContentStore::open(repository_root.to_path_buf())?
+            .content_objects(&content)
+            .is_ok()
+        {
+            return Ok((entry.sha256.clone(), storage));
         }
     }
-    let sha256 = copy_result?;
+
+    let content =
+        FilesystemContentStore::open(repository_root.to_path_buf())?.ingest(source, control)?;
+    let after = source_fingerprint(source)?;
+    if after != before || content.byte_length != before.byte_length {
+        bail!(
+            "rollout changed while creating snapshot: {}",
+            source.display()
+        );
+    }
+    let sha256 = content.logical_sha256;
+    let storage = content.storage;
     source_index.entries.insert(
         source_key,
         SourceObjectIndexEntry {
             byte_length: before.byte_length,
             modified_unix_nanos: before.modified_unix_nanos,
             sha256: sha256.clone(),
+            storage: Some(storage.clone()),
         },
     );
-    Ok(sha256)
+    Ok((sha256, storage))
+}
+
+fn content_ref_from_object(object: &crate::ContentObject) -> crate::storage_v2::ContentRef {
+    crate::storage_v2::ContentRef {
+        logical_sha256: object.sha256.clone(),
+        byte_length: object.byte_length,
+        storage: object.storage.clone().unwrap_or_else(|| StorageRef::Whole {
+            object_sha256: object.sha256.clone(),
+        }),
+        media_type: Some(object.media_type.clone()),
+        logical_path: object.logical_path.clone(),
+    }
+}
+
+fn is_v2_snapshot_path(path: &Path) -> Result<bool> {
+    let file = File::open(path)?;
+    let value: Value = serde_json::from_reader(BufReader::new(file))?;
+    Ok(value.get("schemaVersion").and_then(Value::as_u64)
+        == Some(crate::storage_v2::SNAPSHOT_ROOT_V2_SCHEMA_VERSION as u64)
+        && value
+            .get("threads")
+            .and_then(Value::as_array)
+            .is_some_and(|threads| {
+                threads
+                    .first()
+                    .is_none_or(|thread| thread.get("descriptorSha256").is_some())
+            }))
+}
+
+fn snapshot_repository_root(path: &Path) -> Result<PathBuf> {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .context("v2 snapshot is not below snapshots/v2")
 }
 
 pub(crate) fn copy_verified_object(
@@ -1200,12 +1372,12 @@ pub(crate) fn copy_verified_object(
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        if let Some(control) = control {
-            if control.is_cancelled() {
-                drop(writer);
-                let _ = fs::remove_file(destination);
-                bail!("operation cancelled");
-            }
+        if let Some(control) = control
+            && control.is_cancelled()
+        {
+            drop(writer);
+            let _ = fs::remove_file(destination);
+            bail!("operation cancelled");
         }
         let count = reader.read(&mut buffer)?;
         if count == 0 {
@@ -1333,6 +1505,9 @@ fn write_journal(path: &Path, journal: &OperationJournal) -> Result<()> {
 mod tests {
     use super::*;
     use crate::codex::scan_codex_home;
+    use crate::models::{
+        ContentObject, RelatedRecords, THREAD_BUNDLE_SCHEMA_VERSION, WorkspaceRef,
+    };
     use serde_json::json;
     use std::sync::{
         Arc,
@@ -1370,6 +1545,73 @@ mod tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn insert_thread_row_synthesizes_recency_from_bundle_timestamp() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    updated_at_ms INTEGER,
+                    recency_at INTEGER NOT NULL DEFAULT 0,
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        let timestamp_ms = 1_700_000_100_123_i64;
+        let thread = ThreadBundle {
+            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+            thread_id: "thread".to_string(),
+            title: "Thread".to_string(),
+            archived: false,
+            created_at_ms: None,
+            updated_at_ms: Some(timestamp_ms),
+            model_provider: Some("openai".to_string()),
+            workspace: WorkspaceRef {
+                logical_id: None,
+                source_path: Some("C:/work".to_string()),
+            },
+            rollout: ContentObject {
+                sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+                byte_length: 0,
+                media_type: "application/x-ndjson".to_string(),
+                logical_path: Some("sessions/rollout-thread.jsonl".to_string()),
+                source_path: None,
+                storage: None,
+            },
+            related_records: RelatedRecords {
+                source_database: None,
+                tables: BTreeMap::from([(
+                    "threads".to_string(),
+                    vec![json!({"id": "thread", "cwd": "C:/work"})],
+                )]),
+            },
+            attachments: Vec::new(),
+        };
+        let columns = thread_table_columns(&connection).unwrap();
+
+        insert_thread_row(
+            &connection,
+            &columns,
+            &thread,
+            Path::new("C:/codex/sessions/rollout-thread.jsonl"),
+            Path::new("C:/codex"),
+        )
+        .unwrap();
+
+        let values: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT updated_at_ms, recency_at, recency_at_ms FROM threads WHERE id = 'thread'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (timestamp_ms, timestamp_ms / 1_000, timestamp_ms));
     }
 
     #[test]
@@ -1422,8 +1664,9 @@ mod tests {
         let repository = tempdir().unwrap();
         create_codex_home(source.path(), &[("thread-1", "Demo", "abcdefgh")]);
         let first = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let manifest: LocalSnapshot = read_json(&first.manifest_path).unwrap();
-        let object = object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
+        let manifest = load_local_snapshot(&first.manifest_path).unwrap();
+        let object =
+            repository_object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
         let mut bytes = fs::read(&object).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
@@ -1432,7 +1675,7 @@ mod tests {
         let second = create_local_snapshot(source.path(), repository.path(), true).unwrap();
         let error = validate_local_snapshot(&second.manifest_path, repository.path()).unwrap_err();
 
-        assert!(error.to_string().contains("hash mismatch"));
+        assert!(error.to_string().contains("storage object"));
     }
 
     #[test]
@@ -1441,7 +1684,7 @@ mod tests {
         let repository = tempdir().unwrap();
         create_codex_home(source.path(), &[("thread-1", "Demo", "abcdefgh")]);
         let first = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let first_manifest: LocalSnapshot = read_json(&first.manifest_path).unwrap();
+        let first_manifest = load_local_snapshot(&first.manifest_path).unwrap();
         std::thread::sleep(Duration::from_millis(20));
         let rollout = source
             .path()
@@ -1450,7 +1693,7 @@ mod tests {
         fs::write(&rollout, original.replace("abcdefgh", "abcdxfgh")).unwrap();
 
         let second = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let second_manifest: LocalSnapshot = read_json(&second.manifest_path).unwrap();
+        let second_manifest = load_local_snapshot(&second.manifest_path).unwrap();
 
         assert_ne!(
             first_manifest.threads[0].rollout.sha256,
@@ -1499,7 +1742,7 @@ mod tests {
             &[("thread-1", "Demo", "{\"type\":\"event\"}")],
         );
         let summary = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let mut manifest: LocalSnapshot = read_json(&summary.manifest_path).unwrap();
+        let mut manifest = load_local_snapshot(&summary.manifest_path).unwrap();
         manifest.threads[0].rollout.logical_path = Some("other/rollout-thread-1.jsonl".to_string());
         atomic_write_json(&summary.manifest_path, &manifest).unwrap();
 
@@ -1568,8 +1811,9 @@ mod tests {
         create_codex_home(source.path(), &[("thread-1", "Demo", "{\"value\":1}")]);
         create_codex_home(target.path(), &[]);
         let snapshot = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let manifest: LocalSnapshot = read_json(&snapshot.manifest_path).unwrap();
-        let object = object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
+        let manifest = load_local_snapshot(&snapshot.manifest_path).unwrap();
+        let object =
+            repository_object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
         fs::write(object, "corrupt").unwrap();
 
         let error = import_local_snapshot(
@@ -1579,7 +1823,7 @@ mod tests {
             true,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("length mismatch"));
+        assert!(error.to_string().contains("storage object"));
         assert_eq!(
             fs::read_dir(repository.path().join("backups"))
                 .unwrap()
@@ -1610,23 +1854,24 @@ mod tests {
         drop(connection);
 
         let snapshot = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let mut manifest: LocalSnapshot = read_json(&snapshot.manifest_path).unwrap();
+        let mut manifest = load_local_snapshot(&snapshot.manifest_path).unwrap();
         manifest.threads[0].title = "blocked".to_string();
         manifest.threads[0]
             .related_records
             .tables
             .get_mut("threads")
             .unwrap()[0]["title"] = Value::String("blocked".to_string());
-        atomic_write_json(&snapshot.manifest_path, &manifest).unwrap();
+        let legacy_manifest = repository.path().join("snapshots/v1/blocked.json");
+        let typed =
+            repository_object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
+        let legacy = object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::copy(typed, legacy).unwrap();
+        atomic_write_json(&legacy_manifest, &manifest).unwrap();
 
-        let error = import_local_snapshot(
-            &snapshot.manifest_path,
-            target.path(),
-            repository.path(),
-            true,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("failed to insert thread"));
+        let error = import_local_snapshot(&legacy_manifest, target.path(), repository.path(), true)
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
         let connection = Connection::open(&target_database).unwrap();
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
@@ -1655,9 +1900,9 @@ mod tests {
         );
         create_codex_home(target.path(), &[]);
         let snapshot = create_local_snapshot(source.path(), repository.path(), true).unwrap();
-        let manifest: LocalSnapshot = read_json(&snapshot.manifest_path).unwrap();
+        let manifest = load_local_snapshot(&snapshot.manifest_path).unwrap();
         let thread = &manifest.threads[0];
-        let object = object_path(repository.path(), &thread.rollout.sha256).unwrap();
+        let object = repository_object_path(repository.path(), &thread.rollout.sha256).unwrap();
         let target_rollout = target.path().join(safe_rollout_path(thread).unwrap());
         fs::create_dir_all(target_rollout.parent().unwrap()).unwrap();
         fs::copy(&object, &target_rollout).unwrap();

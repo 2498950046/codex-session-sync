@@ -5,12 +5,15 @@ pub mod models;
 pub mod operation;
 pub mod process;
 pub mod protocol;
+pub mod storage_v2;
 pub mod sync;
+pub mod workspace;
 
 pub use checkout::*;
 pub use codex::{
     default_codex_home, quarantine_empty_rollout, scan_codex_home, scan_codex_home_dashboard,
     scan_codex_home_dashboard_with_control, scan_codex_home_with_control,
+    scan_codex_home_workspace_paths, scan_codex_home_workspace_usage,
 };
 pub use local::{
     collect_object_descriptors, create_local_snapshot, create_local_snapshot_with_control,
@@ -23,4 +26,6 @@ pub use models::*;
 pub use operation::{OperationControl, OperationProgress};
 pub use process::{CodexProcess, CodexProcessKind, detect_codex_processes};
 pub use protocol::*;
+pub use storage_v2::*;
 pub use sync::*;
+pub use workspace::*;

@@ -13,10 +13,12 @@ use axum::{Json, Router};
 use serde::Serialize;
 use sync_core::{
     CommitRevisionRequest, CommitRevisionResponse, CreateNamespaceRequest, MissingObjectsRequest,
-    MissingObjectsResponse, NamespaceHeadResponse, NamespaceListResponse, ProtocolInfoResponse,
-    PutObjectResponse, REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RevisionManifest,
-    validate_sha256,
+    MissingObjectsResponse, NamespaceHeadResponse, NamespaceListResponse, ProtocolCapabilities,
+    ProtocolInfoResponse, ProtocolLimits, PutObjectResponse, REMOTE_PROTOCOL_VERSION,
+    RenameNamespaceRequest, RevisionManifest, StorageObjectKind, StorageObjectRef,
+    TypedMissingObjectsRequest, TypedMissingObjectsResponse, validate_sha256,
 };
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -35,6 +37,7 @@ const REQUEST_ENVELOPE_OVERHEAD_BYTES: u64 = 64 * 1024;
 pub struct AppState {
     metadata: MetadataStore,
     objects: ObjectStore,
+    typed_objects: BTreeMap<StorageObjectKind, ObjectStore>,
     revisions: RevisionStore,
 }
 
@@ -56,12 +59,23 @@ impl AppState {
         let objects = ObjectStore::open(&config.data_dir, config.max_object_bytes)
             .await
             .context("failed to initialize server object storage")?;
+        let mut typed_objects = BTreeMap::new();
+        for kind in StorageObjectKind::ALL {
+            let limit = kind.max_bytes().min(config.max_object_bytes);
+            typed_objects.insert(
+                kind,
+                ObjectStore::open(config.data_dir.join("typed").join(kind.directory()), limit)
+                    .await
+                    .context("failed to initialize typed object storage")?,
+            );
+        }
         let revisions = RevisionStore::open(&config.data_dir, config.max_manifest_bytes)
             .await
             .context("failed to initialize server revision storage")?;
         Ok(Self {
             metadata,
             objects,
+            typed_objects,
             revisions,
         })
     }
@@ -98,12 +112,25 @@ pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
             AuthState::new(config.token.clone()),
             require_auth,
         ))
-        .with_state(state);
+        .with_state(state.clone());
+    let protected_v2 = Router::new()
+        .route("/objects/missing", post(missing_typed_objects))
+        .route(
+            "/objects/{kind}/{digest}",
+            put(put_typed_object).get(get_typed_object),
+        )
+        .layer(DefaultBodyLimit::max(json_limit))
+        .layer(middleware::from_fn_with_state(
+            AuthState::new(config.token.clone()),
+            require_auth,
+        ))
+        .with_state(state.clone());
 
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/info", get(info))
         .nest("/api/v1", protected)
+        .nest("/api/v2", protected_v2)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -120,7 +147,142 @@ async fn info() -> Json<ProtocolInfoResponse> {
         service: "codex-session-sync".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: REMOTE_PROTOCOL_VERSION,
+        capabilities: ProtocolCapabilities {
+            chunked_objects: true,
+            thread_descriptors: true,
+            revision_roots_v2: true,
+            garbage_collection: false,
+        },
+        limits: ProtocolLimits::default(),
     })
+}
+
+async fn missing_typed_objects(
+    State(state): State<AppState>,
+    payload: Result<Json<TypedMissingObjectsRequest>, JsonRejection>,
+) -> Result<Json<TypedMissingObjectsResponse>, HttpError> {
+    let Json(payload) = parse_json(payload)?;
+    if payload.objects.len() > MAX_MISSING_OBJECTS {
+        return Err(HttpError::invalid_request(format!(
+            "objects must contain no more than {MAX_MISSING_OBJECTS} entries"
+        )));
+    }
+    let mut unique = BTreeMap::new();
+    for object in payload.objects {
+        if object.byte_length > object.kind.max_bytes() {
+            return Err(HttpError::invalid_request(
+                "typed object exceeds its kind limit",
+            ));
+        }
+        let key = (object.kind, object.sha256.clone());
+        if let Some(existing) = unique.insert(key, object.byte_length)
+            && existing != object.byte_length
+        {
+            return Err(HttpError::invalid_request(
+                "the same typed object cannot have different byte lengths",
+            ));
+        }
+    }
+    let mut missing = Vec::new();
+    for ((kind, sha256), byte_length) in unique {
+        let store = typed_store(&state, kind)?;
+        if !store
+            .missing(&[sync_core::ObjectDescriptor {
+                sha256: sha256.clone(),
+                byte_length,
+            }])
+            .await?
+            .is_empty()
+        {
+            missing.push(StorageObjectRef {
+                kind,
+                sha256,
+                byte_length,
+            });
+        }
+    }
+    Ok(Json(TypedMissingObjectsResponse { missing }))
+}
+
+async fn put_typed_object(
+    State(state): State<AppState>,
+    Path((kind, digest)): Path<(String, String)>,
+    request: Request,
+) -> Result<impl IntoResponse, HttpError> {
+    let kind = parse_object_kind(&kind)?;
+    let sha256 = object_id_from_path(&digest)?;
+    let expected_length = parse_content_length(request.headers())?;
+    if expected_length > kind.max_bytes() {
+        return Err(HttpError::payload_too_large(
+            "typed object exceeds its kind limit",
+        ));
+    }
+    let result = typed_store(&state, kind)?
+        .put_stream(
+            &sha256,
+            expected_length,
+            request.into_body().into_data_stream(),
+        )
+        .await?;
+    let created = matches!(result, PutObjectResult::Created);
+    state
+        .metadata
+        .record_storage_object(StorageObjectRef {
+            kind,
+            sha256: sha256.clone(),
+            byte_length: expected_length,
+        })
+        .await?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(PutObjectResponse {
+            sha256,
+            byte_length: expected_length,
+            created,
+        }),
+    ))
+}
+
+async fn get_typed_object(
+    State(state): State<AppState>,
+    Path((kind, digest)): Path<(String, String)>,
+) -> Result<Response, HttpError> {
+    let kind = parse_object_kind(&kind)?;
+    let sha256 = object_id_from_path(&digest)?;
+    let download = typed_store(&state, kind)?.open_download(&sha256).await?;
+    let mut response = Response::new(Body::from_stream(ReaderStream::new(download.file)));
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&download.byte_length.to_string())
+            .map_err(|error| HttpError::invalid_request(error.to_string()))?,
+    );
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response.headers_mut().insert(
+        ETAG,
+        HeaderValue::from_str(&format!("\"{sha256}\""))
+            .map_err(|error| HttpError::invalid_request(error.to_string()))?,
+    );
+    Ok(response)
+}
+
+fn typed_store(state: &AppState, kind: StorageObjectKind) -> Result<&ObjectStore, HttpError> {
+    state
+        .typed_objects
+        .get(&kind)
+        .ok_or_else(|| HttpError::invalid_request("unsupported storage object kind"))
+}
+
+fn parse_object_kind(value: &str) -> Result<StorageObjectKind, HttpError> {
+    value
+        .parse()
+        .map_err(|_| HttpError::invalid_request("unsupported storage object kind"))
 }
 
 async fn list_namespaces(
@@ -293,7 +455,111 @@ async fn commit_revision(
     }
 
     let metadata = NewRevisionMetadata::from_manifest(&payload.revision)?;
-    let missing = state.objects.missing(metadata.objects()).await?;
+    let mut typed_missing = Vec::new();
+    for thread in &payload.revision.payload.threads {
+        if let Some(storage) = &thread.rollout.storage {
+            let object = match storage {
+                sync_core::StorageRef::Whole { object_sha256 } => StorageObjectRef {
+                    kind: StorageObjectKind::Whole,
+                    sha256: object_sha256.clone(),
+                    byte_length: thread.rollout.byte_length,
+                },
+                sync_core::StorageRef::Chunked { manifest_sha256 } => {
+                    let store = typed_store(&state, StorageObjectKind::ChunkManifest)?;
+                    let mut download = match store.open_download(manifest_sha256).await {
+                        Ok(download) => download,
+                        Err(crate::object_store::ObjectStoreError::NotFound { .. }) => {
+                            typed_missing.push(manifest_sha256.clone());
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    let mut bytes = Vec::with_capacity(download.byte_length as usize);
+                    download
+                        .file
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+                    let manifest: sync_core::ChunkManifest = serde_json::from_slice(&bytes)
+                        .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+                    manifest
+                        .validate()
+                        .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+                    if manifest.logical_sha256 != thread.rollout.sha256
+                        || manifest.byte_length != thread.rollout.byte_length
+                    {
+                        return Err(HttpError::invalid_request(
+                            "chunk manifest does not match rollout identity",
+                        ));
+                    }
+                    state
+                        .metadata
+                        .replace_object_edges(
+                            StorageObjectRef {
+                                kind: StorageObjectKind::ChunkManifest,
+                                sha256: manifest_sha256.clone(),
+                                byte_length: bytes.len() as u64,
+                            },
+                            manifest
+                                .chunks
+                                .iter()
+                                .map(|chunk| StorageObjectRef {
+                                    kind: StorageObjectKind::Chunk,
+                                    sha256: chunk.sha256.clone(),
+                                    byte_length: chunk.byte_length,
+                                })
+                                .collect(),
+                        )
+                        .await?;
+                    for chunk in &manifest.chunks {
+                        if !typed_store(&state, StorageObjectKind::Chunk)?
+                            .missing(&[sync_core::ObjectDescriptor {
+                                sha256: chunk.sha256.clone(),
+                                byte_length: chunk.byte_length,
+                            }])
+                            .await?
+                            .is_empty()
+                        {
+                            typed_missing.push(chunk.sha256.clone());
+                        }
+                    }
+                    StorageObjectRef {
+                        kind: StorageObjectKind::ChunkManifest,
+                        sha256: manifest_sha256.clone(),
+                        byte_length: bytes.len() as u64,
+                    }
+                }
+            };
+            if !typed_store(&state, object.kind)?
+                .missing(&[sync_core::ObjectDescriptor {
+                    sha256: object.sha256.clone(),
+                    byte_length: object.byte_length,
+                }])
+                .await?
+                .is_empty()
+            {
+                typed_missing.push(object.sha256);
+            }
+        }
+    }
+    if !typed_missing.is_empty() {
+        typed_missing.sort();
+        typed_missing.dedup();
+        return Err(HttpError::missing_objects(typed_missing));
+    }
+    let legacy_objects = payload
+        .revision
+        .payload
+        .threads
+        .iter()
+        .flat_map(|thread| std::iter::once(&thread.rollout).chain(&thread.attachments))
+        .filter(|object| object.storage.is_none())
+        .map(|object| sync_core::ObjectDescriptor {
+            sha256: object.sha256.clone(),
+            byte_length: object.byte_length,
+        })
+        .collect::<Vec<_>>();
+    let missing = state.objects.missing(&legacy_objects).await?;
     if !missing.is_empty() {
         return Err(HttpError::missing_objects(missing));
     }

@@ -73,7 +73,7 @@ async fn public_endpoints_work_and_data_routes_require_authentication() {
         .await;
     assert_eq!(info.status(), StatusCode::OK);
     let info: Value = response_json(info).await;
-    assert_eq!(info["protocolVersion"], 1);
+    assert_eq!(info["protocolVersion"], 2);
 
     let unauthorized_create = app
         .send(json_request(
@@ -396,6 +396,53 @@ async fn object_missing_upload_download_and_validation_work() {
 }
 
 #[tokio::test]
+async fn typed_v2_objects_are_kind_scoped_and_idempotent() {
+    let app = TestApp::new(1024).await;
+    let content = b"shared typed bytes";
+    let digest = hex::encode(sha2::Sha256::digest(content));
+    let sha256 = format!("sha256:{digest}");
+    let missing = app
+        .send(authenticated(json_request(
+            Method::POST,
+            "/api/v2/objects/missing",
+            &json!({"objects": [
+                {"kind":"whole","sha256":sha256,"byteLength":content.len()},
+                {"kind":"chunk","sha256":sha256,"byteLength":content.len()}
+            ]}),
+            Some(TOKEN),
+        )))
+        .await;
+    assert_eq!(missing.status(), StatusCode::OK);
+    let body: Value = response_json(missing).await;
+    assert_eq!(body["missing"].as_array().unwrap().len(), 2);
+
+    for kind in ["whole", "chunk"] {
+        let response = app
+            .send(authenticated(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v2/objects/{kind}/{digest}"))
+                    .header(CONTENT_LENGTH, content.len())
+                    .body(Body::from(content.as_slice()))
+                    .unwrap(),
+            ))
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let repeat = app
+            .send(authenticated(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri(format!("/api/v2/objects/{kind}/{digest}"))
+                    .header(CONTENT_LENGTH, content.len())
+                    .body(Body::from(content.as_slice()))
+                    .unwrap(),
+            ))
+            .await;
+        assert_eq!(repeat.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
 async fn revision_commit_requires_objects_and_fast_forwards() {
     let app = TestApp::new(1024).await;
     let namespace = create_namespace(&app, "Personal").await;
@@ -694,6 +741,7 @@ fn revision(
                 media_type: "application/x-ndjson".to_string(),
                 logical_path: Some(format!("sessions/rollout-{label}.jsonl")),
                 source_path: None,
+                storage: None,
             },
             related_records: RelatedRecords {
                 source_database: None,

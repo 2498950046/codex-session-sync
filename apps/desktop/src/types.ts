@@ -87,7 +87,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "resolve" | "switch";
+  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "resolve" | "switch" | "remap";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
@@ -180,6 +180,79 @@ export type NamespaceMappingState = {
   };
 };
 
+export type WorkspaceMappingRule = {
+  id: string;
+  remoteId: string;
+  namespaceId: string;
+  codexHomeKey: string;
+  remotePrefix: string;
+  localPrefix: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WorkspaceMappingState = {
+  remoteId: string;
+  namespaceId: string;
+  codexHomeKey: string;
+  mappings: WorkspaceMappingRule[];
+};
+
+export type WorkspaceDirectoryState = "unknown" | "missing" | "empty" | "nonEmpty" | "notDirectory";
+
+export type WorkspacePathEntry = {
+  path: string;
+  activeCount: number;
+  archivedCount: number;
+  mappings: Array<{
+    id: string;
+    remotePrefix: string;
+    localPrefix: string;
+    inherited: boolean;
+  }>;
+  codexProjectNames: string[];
+  directoryState: WorkspaceDirectoryState;
+  cleanupEligible: boolean;
+};
+
+export type WorkspaceCleanupCandidate = { path: string };
+
+export type WorkspaceCleanupReport = {
+  scannedRoots: string[];
+  entries: WorkspacePathEntry[];
+  candidates: WorkspaceCleanupCandidate[];
+};
+
+export type WorkspaceCleanupResult = {
+  quarantined: Array<{
+    originalPath: string;
+    quarantinePath: string;
+  }>;
+  removedCodexProjects: number;
+  removedThreadAssignments: number;
+  backupPath: string | null;
+  journalPath: string;
+};
+
+export type WorkspacePathCandidate = {
+  remotePath: string;
+  suggestedSubdirectory: string;
+};
+
+export type WorkspacePullPlan = {
+  remoteId: string;
+  namespaceId: string;
+  remoteHead: string | null;
+  mappedPathCount: number;
+  existingPathCount: number;
+  unmappedPaths: WorkspacePathCandidate[];
+};
+
+export type AutomaticWorkspaceMappingResult = {
+  state: WorkspaceMappingState;
+  createdDirectories: string[];
+};
+
 export type ThreadConflictVersion = {
   title: string;
   archived: boolean;
@@ -215,7 +288,7 @@ export type CheckoutReport = {
 };
 
 export type SyncReport = {
-  kind: "pushed" | "pulled" | "merged" | "switched" | "no_changes" | "conflict";
+  kind: "pushed" | "pulled" | "merged" | "switched" | "remapped" | "no_changes" | "conflict";
   namespaceId: string;
   previousHead: string | null;
   head: string | null;

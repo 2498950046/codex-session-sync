@@ -1,11 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, FileTimes, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::codex::scan_codex_home_with_control;
@@ -18,6 +23,7 @@ use crate::local::{
 use crate::models::{LocalSnapshot, ThreadBundle};
 use crate::operation::{OperationControl, OperationProgress};
 use crate::protocol::validate_sha256;
+use crate::storage_v2::{ContentRef, ContentStore, FilesystemContentStore};
 use crate::sync::{TrackingStore, semantic_thread_hash};
 
 pub const CHECKOUT_JOURNAL_SCHEMA_VERSION: u32 = 1;
@@ -53,6 +59,16 @@ pub struct CheckoutDirectorySwap {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CheckoutFileSwap {
+    pub live: PathBuf,
+    pub staged: PathBuf,
+    pub backup: PathBuf,
+    pub original_existed: bool,
+    pub expected_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CheckoutTrackingUpdate {
     pub remote_id: Uuid,
     pub namespace_id: Uuid,
@@ -76,6 +92,8 @@ pub struct CheckoutJournal {
     pub updated_at: String,
     pub database_backups: Vec<CheckoutDatabaseBackup>,
     pub directory_swaps: Vec<CheckoutDirectorySwap>,
+    #[serde(default)]
+    pub file_swaps: Vec<CheckoutFileSwap>,
     pub expected_thread_hashes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracking_update: Option<CheckoutTrackingUpdate>,
@@ -121,6 +139,7 @@ pub fn checkout_local_snapshot_with_control(
         repository_root,
         confirmed_codex_closed,
         None,
+        &[],
         control,
     )
 }
@@ -138,6 +157,7 @@ pub fn checkout_local_snapshot_with_tracking(
         repository_root,
         confirmed_codex_closed,
         Some(tracking_update),
+        &[],
         &OperationControl::default(),
     )
 }
@@ -156,6 +176,27 @@ pub fn checkout_local_snapshot_with_tracking_control(
         repository_root,
         confirmed_codex_closed,
         Some(tracking_update),
+        &[],
+        control,
+    )
+}
+
+pub fn checkout_local_snapshot_with_tracking_and_projects_control(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    tracking_update: CheckoutTrackingUpdate,
+    workspace_project_roots: &[String],
+    control: &OperationControl,
+) -> Result<CheckoutReport> {
+    checkout_local_snapshot_internal(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        Some(tracking_update),
+        workspace_project_roots,
         control,
     )
 }
@@ -166,6 +207,7 @@ fn checkout_local_snapshot_internal(
     repository_root: impl AsRef<Path>,
     confirmed_codex_closed: bool,
     tracking_update: Option<CheckoutTrackingUpdate>,
+    workspace_project_roots: &[String],
     control: &OperationControl,
 ) -> Result<CheckoutReport> {
     if !confirmed_codex_closed {
@@ -223,6 +265,13 @@ fn checkout_local_snapshot_internal(
     for swap in &directory_swaps {
         fs::create_dir_all(&swap.staged)?;
     }
+    let file_swaps = prepare_project_state_swap(
+        &target_codex_home,
+        &snapshot.threads,
+        workspace_project_roots,
+        &staging_root,
+        &local_backup_dir,
+    )?;
 
     let expected_thread_hashes = snapshot
         .threads
@@ -242,6 +291,7 @@ fn checkout_local_snapshot_internal(
         updated_at: now,
         database_backups: Vec::new(),
         directory_swaps,
+        file_swaps,
         expected_thread_hashes,
         tracking_update,
         error: None,
@@ -290,6 +340,7 @@ fn checkout_local_snapshot_internal(
         journal.updated_at = Utc::now().to_rfc3339();
         write_checkout_journal(&journal_path, &journal)?;
         apply_directory_swaps(&journal.directory_swaps)?;
+        apply_file_swaps(&journal.file_swaps)?;
         replace_databases(
             &current.database_paths,
             &snapshot.threads,
@@ -302,6 +353,7 @@ fn checkout_local_snapshot_internal(
         write_checkout_journal(&journal_path, &journal)?;
         let non_cancellable = control.non_cancellable();
         validate_checkout_result(&snapshot, &target_codex_home, &non_cancellable)?;
+        validate_file_swaps(&journal.file_swaps)?;
         journal.status = CheckoutStatus::LocalApplied;
         journal.updated_at = Utc::now().to_rfc3339();
         write_checkout_journal(&journal_path, &journal)?;
@@ -490,12 +542,67 @@ fn stage_rollouts(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let source = repository_object_path(repository_root, &thread.rollout.sha256)?;
-        copy_verified_object(&source, &target, &thread.rollout.sha256, Some(control))?;
+        if let Some(storage) = thread.rollout.storage.clone() {
+            FilesystemContentStore::open(repository_root.to_path_buf())?.materialize(
+                &ContentRef {
+                    logical_sha256: thread.rollout.sha256.clone(),
+                    byte_length: thread.rollout.byte_length,
+                    storage,
+                    media_type: Some(thread.rollout.media_type.clone()),
+                    logical_path: thread.rollout.logical_path.clone(),
+                },
+                &target,
+                control,
+            )?;
+        } else {
+            let source = repository_object_path(repository_root, &thread.rollout.sha256)?;
+            copy_verified_object(&source, &target, &thread.rollout.sha256, Some(control))?;
+        }
         if fs::metadata(&target)?.len() != thread.rollout.byte_length {
             bail!("staged rollout has an unexpected byte length");
         }
+        restore_rollout_modified_time(&target, thread_modified_at_ms(thread))?;
     }
+    Ok(())
+}
+
+fn thread_modified_at_ms(thread: &ThreadBundle) -> Option<i64> {
+    thread.updated_at_ms.or(thread.created_at_ms).or_else(|| {
+        let row = thread
+            .related_records
+            .tables
+            .get("threads")?
+            .first()?
+            .as_object()?;
+        row.get("updated_at_ms")
+            .and_then(serde_json::Value::as_i64)
+            .or_else(|| {
+                row.get("updated_at")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+            .or_else(|| row.get("created_at_ms").and_then(serde_json::Value::as_i64))
+            .or_else(|| {
+                row.get("created_at")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| value.checked_mul(1_000))
+            })
+    })
+}
+
+fn restore_rollout_modified_time(path: &Path, timestamp_ms: Option<i64>) -> Result<()> {
+    let Some(timestamp_ms) = timestamp_ms.filter(|timestamp| *timestamp >= 0) else {
+        return Ok(());
+    };
+    let timestamp = std::time::UNIX_EPOCH
+        .checked_add(Duration::from_millis(timestamp_ms as u64))
+        .context("rollout timestamp is outside the supported filesystem range")?;
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("failed to open staged rollout {}", path.display()))?;
+    file.set_times(FileTimes::new().set_modified(timestamp))
+        .with_context(|| format!("failed to restore rollout timestamp {}", path.display()))?;
     Ok(())
 }
 
@@ -508,14 +615,14 @@ fn apply_directory_swaps(swaps: &[CheckoutDirectorySwap]) -> Result<()> {
             );
         }
         if swap.live.exists() {
-            fs::rename(&swap.live, &swap.backup).with_context(|| {
+            rename_checkout_directory(&swap.live, &swap.backup).with_context(|| {
                 format!(
                     "failed to move current session directory {} to backup",
                     swap.live.display()
                 )
             })?;
         }
-        fs::rename(&swap.staged, &swap.live).with_context(|| {
+        rename_checkout_directory(&swap.staged, &swap.live).with_context(|| {
             format!(
                 "failed to install staged session directory {}",
                 swap.live.display()
@@ -523,6 +630,399 @@ fn apply_directory_swaps(swaps: &[CheckoutDirectorySwap]) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn rename_checkout_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    const WINDOWS_RENAME_ATTEMPTS: usize = 20;
+    const WINDOWS_RENAME_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+    let mut attempt = 1;
+    loop {
+        match fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && attempt < WINDOWS_RENAME_ATTEMPTS
+                    && is_transient_windows_rename_error(&error) =>
+            {
+                thread::sleep(WINDOWS_RENAME_RETRY_DELAY);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+const MAX_CODEX_GLOBAL_STATE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn prepare_project_state_swap(
+    codex_home: &Path,
+    threads: &[ThreadBundle],
+    workspace_project_roots: &[String],
+    staging_root: &Path,
+    local_backup_dir: &Path,
+) -> Result<Vec<CheckoutFileSwap>> {
+    let live = codex_home.join(".codex-global-state.json");
+    if !live.is_file() {
+        return Ok(Vec::new());
+    }
+    let metadata = fs::metadata(&live)?;
+    if metadata.len() > MAX_CODEX_GLOBAL_STATE_BYTES {
+        bail!(
+            "Codex global state is too large to update safely: {} bytes",
+            metadata.len()
+        );
+    }
+    let bytes = fs::read(&live)?;
+    let mut state: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse Codex global state {}", live.display()))?;
+    if !apply_project_assignments(&mut state, threads, workspace_project_roots)? {
+        return Ok(Vec::new());
+    }
+    let output = serde_json::to_vec(&state)?;
+    let expected_sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&output)));
+    let staged = staging_root.join("project-state").join("global-state.json");
+    if let Some(parent) = staged.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staged)?;
+    use std::io::Write as _;
+    file.write_all(&output)?;
+    file.sync_all()?;
+    drop(file);
+    Ok(vec![CheckoutFileSwap {
+        live,
+        staged,
+        backup: local_backup_dir
+            .join("project-state")
+            .join("global-state.json"),
+        original_existed: true,
+        expected_sha256,
+    }])
+}
+
+#[derive(Debug)]
+struct WorkspaceProjectRoot {
+    display: String,
+    identity: String,
+    project_id: String,
+}
+
+fn apply_project_assignments(
+    state: &mut Value,
+    threads: &[ThreadBundle],
+    workspace_project_roots: &[String],
+) -> Result<bool> {
+    let state = state
+        .as_object_mut()
+        .context("Codex global state is not a JSON object")?;
+    // A workspace mapping describes how paths are translated between
+    // machines; it is not necessarily a Codex project root.  A broad mapping
+    // such as `D:/yaxin -> F:/history/yaxin` can contain several projects
+    // (`yxzsApplet`, `yxzsJava`, ...).  Keep mapping roots as fallbacks, and
+    // promote a concrete child path when multiple threads use it.  A
+    // singleton child path is commonly just a task-specific subdirectory and
+    // must stay in its mapped parent project (for example `workspace/new`).
+    let mut root_candidates = workspace_project_roots.to_vec();
+    let mapping_identities = workspace_project_roots
+        .iter()
+        .map(|root| workspace_path_identity(&native_workspace_path(root)))
+        .filter(|identity| !identity.is_empty())
+        .collect::<Vec<_>>();
+    let mut concrete_paths = BTreeMap::<String, (String, usize)>::new();
+    for path in threads.iter().filter_map(checkout_thread_workspace_path) {
+        let display = native_workspace_path(path);
+        let identity = workspace_path_identity(&display);
+        if identity.is_empty() {
+            continue;
+        }
+        concrete_paths
+            .entry(identity)
+            .and_modify(|(_, count)| *count += 1)
+            .or_insert((display, 1));
+    }
+    for (identity, (display, count)) in concrete_paths {
+        let covered_by_mapping = mapping_identities
+            .iter()
+            .any(|prefix| workspace_path_matches(&identity, prefix));
+        if count >= 2 || !covered_by_mapping {
+            root_candidates.push(display);
+        }
+    }
+    let mut roots = root_candidates
+        .iter()
+        .filter_map(|root| {
+            let display = native_workspace_path(root);
+            let identity = workspace_path_identity(&display);
+            (!identity.is_empty()).then_some(WorkspaceProjectRoot {
+                project_id: format!(
+                    "local-{}",
+                    &hex::encode(Sha256::digest(display.as_bytes()))[..32]
+                ),
+                display,
+                identity,
+            })
+        })
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| left.identity.cmp(&right.identity));
+    roots.dedup_by(|left, right| left.identity == right.identity);
+
+    if let Some(projects) = state.get("local-projects").and_then(Value::as_object) {
+        for root in &mut roots {
+            if let Some((project_id, _)) = projects.iter().find(|(_, project)| {
+                project
+                    .get("rootPaths")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|path| workspace_path_identity(path) == root.identity)
+            }) {
+                root.project_id.clone_from(project_id);
+            }
+        }
+    }
+
+    let assignments = threads
+        .iter()
+        .filter_map(|thread| {
+            let cwd = checkout_thread_workspace_path(thread)?;
+            let cwd_display = native_workspace_path(cwd);
+            let cwd_identity = workspace_path_identity(&cwd_display);
+            let root = roots
+                .iter()
+                .filter(|root| workspace_path_matches(&cwd_identity, &root.identity))
+                .max_by_key(|root| root.identity.len())?;
+            Some((
+                thread.thread_id.clone(),
+                cwd_display,
+                root.project_id.clone(),
+                root.identity.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if assignments.is_empty() {
+        return Ok(false);
+    }
+    let used_root_ids = assignments
+        .iter()
+        .map(|(_, _, _, identity)| identity.as_str())
+        .collect::<BTreeSet<_>>();
+    let now = Utc::now().timestamp_millis();
+    let mut changed = false;
+
+    let projects = json_object_field(state, "local-projects")?;
+    for root in roots
+        .iter()
+        .filter(|root| used_root_ids.contains(root.identity.as_str()))
+    {
+        if let Some(existing) = projects.get(&root.project_id) {
+            let same_root = existing
+                .get("rootPaths")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|path| workspace_path_identity(path) == root.identity);
+            if !same_root {
+                bail!("Codex project ID collision for {}", root.display);
+            }
+        } else {
+            let name = Path::new(&root.display)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&root.display);
+            projects.insert(
+                root.project_id.clone(),
+                json!({
+                    "id": root.project_id,
+                    "name": name,
+                    "rootPaths": [root.display],
+                    "createdAt": now,
+                    "updatedAt": now,
+                }),
+            );
+            changed = true;
+        }
+    }
+
+    let order = json_array_field(state, "project-order")?;
+    for root in roots
+        .iter()
+        .filter(|root| used_root_ids.contains(root.identity.as_str()))
+    {
+        if !order
+            .iter()
+            .any(|value| value.as_str() == Some(&root.project_id))
+        {
+            order.push(Value::String(root.project_id.clone()));
+            changed = true;
+        }
+    }
+
+    let saved_roots = json_array_field(state, "electron-saved-workspace-roots")?;
+    for root in roots
+        .iter()
+        .filter(|root| used_root_ids.contains(root.identity.as_str()))
+    {
+        if !saved_roots
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|path| workspace_path_identity(path) == root.identity)
+        {
+            saved_roots.push(Value::String(root.display.clone()));
+            changed = true;
+        }
+    }
+
+    let thread_assignments = json_object_field(state, "thread-project-assignments")?;
+    for (thread_id, cwd, project_id, _) in &assignments {
+        let assignment = json!({
+            "projectKind": "local",
+            "projectId": project_id,
+            "cwd": cwd,
+            "pendingCoreUpdate": false,
+        });
+        if thread_assignments.get(thread_id) != Some(&assignment) {
+            thread_assignments.insert(thread_id.clone(), assignment);
+            changed = true;
+        }
+    }
+
+    if let Some(projectless) = state
+        .get_mut("projectless-thread-ids")
+        .and_then(Value::as_array_mut)
+    {
+        let before = projectless.len();
+        projectless.retain(|value| {
+            value.as_str().is_none_or(|thread_id| {
+                !assignments
+                    .iter()
+                    .any(|(assigned, _, _, _)| assigned == thread_id)
+            })
+        });
+        changed |= before != projectless.len();
+    }
+    Ok(changed)
+}
+
+fn json_object_field<'a>(
+    state: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>> {
+    if !state.contains_key(key) {
+        state.insert(key.to_string(), Value::Object(Map::new()));
+    }
+    state
+        .get_mut(key)
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("Codex global state field {key} is not an object"))
+}
+
+fn json_array_field<'a>(
+    state: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Vec<Value>> {
+    if !state.contains_key(key) {
+        state.insert(key.to_string(), Value::Array(Vec::new()));
+    }
+    state
+        .get_mut(key)
+        .and_then(Value::as_array_mut)
+        .with_context(|| format!("Codex global state field {key} is not an array"))
+}
+
+fn checkout_thread_workspace_path(thread: &ThreadBundle) -> Option<&str> {
+    thread.workspace.source_path.as_deref().or_else(|| {
+        thread
+            .related_records
+            .tables
+            .get("threads")?
+            .first()?
+            .get("cwd")?
+            .as_str()
+    })
+}
+
+fn native_workspace_path(path: &str) -> String {
+    #[cfg(windows)]
+    let path = path.replace('/', "\\");
+    #[cfg(not(windows))]
+    let path = path.replace('\\', "/");
+    path
+}
+
+fn workspace_path_identity(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let normalized = normalized.strip_prefix("//?/").unwrap_or(&normalized);
+    let normalized = normalized.trim_end_matches('/');
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    normalized.to_string()
+}
+
+fn workspace_path_matches(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn apply_file_swaps(swaps: &[CheckoutFileSwap]) -> Result<()> {
+    for swap in swaps {
+        if swap.backup.exists() {
+            bail!(
+                "checkout backup path already exists: {}",
+                swap.backup.display()
+            );
+        }
+        if let Some(parent) = swap.backup.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if swap.live.exists() {
+            rename_checkout_directory(&swap.live, &swap.backup).with_context(|| {
+                format!(
+                    "failed to back up local Codex state {}",
+                    swap.live.display()
+                )
+            })?;
+        }
+        rename_checkout_directory(&swap.staged, &swap.live).with_context(|| {
+            format!(
+                "failed to install local Codex state {}",
+                swap.live.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_file_swaps(swaps: &[CheckoutFileSwap]) -> Result<()> {
+    for swap in swaps {
+        let actual = format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(fs::read(&swap.live)?))
+        );
+        if actual != swap.expected_sha256 {
+            bail!(
+                "local Codex state hash mismatch for {}: expected {}, got {}",
+                swap.live.display(),
+                swap.expected_sha256,
+                actual
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_transient_windows_rename_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied
+        || error.kind() == io::ErrorKind::WouldBlock
+        || matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 fn replace_databases(
@@ -688,7 +1188,8 @@ fn validate_checkout_journal_result(journal: &CheckoutJournal) -> Result<()> {
         );
     }
     let actual = semantic_thread_hashes(&actual.threads)?;
-    validate_thread_hashes(&journal.expected_thread_hashes, &actual)
+    validate_thread_hashes(&journal.expected_thread_hashes, &actual)?;
+    validate_file_swaps(&journal.file_swaps)
 }
 
 fn semantic_thread_hashes(threads: &[ThreadBundle]) -> Result<BTreeMap<String, String>> {
@@ -769,6 +1270,39 @@ fn rollback_checkout(
         .join(&journal.operation_id);
     fs::create_dir_all(&failed_root)?;
     let mut failures = Vec::new();
+    for swap in journal.file_swaps.iter().rev() {
+        let swap_started = local_write_started
+            && (swap.backup.exists() || (!swap.original_existed && swap.live.exists()));
+        if swap_started && swap.live.exists() {
+            let failed = failed_root.join(
+                swap.live
+                    .file_name()
+                    .context("checkout live file has no file name")?,
+            );
+            if failed.exists() {
+                failures.push(format!(
+                    "failed-state path already exists: {}",
+                    failed.display()
+                ));
+            } else if let Err(error) = rename_checkout_directory(&swap.live, &failed) {
+                failures.push(format!(
+                    "failed to preserve checkout file {}: {error}",
+                    swap.live.display()
+                ));
+            }
+        }
+        if swap_started
+            && swap.backup.exists()
+            && !swap.live.exists()
+            && let Err(error) = rename_checkout_directory(&swap.backup, &swap.live)
+        {
+            failures.push(format!(
+                "failed to restore local Codex state {}: {error}",
+                swap.live.display()
+            ));
+        }
+        let _ = fs::remove_file(&swap.staged);
+    }
     for swap in journal.directory_swaps.iter().rev() {
         let swap_started = local_write_started
             && (swap.backup.exists() || (!swap.original_existed && swap.live.exists()));
@@ -783,7 +1317,7 @@ fn rollback_checkout(
                     "failed-state path already exists: {}",
                     failed.display()
                 ));
-            } else if let Err(error) = fs::rename(&swap.live, &failed) {
+            } else if let Err(error) = rename_checkout_directory(&swap.live, &failed) {
                 failures.push(format!(
                     "failed to preserve checkout directory {}: {error}",
                     swap.live.display()
@@ -792,7 +1326,8 @@ fn rollback_checkout(
         }
         if swap_started
             && swap.backup.exists()
-            && let Err(error) = fs::rename(&swap.backup, &swap.live)
+            && !swap.live.exists()
+            && let Err(error) = rename_checkout_directory(&swap.backup, &swap.live)
         {
             failures.push(format!(
                 "failed to restore session directory {}: {error}",
@@ -850,6 +1385,15 @@ fn validate_checkout_journal(journal: &CheckoutJournal) -> Result<()> {
         }
         validate_tracking_update(update)?;
     }
+    for swap in &journal.file_swaps {
+        validate_sha256(&swap.expected_sha256).map_err(|_| {
+            anyhow::anyhow!(
+                "invalid checkout file hash {} for {}",
+                swap.expected_sha256,
+                swap.live.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -894,6 +1438,25 @@ mod tests {
     };
 
     #[test]
+    fn staged_rollout_modified_time_can_be_restored_from_thread_timestamp() {
+        let directory = tempdir().unwrap();
+        let rollout = directory.path().join("rollout-thread.jsonl");
+        fs::write(&rollout, b"rollout").unwrap();
+        let timestamp_ms = 1_700_000_100_123_i64;
+
+        restore_rollout_modified_time(&rollout, Some(timestamp_ms)).unwrap();
+
+        let actual = fs::metadata(&rollout)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert!((actual - timestamp_ms).abs() <= 2_000);
+    }
+
+    #[test]
     fn exact_checkout_replaces_sessions_and_keeps_recoverable_backup() {
         let temp = tempdir().unwrap();
         let codex_home = temp.path().join("codex");
@@ -910,6 +1473,44 @@ mod tests {
         assert_eq!(scanned.threads[0].thread_id, "new");
         assert!(report.local_backup_dir.join("sessions").is_dir());
         assert!(report.backup_dir.join("databases/0.sqlite").is_file());
+        let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        assert_eq!(journal.status, CheckoutStatus::Completed);
+    }
+
+    #[test]
+    fn checkout_accepts_older_thread_rows_when_newer_schema_adds_defaulted_columns() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let connection = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE threads ADD COLUMN recency_at INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL DEFAULT 'legacy';
+                 ALTER TABLE threads ADD COLUMN name TEXT;
+                 CREATE TRIGGER threads_recency_at_after_insert
+                 AFTER INSERT ON threads
+                 WHEN NEW.recency_at_ms = 0
+                 BEGIN
+                     UPDATE threads
+                     SET recency_at = NEW.updated_at,
+                         recency_at_ms = NEW.updated_at * 1000
+                     WHERE id = NEW.id;
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+
+        let report = checkout_local_snapshot(&manifest, &codex_home, &repository, true).unwrap();
+        let scanned = crate::scan_codex_home(&codex_home).unwrap();
+
+        assert_eq!(scanned.threads.len(), 1);
+        assert_eq!(scanned.threads[0].thread_id, "new");
         let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
         assert_eq!(journal.status, CheckoutStatus::Completed);
     }
@@ -1062,6 +1663,27 @@ mod tests {
         let repository = temp.path().join("repository");
         create_fixture_home(&codex_home, "old", b"old rollout");
         let catalog_path = create_fixture_thread_catalog(&codex_home);
+        let original_project_state = serde_json::to_vec(&json!({
+            "electron-saved-workspace-roots": ["C:/existing"],
+            "project-order": ["local-existing"],
+            "local-projects": {
+                "local-existing": {
+                    "id": "local-existing",
+                    "name": "existing",
+                    "rootPaths": ["C:/existing"],
+                    "createdAt": 1,
+                    "updatedAt": 1
+                }
+            },
+            "thread-project-assignments": {},
+            "projectless-thread-ids": ["new"]
+        }))
+        .unwrap();
+        fs::write(
+            codex_home.join(".codex-global-state.json"),
+            &original_project_state,
+        )
+        .unwrap();
         let target = snapshot_with_object(&repository, "new", b"new rollout");
         let manifest = store_local_snapshot(&target, &repository).unwrap();
         let remote_id = Uuid::now_v7();
@@ -1073,7 +1695,7 @@ mod tests {
             .compare_and_set(&codex_home, remote_id, namespace_id, None, Some(&old_head))
             .unwrap();
 
-        let error = checkout_local_snapshot_with_tracking(
+        let error = checkout_local_snapshot_with_tracking_and_projects_control(
             &manifest,
             &codex_home,
             &repository,
@@ -1085,6 +1707,8 @@ mod tests {
                 integrated_head: Some(target_head),
                 activate_namespace: true,
             },
+            &["C:/work".to_string()],
+            &OperationControl::default(),
         )
         .unwrap_err();
 
@@ -1122,6 +1746,10 @@ mod tests {
         assert_eq!(local_entries, 1);
         assert_eq!(local_state, (Some(100.0), 1, 42, Some(100)));
         assert_eq!(revision, 7);
+        assert_eq!(
+            fs::read(codex_home.join(".codex-global-state.json")).unwrap(),
+            original_project_state
+        );
     }
 
     #[test]
@@ -1348,6 +1976,7 @@ mod tests {
                     original_existed: true,
                 })
                 .collect(),
+            file_swaps: Vec::new(),
             expected_thread_hashes: BTreeMap::new(),
             tracking_update: None,
             error: None,
@@ -1358,6 +1987,81 @@ mod tests {
         let scanned = crate::scan_codex_home(&codex_home).unwrap();
         assert_eq!(scanned.threads[0].thread_id, "old");
         assert!(codex_home.join("sessions").is_dir());
+    }
+
+    #[test]
+    fn project_assignments_preserve_nested_projects_under_a_mapping_root() -> Result<()> {
+        let temp = tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let mut parent = snapshot_with_object(&repository, "parent", b"parent")
+            .threads
+            .remove(0);
+        let mut applet = parent.clone();
+        let mut java = parent.clone();
+        let mut technical = parent.clone();
+        parent.workspace.source_path = Some("F:/history/yaxin".to_string());
+        applet.thread_id = "applet".to_string();
+        applet.workspace.source_path = Some("F:/history/yaxin/yxzsApplet".to_string());
+        java.thread_id = "java".to_string();
+        java.workspace.source_path = Some("F:/history/yaxin/yxzsJava".to_string());
+        technical.thread_id = "technical".to_string();
+        technical.workspace.source_path = Some("F:/history/yaxin/technical-center".to_string());
+        let mut applet_second = applet.clone();
+        applet_second.thread_id = "applet-second".to_string();
+        let mut java_second = java.clone();
+        java_second.thread_id = "java-second".to_string();
+        let mut technical_second = technical.clone();
+        technical_second.thread_id = "technical-second".to_string();
+
+        let mut state = json!({
+            "electron-saved-workspace-roots": [],
+            "project-order": [],
+            "local-projects": {},
+            "thread-project-assignments": {},
+            "projectless-thread-ids": [
+                "parent", "applet", "applet-second", "java", "java-second",
+                "technical", "technical-second"
+            ]
+        });
+        assert!(apply_project_assignments(
+            &mut state,
+            &[
+                parent,
+                applet,
+                applet_second,
+                java,
+                java_second,
+                technical,
+                technical_second,
+            ],
+            &["F:/history/yaxin".to_string()]
+        )?);
+
+        let assignments = state["thread-project-assignments"].as_object().unwrap();
+        let projects = state["local-projects"].as_object().unwrap();
+        let project_name = |thread_id: &str| {
+            let project_id = assignments[thread_id]["projectId"].as_str().unwrap();
+            projects[project_id]["name"].as_str().unwrap()
+        };
+        assert_eq!(project_name("parent"), "yaxin");
+        assert_eq!(project_name("applet"), "yxzsApplet");
+        assert_eq!(project_name("java"), "yxzsJava");
+        assert_eq!(project_name("technical"), "technical-center");
+        assert_eq!(
+            assignments["applet"]["projectId"],
+            assignments["applet-second"]["projectId"]
+        );
+        assert_ne!(
+            assignments["applet"]["projectId"],
+            assignments["java"]["projectId"]
+        );
+        assert!(
+            state["projectless-thread-ids"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        Ok(())
     }
 
     fn create_fixture_home(codex_home: &Path, thread_id: &str, content: &[u8]) {
@@ -1510,6 +2214,7 @@ mod tests {
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: Some(format!("sessions/2026/07/26/rollout-{thread_id}.jsonl")),
                     source_path: None,
+                    storage: None,
                 },
                 related_records: RelatedRecords {
                     source_database: None,

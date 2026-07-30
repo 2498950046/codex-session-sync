@@ -1,5 +1,26 @@
 # Codex Session Sync
 
+## Storage protocol v2
+
+New local snapshots use a typed, content-addressed graph. Small rollouts are
+stored as immutable whole objects; rollouts of 8 MiB or more use fixed 4 MiB
+chunks plus a canonical chunk manifest. Thread metadata is stored once as an
+immutable descriptor and the snapshot root contains only thread/descriptor
+references. Existing v1 snapshots and `/api/v1` objects remain readable.
+
+The server advertises protocol 2 capabilities and exposes authenticated typed
+object transfer at `/api/v2/objects/{kind}/{sha256}` plus the batched
+`/api/v2/objects/missing` query. Typed objects are separated by kind even when
+their byte hashes match. Metadata schema v2 includes rebuildable object and
+edge tables for reachability and future server-side maintenance.
+
+Local GC is deliberately two-phase: `plan_local_gc` recomputes reachability
+from authoritative v2 roots and `quarantine_local_gc_plan` revalidates the
+plan before moving unreachable immutable objects into `trash/gc/<operation>`.
+It never permanently deletes data. Legacy repository optimization remains an
+explicit user operation; application startup does not migrate or reclaim old
+objects automatically.
+
 A personal, self-hosted, Git-like synchronization system for Codex
 conversations. The repository contains a cross-platform Tauri desktop client,
 a Rust synchronization core, and an Axum server.

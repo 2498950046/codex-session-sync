@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Read};
@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 use crate::models::{
     ContentObject, QuarantinedRollout, RelatedRecords, ScanDashboardReport, ScanReport,
     ScanWarning, ScanWarningKind, THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, ThreadPreview,
-    WorkspaceRef,
+    WorkspacePathUsage, WorkspaceRef,
 };
 use crate::operation::{OperationControl, OperationProgress};
 
@@ -182,6 +182,7 @@ impl ScannedThread {
                 media_type: self.rollout.media_type,
                 logical_path: self.rollout.logical_path,
                 source_path: Some(self.rollout.source_path),
+                storage: None,
             },
             related_records: self.related_records,
             attachments: Vec::new(),
@@ -193,6 +194,7 @@ impl ScannedThread {
 pub(crate) struct MetadataScanReport {
     pub(crate) codex_home: PathBuf,
     pub(crate) database_paths: Vec<PathBuf>,
+    pub(crate) workspace_path_usage: Vec<WorkspacePathUsage>,
     pub(crate) active_count: usize,
     pub(crate) archived_count: usize,
     pub(crate) total_rollout_bytes: u64,
@@ -259,6 +261,20 @@ pub fn scan_codex_home_dashboard_with_control(
             .collect(),
         warnings: report.warnings,
     })
+}
+
+pub fn scan_codex_home_workspace_usage(
+    codex_home: impl AsRef<Path>,
+) -> Result<Vec<WorkspacePathUsage>> {
+    let report = scan_codex_home_metadata_with_control(codex_home, &OperationControl::default())?;
+    Ok(report.workspace_path_usage)
+}
+
+pub fn scan_codex_home_workspace_paths(codex_home: impl AsRef<Path>) -> Result<Vec<String>> {
+    Ok(scan_codex_home_workspace_usage(codex_home)?
+        .into_iter()
+        .map(|usage| usage.path)
+        .collect())
 }
 
 pub fn scan_codex_home_with_control(
@@ -328,7 +344,6 @@ pub(crate) fn scan_codex_home_metadata_with_control(
     let database_paths = discover_database_paths(&codex_home);
     let mut warnings = Vec::new();
     let db_records = load_database_records(&database_paths, &mut warnings);
-
     let mut rollouts = BTreeMap::<String, RolloutRecord>::new();
     let mut rollout_count = 0_u64;
     for (directory, archived) in SESSION_DIRS {
@@ -401,8 +416,11 @@ pub(crate) fn scan_codex_home_metadata_with_control(
     let mut total_rollout_bytes = 0_u64;
     let mut active_count = 0_usize;
     let mut archived_count = 0_usize;
+    let mut scanned_thread_ids = BTreeSet::new();
+    let mut workspace_path_usage = BTreeMap::<String, WorkspacePathUsage>::new();
 
     for (thread_id, rollout) in rollouts {
+        scanned_thread_ids.insert(thread_id.clone());
         let db = db_records.get(&thread_id);
         let title = db
             .and_then(|record| record.title.clone())
@@ -423,6 +441,7 @@ pub(crate) fn scan_codex_home_metadata_with_control(
         } else {
             active_count += 1;
         }
+        record_workspace_path_usage(&mut workspace_path_usage, cwd.as_deref(), archived);
         total_rollout_bytes += rollout.rollout.byte_length;
 
         let related_records = db.map_or_else(RelatedRecords::default, |record| RelatedRecords {
@@ -447,15 +466,48 @@ pub(crate) fn scan_codex_home_metadata_with_control(
         });
     }
 
+    for (thread_id, record) in &db_records {
+        if !scanned_thread_ids.contains(thread_id) {
+            record_workspace_path_usage(
+                &mut workspace_path_usage,
+                record.cwd.as_deref(),
+                record.archived.unwrap_or(false),
+            );
+        }
+    }
+
     Ok(MetadataScanReport {
         codex_home,
         database_paths,
+        workspace_path_usage: workspace_path_usage.into_values().collect(),
         active_count,
         archived_count,
         total_rollout_bytes,
         threads,
         warnings,
     })
+}
+
+fn record_workspace_path_usage(
+    usage: &mut BTreeMap<String, WorkspacePathUsage>,
+    path: Option<&str>,
+    archived: bool,
+) {
+    let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let entry = usage
+        .entry(crate::workspace::normalize_workspace_path_for_match(path))
+        .or_insert_with(|| WorkspacePathUsage {
+            path: path.to_string(),
+            active_count: 0,
+            archived_count: 0,
+        });
+    if archived {
+        entry.archived_count += 1;
+    } else {
+        entry.active_count += 1;
+    }
 }
 
 fn read_rollout_record(
@@ -941,6 +993,44 @@ mod tests {
             Some("/tmp/db-demo")
         );
         assert!(report.warnings.is_empty());
+        let usage = scan_codex_home_workspace_usage(temp.path()).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].path, "/tmp/db-demo");
+        assert_eq!(usage[0].active_count, 1);
+        assert_eq!(usage[0].archived_count, 0);
+    }
+
+    #[test]
+    fn workspace_path_scan_counts_active_and_archived_database_rows_without_rollouts() {
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, cwd, archived) VALUES
+                    ('active-1', 'F:/history/referenced', 0),
+                    ('active-2', 'F:/history/referenced', 0),
+                    ('archived-1', 'F:/history/referenced', 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let usage = scan_codex_home_workspace_usage(temp.path()).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].path, "F:/history/referenced");
+        assert_eq!(usage[0].active_count, 2);
+        assert_eq!(usage[0].archived_count, 1);
+        assert_eq!(
+            scan_codex_home_workspace_paths(temp.path()).unwrap(),
+            vec!["F:/history/referenced".to_string()]
+        );
     }
 
     #[test]

@@ -5,9 +5,10 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sync_core::{
-    CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, LocalSnapshot, OperationControl,
-    OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome,
-    TrackingRecord, TrackingStore, checkout_local_snapshot_with_tracking_control,
+    CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, ContentStore,
+    FilesystemContentStore, LocalSnapshot, OperationControl, OperationProgress, ThreadBundle,
+    ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome, TrackingRecord, TrackingStore,
+    WorkspacePathMapper, checkout_local_snapshot_with_tracking_and_projects_control,
     collect_object_descriptors, create_local_snapshot_with_control, install_repository_object,
     load_local_snapshot, merge_thread_sets, remote_thread_view, repository_object_path,
     resolve_thread_sets, revision_to_snapshot, semantic_thread_hash, snapshot_to_revision,
@@ -29,8 +30,113 @@ pub enum SyncOutcomeKind {
     Pulled,
     Merged,
     Switched,
+    Remapped,
     NoChanges,
     Conflict,
+}
+
+#[derive(Clone, Copy)]
+pub struct LocalSyncContext<'a> {
+    codex_home: &'a Path,
+    repository_root: &'a Path,
+    workspace_mapper: &'a WorkspacePathMapper,
+    control: &'a OperationControl,
+}
+
+impl<'a> LocalSyncContext<'a> {
+    pub fn new(
+        codex_home: &'a Path,
+        repository_root: &'a Path,
+        workspace_mapper: &'a WorkspacePathMapper,
+        control: &'a OperationControl,
+    ) -> Self {
+        Self {
+            codex_home,
+            repository_root,
+            workspace_mapper,
+            control,
+        }
+    }
+}
+
+pub fn reapply_workspace_mappings(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    client.info()?;
+    let tracking = TrackingStore::open(repository_root)?;
+    let active = tracking
+        .active(codex_home)?
+        .context("no namespace is active for this Codex home")?;
+    if active.remote_id != remote_id || active.namespace_id != namespace_id {
+        bail!("the selected namespace is not active; switch namespaces before applying mappings");
+    }
+    let record = tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .context("active namespace has no tracking record")?;
+    let reference = record
+        .integrated_head
+        .as_deref()
+        .map(|head| client.revision(head))
+        .transpose()?;
+    if let Some(revision) = &reference {
+        validate_revision_namespace(revision, namespace_id)?;
+    }
+    let local_summary =
+        create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
+    if local_summary.warning_count > 0 {
+        bail!("workspace remap is blocked because the local scan contains warnings");
+    }
+    let local = load_local_snapshot(local_summary.manifest_path)?;
+    let snapshot = workspace_mapper.materialize_snapshot_objects_with_reference(
+        &local,
+        reference
+            .as_ref()
+            .map(|revision| revision.payload.threads.as_slice())
+            .unwrap_or_default(),
+        repository_root,
+        control,
+    )?;
+    let thread_count = snapshot.threads.len();
+    let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = workspace_mapper.local_prefixes();
+    ensure_codex_closed()?;
+    let checkout = checkout_local_snapshot_with_tracking_and_projects_control(
+        manifest,
+        codex_home,
+        repository_root,
+        true,
+        CheckoutTrackingUpdate {
+            remote_id,
+            namespace_id,
+            expected_generation: Some(record.generation),
+            integrated_head: record.integrated_head.clone(),
+            activate_namespace: true,
+        },
+        &project_roots,
+        control,
+    )?;
+    Ok(SyncReport {
+        kind: SyncOutcomeKind::Remapped,
+        namespace_id,
+        previous_head: record.integrated_head.clone(),
+        head: record.integrated_head.clone(),
+        revision_id: record.integrated_head,
+        uploaded_objects: 0,
+        downloaded_objects: 0,
+        thread_count,
+        conflicts: Vec::new(),
+        checkout: Some(checkout),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,10 +158,14 @@ pub fn push_namespace(
     remote_id: Uuid,
     namespace_id: Uuid,
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
     ensure_codex_closed()?;
     client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
@@ -77,7 +187,11 @@ pub fn push_namespace(
             summary.warning_count
         );
     }
-    let snapshot = load_local_snapshot(&summary.manifest_path)?;
+    let snapshot = workspace_mapper.canonicalize_snapshot_objects(
+        &load_local_snapshot(&summary.manifest_path)?,
+        repository_root,
+        control,
+    )?;
     let revision = snapshot_to_revision(&snapshot, namespace_id, remote_head.clone())?;
     if let Some(head) = remote_head.as_deref() {
         let current = client.revision(head)?;
@@ -121,7 +235,46 @@ pub fn push_namespace(
         );
     }
 
-    let descriptors = collect_object_descriptors(&revision.payload.threads)?;
+    let typed_store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let mut typed_objects = BTreeSet::new();
+    for thread in &revision.payload.threads {
+        if let Some(storage) = thread.rollout.storage.clone() {
+            typed_objects.extend(typed_store.content_objects(&sync_core::ContentRef {
+                logical_sha256: thread.rollout.sha256.clone(),
+                byte_length: thread.rollout.byte_length,
+                storage,
+                media_type: Some(thread.rollout.media_type.clone()),
+                logical_path: thread.rollout.logical_path.clone(),
+            })?);
+        }
+    }
+    let missing_typed = client.missing_typed_objects(typed_objects.into_iter().collect())?;
+    let mut uploaded = 0;
+    for (index, object) in missing_typed.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "push_typed_objects".to_string(),
+            message: format!("{} {}", object.kind, object.sha256),
+            completed: index as u64,
+            total: Some(missing_typed.len() as u64),
+            unit: "objects".to_string(),
+            cancellable: true,
+        });
+        let path = typed_store.object_path(object)?;
+        if client.upload_typed_object(object, &path, control)? {
+            uploaded += 1;
+        }
+    }
+
+    let descriptors = collect_object_descriptors(
+        &revision
+            .payload
+            .threads
+            .iter()
+            .filter(|thread| thread.rollout.storage.is_none())
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
     let missing = client
         .missing_objects(descriptors.clone())?
         .into_iter()
@@ -136,7 +289,6 @@ pub fn push_namespace(
     {
         bail!("server requested an object that is not part of the revision");
     }
-    let mut uploaded = 0;
     for (index, sha256) in missing.iter().enumerate() {
         control.check_cancelled()?;
         control.report(OperationProgress {
@@ -211,18 +363,9 @@ pub fn pull_namespace(
     remote_id: Uuid,
     namespace_id: Uuid,
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
-    let prepared = match prepare_pull(
-        remote_id,
-        namespace_id,
-        client,
-        codex_home,
-        repository_root,
-        control,
-    )? {
+    let prepared = match prepare_pull(remote_id, namespace_id, client, context)? {
         PreparedPull::NoChanges { head } => {
             return Ok(SyncReport {
                 kind: SyncOutcomeKind::NoChanges,
@@ -255,8 +398,6 @@ pub fn pull_namespace(
     }
     let thread_count = prepared.merged.threads.len();
     let checkout = apply_prepared_pull(
-        codex_home,
-        repository_root,
         CheckoutTrackingUpdate {
             remote_id,
             namespace_id,
@@ -265,7 +406,7 @@ pub fn pull_namespace(
             activate_namespace: true,
         },
         prepared.merged.threads,
-        control,
+        context,
     )?;
     Ok(SyncReport {
         kind: SyncOutcomeKind::Pulled,
@@ -286,18 +427,15 @@ pub fn resolve_pull_conflicts(
     namespace_id: Uuid,
     resolutions: &[ThreadConflictResolution],
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
-    let prepared = match prepare_pull(
-        remote_id,
-        namespace_id,
-        client,
+    let LocalSyncContext {
         codex_home,
         repository_root,
+        workspace_mapper,
         control,
-    )? {
+    } = context;
+    let prepared = match prepare_pull(remote_id, namespace_id, client, context)? {
         PreparedPull::NoChanges { .. } => {
             bail!("there are no remote changes to resolve; pull again")
         }
@@ -324,8 +462,6 @@ pub fn resolve_pull_conflicts(
     let previous_head = prepared.previous_head.clone();
     let downloaded = prepared.downloaded;
     let checkout = apply_prepared_pull(
-        codex_home,
-        repository_root,
         CheckoutTrackingUpdate {
             remote_id,
             namespace_id,
@@ -334,7 +470,7 @@ pub fn resolve_pull_conflicts(
             activate_namespace: true,
         },
         resolved_threads,
-        control,
+        context,
     )?;
 
     // Applying first preserves the user's explicit merge locally if the remote Head changes
@@ -353,9 +489,12 @@ pub fn resolve_pull_conflicts(
         remote_id,
         namespace_id,
         client,
-        codex_home,
-        repository_root,
-        &publish_control,
+        LocalSyncContext::new(
+            codex_home,
+            repository_root,
+            workspace_mapper,
+            &publish_control,
+        ),
     )
     .context("conflicts were safely applied locally, but publishing failed; use Push to retry")?;
     Ok(SyncReport {
@@ -392,10 +531,14 @@ fn prepare_pull(
     remote_id: Uuid,
     namespace_id: Uuid,
     client: &RemoteClient,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<PreparedPull> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
     ensure_codex_closed()?;
     client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
@@ -435,7 +578,11 @@ fn prepare_pull(
     if local_summary.warning_count > 0 {
         bail!("pull is blocked because the local scan contains warnings");
     }
-    let local = load_local_snapshot(local_summary.manifest_path)?;
+    let local = workspace_mapper.canonicalize_snapshot_objects(
+        &load_local_snapshot(local_summary.manifest_path)?,
+        repository_root,
+        control,
+    )?;
     let base = match previous_head.as_deref() {
         Some(head) => {
             let revision = client.revision(head)?;
@@ -459,27 +606,37 @@ fn prepare_pull(
 }
 
 fn apply_prepared_pull(
-    codex_home: &Path,
-    repository_root: &Path,
     tracking_update: CheckoutTrackingUpdate,
     threads: Vec<ThreadBundle>,
-    control: &OperationControl,
+    context: LocalSyncContext<'_>,
 ) -> Result<CheckoutReport> {
-    let snapshot = LocalSnapshot {
-        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
-        snapshot_id: Uuid::now_v7().to_string(),
-        created_at: Utc::now().to_rfc3339(),
-        threads,
-        warning_count: 0,
-    };
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    let snapshot = workspace_mapper.materialize_snapshot_objects(
+        &LocalSnapshot {
+            schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: Uuid::now_v7().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            threads,
+            warning_count: 0,
+        },
+        repository_root,
+        control,
+    )?;
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
-    checkout_local_snapshot_with_tracking_control(
+    checkout_local_snapshot_with_tracking_and_projects_control(
         manifest,
         codex_home,
         repository_root,
         true,
         tracking_update,
+        &project_roots,
         control,
     )
 }
@@ -489,23 +646,21 @@ pub fn switch_namespace(
     namespace_id: Uuid,
     target_client: &RemoteClient,
     current_client: Option<&RemoteClient>,
-    codex_home: &Path,
-    repository_root: &Path,
-    control: &OperationControl,
+    current_workspace_mapper: Option<&WorkspacePathMapper>,
+    context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper: target_workspace_mapper,
+        control,
+    } = context;
     ensure_codex_closed()?;
     target_client.info()?;
     let tracking = TrackingStore::open(repository_root)?;
     if let Some(active) = tracking.active(codex_home)? {
         if active.remote_id == remote_id && active.namespace_id == namespace_id {
-            return pull_namespace(
-                remote_id,
-                namespace_id,
-                target_client,
-                codex_home,
-                repository_root,
-                control,
-            );
+            return pull_namespace(remote_id, namespace_id, target_client, context);
         }
         let current_client = current_client.context(
             "the active namespace uses a different remote, but its client is unavailable",
@@ -516,6 +671,7 @@ pub fn switch_namespace(
             current_client,
             codex_home,
             repository_root,
+            current_workspace_mapper.unwrap_or(target_workspace_mapper),
             control,
         )?;
     }
@@ -548,9 +704,15 @@ pub fn switch_namespace(
             0,
         ),
     };
+    let snapshot = target_workspace_mapper.materialize_snapshot_objects(
+        &snapshot,
+        repository_root,
+        control,
+    )?;
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = target_workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
-    let checkout = checkout_local_snapshot_with_tracking_control(
+    let checkout = checkout_local_snapshot_with_tracking_and_projects_control(
         manifest,
         codex_home,
         repository_root,
@@ -562,6 +724,7 @@ pub fn switch_namespace(
             integrated_head: target_head.clone(),
             activate_namespace: true,
         },
+        &project_roots,
         control,
     )?;
     Ok(SyncReport {
@@ -584,6 +747,7 @@ fn ensure_active_namespace_clean(
     client: &RemoteClient,
     codex_home: &Path,
     repository_root: &Path,
+    workspace_mapper: &WorkspacePathMapper,
     control: &OperationControl,
 ) -> Result<()> {
     client.info()?;
@@ -595,7 +759,11 @@ fn ensure_active_namespace_clean(
     if local_summary.warning_count > 0 {
         bail!("namespace switch is blocked because the local scan contains warnings");
     }
-    let local = load_local_snapshot(local_summary.manifest_path)?;
+    let local = workspace_mapper.canonicalize_snapshot_objects(
+        &load_local_snapshot(local_summary.manifest_path)?,
+        repository_root,
+        control,
+    )?;
     let base = match record.integrated_head.as_deref() {
         Some(head) => {
             let revision = client.revision(head)?;
@@ -616,9 +784,85 @@ fn download_revision_objects(
     repository_root: &Path,
     control: &OperationControl,
 ) -> Result<usize> {
-    let descriptors = collect_object_descriptors(threads)?;
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut downloaded = 0;
+    for thread in threads {
+        let Some(storage) = thread.rollout.storage.clone() else {
+            continue;
+        };
+        let content = sync_core::ContentRef {
+            logical_sha256: thread.rollout.sha256.clone(),
+            byte_length: thread.rollout.byte_length,
+            storage: storage.clone(),
+            media_type: Some(thread.rollout.media_type.clone()),
+            logical_path: thread.rollout.logical_path.clone(),
+        };
+        match storage {
+            sync_core::StorageRef::Whole { object_sha256 } => {
+                let object = sync_core::StorageObjectRef {
+                    kind: sync_core::StorageObjectKind::Whole,
+                    sha256: object_sha256,
+                    byte_length: content.byte_length,
+                };
+                if !store.contains_storage_object(&object)? {
+                    let response = client.download_typed_object(&object)?;
+                    if store.install(&object, response, control)? {
+                        downloaded += 1;
+                    }
+                }
+            }
+            sync_core::StorageRef::Chunked { manifest_sha256 } => {
+                let manifest_path = store.object_path_by_id(
+                    sync_core::StorageObjectKind::ChunkManifest,
+                    &manifest_sha256,
+                )?;
+                if !manifest_path.exists() {
+                    let probe = sync_core::StorageObjectRef {
+                        kind: sync_core::StorageObjectKind::ChunkManifest,
+                        sha256: manifest_sha256.clone(),
+                        byte_length: 0,
+                    };
+                    let response = client.download_typed_object(&probe)?;
+                    let length = response
+                        .content_length()
+                        .context("typed manifest response has no Content-Length")?;
+                    let object = sync_core::StorageObjectRef {
+                        byte_length: length,
+                        ..probe
+                    };
+                    if store.install(&object, response, control)? {
+                        downloaded += 1;
+                    }
+                }
+                let manifest = store.load_chunk_manifest(&manifest_sha256)?;
+                if manifest.logical_sha256 != content.logical_sha256
+                    || manifest.byte_length != content.byte_length
+                {
+                    bail!("downloaded chunk manifest does not match rollout");
+                }
+                for chunk in manifest.chunks {
+                    let object = sync_core::StorageObjectRef {
+                        kind: sync_core::StorageObjectKind::Chunk,
+                        sha256: chunk.sha256,
+                        byte_length: chunk.byte_length,
+                    };
+                    if !store.contains_storage_object(&object)? {
+                        let response = client.download_typed_object(&object)?;
+                        if store.install(&object, response, control)? {
+                            downloaded += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let descriptors = collect_object_descriptors(threads)?;
     for (index, descriptor) in descriptors.iter().enumerate() {
+        if threads.iter().any(|thread| {
+            thread.rollout.sha256 == descriptor.sha256 && thread.rollout.storage.is_some()
+        }) {
+            continue;
+        }
         control.check_cancelled()?;
         control.report(OperationProgress {
             phase: "pull_objects".to_string(),
@@ -715,7 +959,7 @@ fn ensure_codex_closed() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{BufRead, BufReader, Write};
 
     use axum::Router;
     use rusqlite::{Connection, params};
@@ -770,6 +1014,7 @@ mod tests {
         let home_b = temp.path().join("home-b");
         let repository_a = temp.path().join("repository-a");
         let repository_b = temp.path().join("repository-b");
+        let workspace_mapper = WorkspacePathMapper::default();
         initialize_home(&home_a);
         initialize_home(&home_b);
         insert_fixture_thread(&home_a, "shared-thread");
@@ -779,9 +1024,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pushed_a.kind, SyncOutcomeKind::Pushed);
@@ -800,9 +1048,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(retried_b.kind, SyncOutcomeKind::NoChanges);
@@ -825,9 +1076,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(repeated_b.kind, SyncOutcomeKind::NoChanges);
@@ -867,9 +1121,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(retried_stale.kind, SyncOutcomeKind::NoChanges);
@@ -929,6 +1186,12 @@ mod tests {
         let home_b = temp.path().join("home-b");
         let repository_a = temp.path().join("repository-a");
         let repository_b = temp.path().join("repository-b");
+        let workspace_mapper_a = WorkspacePathMapper::default();
+        let workspace_mapper_b = WorkspacePathMapper::new(vec![sync_core::WorkspacePathMapping {
+            remote_prefix: "C:/work".to_string(),
+            local_prefix: "F:/workspace".to_string(),
+        }])
+        .unwrap();
         initialize_home(&home_a);
         initialize_home(&home_b);
         insert_fixture_thread(&home_a, "thread-a");
@@ -937,21 +1200,40 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pushed_a.kind, SyncOutcomeKind::Pushed);
+        let pushed_a_head = pushed_a.head.as_deref().unwrap();
+        let pushed_a_revision = client.revision(pushed_a_head).unwrap();
+        let thread_a_remote_hash = pushed_a_revision
+            .payload
+            .threads
+            .iter()
+            .find(|thread| thread.thread_id == "thread-a")
+            .unwrap()
+            .rollout
+            .sha256
+            .clone();
+        assert_eq!(object_cwd(&repository_a, &thread_a_remote_hash), "C:/work");
 
         let switched_b = switch_namespace(
             remote_id,
             namespace.id,
             &client,
             None,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            None,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(switched_b.kind, SyncOutcomeKind::Switched);
@@ -959,26 +1241,105 @@ mod tests {
             sync_core::scan_codex_home(&home_b).unwrap().threads.len(),
             1
         );
+        assert_eq!(
+            sync_core::scan_codex_home(&home_b).unwrap().threads[0]
+                .workspace
+                .source_path
+                .as_deref(),
+            Some("C:/work")
+        );
+        insert_fixture_thread_at(&home_b, "thread-b", "C:/work/new");
 
-        insert_fixture_thread(&home_b, "thread-b");
+        let remapped_b = reapply_workspace_mappings(
+            remote_id,
+            namespace.id,
+            &client,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_b,
+                &OperationControl::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(remapped_b.kind, SyncOutcomeKind::Remapped);
+        let remapped_paths = sync_core::scan_codex_home(&home_b)
+            .unwrap()
+            .threads
+            .into_iter()
+            .map(|thread| (thread.thread_id, thread.workspace.source_path.unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(remapped_paths["thread-a"], "F:/workspace");
+        assert_eq!(remapped_paths["thread-b"], "F:/workspace/new");
+        assert_eq!(rollout_cwd(&home_b, "thread-a"), "F:/workspace");
+        assert_eq!(rollout_cwd(&home_b, "thread-b"), "F:/workspace/new");
+        let project_state: serde_json::Value =
+            serde_json::from_reader(File::open(home_b.join(".codex-global-state.json")).unwrap())
+                .unwrap();
+        let assignment_a = &project_state["thread-project-assignments"]["thread-a"];
+        let assignment_b = &project_state["thread-project-assignments"]["thread-b"];
+        assert_eq!(assignment_a["projectId"], assignment_b["projectId"]);
+        assert_eq!(
+            assignment_a["cwd"].as_str().unwrap().replace('\\', "/"),
+            "F:/workspace"
+        );
+        assert_eq!(
+            assignment_b["cwd"].as_str().unwrap().replace('\\', "/"),
+            "F:/workspace/new"
+        );
+        assert!(
+            remapped_b
+                .checkout
+                .as_ref()
+                .unwrap()
+                .local_backup_dir
+                .join("project-state/global-state.json")
+                .is_file()
+        );
+
         let pushed_b = push_namespace(
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_b,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pushed_b.kind, SyncOutcomeKind::Pushed);
+        let pushed_b_revision = client.revision(pushed_b.head.as_deref().unwrap()).unwrap();
+        let pushed_b_threads = pushed_b_revision
+            .payload
+            .threads
+            .iter()
+            .map(|thread| (thread.thread_id.as_str(), &thread.rollout.sha256))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            pushed_b_threads.get("thread-a").map(|hash| hash.as_str()),
+            Some(thread_a_remote_hash.as_str())
+        );
+        assert_eq!(
+            object_cwd(&repository_b, pushed_b_threads["thread-a"]),
+            "C:/work"
+        );
+        assert_eq!(
+            object_cwd(&repository_b, pushed_b_threads["thread-b"]),
+            "C:/work/new"
+        );
 
         let pulled_a = pull_namespace(
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pulled_a.kind, SyncOutcomeKind::Pulled);
@@ -1033,6 +1394,7 @@ mod tests {
         let home_b = temp.path().join("home-b");
         let repository_a = temp.path().join("repository-a");
         let repository_b = temp.path().join("repository-b");
+        let workspace_mapper = WorkspacePathMapper::default();
         initialize_home(&home_a);
         initialize_home(&home_b);
         insert_fixture_thread(&home_a, "shared-thread");
@@ -1041,9 +1403,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         switch_namespace(
@@ -1051,9 +1416,13 @@ mod tests {
             namespace.id,
             &client,
             None,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            None,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
 
@@ -1062,9 +1431,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         modify_fixture_thread(&home_b, "shared-thread", "来自 B", "event-b");
@@ -1073,9 +1445,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(conflicted.kind, SyncOutcomeKind::Conflict);
@@ -1094,9 +1469,12 @@ mod tests {
             namespace.id,
             &resolutions,
             &client,
-            &home_b,
-            &repository_b,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(resolved.kind, SyncOutcomeKind::Merged);
@@ -1111,9 +1489,12 @@ mod tests {
             remote_id,
             namespace.id,
             &client,
-            &home_a,
-            &repository_a,
-            &OperationControl::default(),
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &workspace_mapper,
+                &OperationControl::default(),
+            ),
         )
         .unwrap();
         assert_eq!(pulled_a.kind, SyncOutcomeKind::Pulled);
@@ -1131,6 +1512,18 @@ mod tests {
     fn initialize_home(home: &Path) {
         fs::create_dir_all(home.join("sessions/2026/07/26")).unwrap();
         fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        fs::write(
+            home.join(".codex-global-state.json"),
+            serde_json::to_vec(&json!({
+                "electron-saved-workspace-roots": [],
+                "project-order": [],
+                "local-projects": {},
+                "thread-project-assignments": {},
+                "projectless-thread-ids": ["thread-a", "thread-b"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
         connection
             .execute_batch(
@@ -1152,6 +1545,10 @@ mod tests {
     }
 
     fn insert_fixture_thread(home: &Path, thread_id: &str) {
+        insert_fixture_thread_at(home, thread_id, "C:/work");
+    }
+
+    fn insert_fixture_thread_at(home: &Path, thread_id: &str, cwd: &str) {
         let rollout = home
             .join("sessions/2026/07/26")
             .join(format!("rollout-{thread_id}.jsonl"));
@@ -1161,7 +1558,7 @@ mod tests {
             "{}",
             json!({
                 "type": "session_meta",
-                "payload": {"id": thread_id, "cwd": "C:/work", "model_provider": "openai"}
+                "payload": {"id": thread_id, "cwd": cwd, "model_provider": "openai"}
             })
         )
         .unwrap();
@@ -1172,8 +1569,8 @@ mod tests {
                 "INSERT INTO threads (
                     id, rollout_path, created_at, updated_at, source, model_provider,
                     cwd, title, sandbox_policy, approval_mode, archived
-                 ) VALUES (?1, ?2, 1, 1, 'cli', 'openai', 'C:/work', ?1, '{}', 'never', 0)",
-                params![thread_id, rollout.to_string_lossy().as_ref()],
+                 ) VALUES (?1, ?2, 1, 1, 'cli', 'openai', ?3, ?1, '{}', 'never', 0)",
+                params![thread_id, rollout.to_string_lossy().as_ref(), cwd],
             )
             .unwrap();
     }
@@ -1202,6 +1599,32 @@ mod tests {
         .unwrap();
     }
 
+    fn rollout_cwd(home: &Path, thread_id: &str) -> String {
+        let connection = Connection::open(home.join("state_5.sqlite")).unwrap();
+        let rollout_path: String = connection
+            .query_row(
+                "SELECT rollout_path FROM threads WHERE id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        first_record_cwd(File::open(rollout_path).unwrap())
+    }
+
+    fn object_cwd(repository: &Path, sha256: &str) -> String {
+        let path = repository_object_path(repository, sha256).unwrap();
+        first_record_cwd(File::open(path).unwrap())
+    }
+
+    fn first_record_cwd(file: File) -> String {
+        let mut first_line = String::new();
+        BufReader::new(file).read_line(&mut first_line).unwrap();
+        serde_json::from_str::<serde_json::Value>(&first_line).unwrap()["payload"]["cwd"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     fn test_thread(id: &str) -> ThreadBundle {
         ThreadBundle {
             schema_version: sync_core::THREAD_BUNDLE_SCHEMA_VERSION,
@@ -1218,6 +1641,7 @@ mod tests {
                 media_type: "application/x-ndjson".to_string(),
                 logical_path: Some(format!("sessions/rollout-{id}.jsonl")),
                 source_path: None,
+                storage: None,
             },
             related_records: sync_core::RelatedRecords {
                 source_database: None,

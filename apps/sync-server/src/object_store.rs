@@ -340,13 +340,13 @@ impl ObjectStore {
             hasher.update(&buffer[..read]);
         }
 
-        if let Some(expected_length) = expected_length {
-            if actual_length != expected_length {
-                return Err(ObjectStoreError::LengthMismatch {
-                    expected_bytes: expected_length,
-                    actual_bytes: actual_length,
-                });
-            }
+        if let Some(expected_length) = expected_length
+            && actual_length != expected_length
+        {
+            return Err(ObjectStoreError::LengthMismatch {
+                expected_bytes: expected_length,
+                actual_bytes: actual_length,
+            });
         }
         let actual_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
         if actual_digest != expected_digest {

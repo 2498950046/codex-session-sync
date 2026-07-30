@@ -1,5 +1,5 @@
 import { mockIPC } from "@tauri-apps/api/mocks";
-import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport } from "./types";
+import type { JobSnapshot, NamespaceMappingState, ScanReport, SyncReport, WorkspaceMappingRule, WorkspacePullPlan } from "./types";
 
 const remoteId = "019fa1a0-1111-7111-8111-111111111111";
 const namespaceId = "019fa1a0-2222-7222-8222-222222222222";
@@ -69,6 +69,20 @@ const conflictReport: SyncReport = {
   }],
 };
 
+const remapReport: SyncReport = {
+  ...conflictReport,
+  kind: "remapped",
+  conflicts: [],
+  checkout: {
+    operationId: "019fa1a0-6666-7666-8666-666666666666",
+    snapshotId: "019fa1a0-7777-7777-8777-777777777777",
+    threadCount: 418,
+    backupDir: "C:/Users/demo/.codex-session-sync/backups/remap",
+    localBackupDir: "C:/Users/demo/.codex/.codex-session-sync/backups/remap",
+    journalPath: "C:/Users/demo/.codex-session-sync/journal/checkout-remap.json",
+  },
+};
+
 const scanReport: ScanReport = {
   codexHome: "C:/Users/demo/.codex",
   databasePaths: ["C:/Users/demo/.codex/state_5.sqlite"],
@@ -111,11 +125,55 @@ const namespaceMappingState: NamespaceMappingState = {
   },
 };
 
-export async function installDevelopmentPreview(_preview: "conflict" | "mapping") {
+export async function installDevelopmentPreview(preview: "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure") {
   let automaticEnabled = true;
   let selectedProfileNamespaceId = namespaceId;
   let manualOverrideNamespaceId: string | null = null;
   let mappings = [...namespaceMappingState.mappings];
+  let workspaceMappings: WorkspaceMappingRule[] = [
+    {
+      id: "019fa1a0-5555-7555-8555-555555555555",
+      remoteId,
+      namespaceId: workNamespaceId,
+      codexHomeKey: "c:/users/demo/.codex",
+      remotePrefix: "D:/projects/cpa",
+      localPrefix: "F:/history/cpa",
+      createdAt: "2026-07-27T00:00:00Z",
+      updatedAt: "2026-07-27T00:00:00Z",
+    },
+    {
+      id: "019fa1a0-6666-7666-8666-666666666666",
+      remoteId,
+      namespaceId: workNamespaceId,
+      codexHomeKey: "c:/users/demo/.codex",
+      remotePrefix: "D:/yaxin",
+      localPrefix: "F:/history/yaxin",
+      createdAt: "2026-07-27T00:00:00Z",
+      updatedAt: "2026-07-27T00:00:00Z",
+    },
+  ];
+  let workspaceCleanupPaths = [
+    "F:/history/cpa-3",
+    "F:/history/do-c-2",
+    "F:/history/new-chat-5",
+  ];
+
+  function workspacePullPlan(requestedNamespaceId: string): WorkspacePullPlan {
+    return {
+      remoteId,
+      namespaceId: requestedNamespaceId,
+      remoteHead: requestedNamespaceId === workNamespaceId ? remoteHead : baseHash,
+      mappedPathCount: workspaceMappings.length,
+      existingPathCount: 1,
+      unmappedPaths: workspaceMappings.length > 0 ? [] : [{
+        remotePath: "D:/projects/codex-session-sync",
+        suggestedSubdirectory: "codex-session-sync",
+      }, {
+        remotePath: "/Users/demo/work/notes",
+        suggestedSubdirectory: "notes",
+      }],
+    };
+  }
 
   function currentMappingState(): NamespaceMappingState {
     const mappedNamespaceId = mappings[0]?.namespaceId ?? null;
@@ -156,8 +214,14 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
   mockIPC((command, args) => {
     if (command === "get_default_codex_home") return "C:/Users/demo/.codex";
     if (command === "get_default_repository_root") return "C:/Users/demo/.codex-session-sync";
-    if (command === "list_codex_processes") return [];
-    if (command === "list_remote_profiles") return [{
+    if (command === "list_codex_processes") return preview === "process-running" ? [{
+      pid: 4242,
+      name: "Codex",
+      executable: "C:/Program Files/Codex/Codex.exe",
+      commandLine: [],
+      kind: "desktop",
+    }] : [];
+    if (command === "list_remote_profiles") return preview === "empty" ? [] : [{
       id: remoteId,
       displayName: "个人服务器",
       serverUrl: "https://sync.example.test",
@@ -195,6 +259,78 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
       };
     }
     if (command === "get_namespace_mapping_state") return currentMappingState();
+    if (command === "get_workspace_mapping_state") return {
+      remoteId,
+      namespaceId: String((args as { namespaceId?: string } | undefined)?.namespaceId ?? namespaceId),
+      codexHomeKey: "c:/users/demo/.codex",
+      mappings: workspaceMappings,
+    };
+    if (command === "get_workspace_cleanup_report") return {
+      scannedRoots: ["F:/history"],
+      entries: [
+        { path: "F:/history/cpa", activeCount: 1, archivedCount: 2, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/cpa").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix, localPrefix: mapping.localPrefix, inherited: false })), codexProjectNames: ["cpa"], directoryState: "nonEmpty", cleanupEligible: false },
+        { path: "F:/history/do-c", activeCount: 3, archivedCount: 1, mappings: [], codexProjectNames: ["do-c"], directoryState: "nonEmpty", cleanupEligible: false },
+        { path: "F:/history/yaxin", activeCount: 0, archivedCount: 4, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/yaxin").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix, localPrefix: mapping.localPrefix, inherited: false })), codexProjectNames: ["yaxin"], directoryState: "nonEmpty", cleanupEligible: false },
+        { path: "F:/history/yaxin/data-platform", activeCount: 5, archivedCount: 0, mappings: workspaceMappings.filter((mapping) => mapping.localPrefix === "F:/history/yaxin").map((mapping) => ({ id: mapping.id, remotePrefix: mapping.remotePrefix, localPrefix: mapping.localPrefix, inherited: true })), codexProjectNames: ["data-platform"], directoryState: "missing", cleanupEligible: false },
+        ...workspaceCleanupPaths.map((path) => ({ path, activeCount: 0, archivedCount: 0, mappings: [], codexProjectNames: path.endsWith("new-chat-5") ? [] : [path.split("/").at(-1) ?? path], directoryState: path.endsWith("do-c-2") ? "missing" : "empty", cleanupEligible: true })),
+      ],
+      candidates: workspaceCleanupPaths.map((path) => ({ path })),
+    };
+    if (command === "quarantine_workspace_directories") {
+      const paths = (args as { request?: { paths?: string[] } } | undefined)?.request?.paths ?? [];
+      workspaceCleanupPaths = workspaceCleanupPaths.filter((path) => !paths.includes(path));
+      return {
+        quarantined: paths.filter((path) => !path.endsWith("do-c-2")).map((path) => ({
+          originalPath: path,
+          quarantinePath: `C:/Users/demo/.codex-session-sync/quarantine/empty-workspaces/${path.split("/").at(-1)}`,
+        })),
+        removedCodexProjects: paths.filter((path) => !path.endsWith("new-chat-5")).length,
+        removedThreadAssignments: 2,
+        backupPath: "C:/Users/demo/.codex-session-sync/backups/workspace-cleanup-preview/codex-global-state.json",
+        journalPath: "C:/Users/demo/.codex-session-sync/journal/workspace-cleanup-preview.json",
+      };
+    }
+    if (command === "get_workspace_pull_plan") {
+      const requestedNamespaceId = String((args as { namespaceId?: string } | undefined)?.namespaceId ?? namespaceId);
+      return workspacePullPlan(requestedNamespaceId);
+    }
+    if (command === "create_automatic_workspace_mappings") {
+      const request = (args as { request?: { namespaceId?: string; mappings?: Array<{ remotePath: string; localPath: string }> } } | undefined)?.request;
+      const plan = workspacePullPlan(String(request?.namespaceId ?? namespaceId));
+      workspaceMappings = (request?.mappings ?? []).map((mapping, index) => ({
+        id: `019fa1a0-5555-7555-8555-55555555555${index}`,
+        remoteId,
+        namespaceId: plan.namespaceId,
+        codexHomeKey: "c:/users/demo/.codex",
+        remotePrefix: mapping.remotePath,
+        localPrefix: mapping.localPath,
+        createdAt: "2026-07-28T00:00:00Z",
+        updatedAt: "2026-07-28T00:00:00Z",
+      }));
+      return {
+        state: { remoteId, namespaceId: plan.namespaceId, codexHomeKey: "c:/users/demo/.codex", mappings: workspaceMappings },
+        createdDirectories: workspaceMappings.map((mapping) => mapping.localPrefix),
+      };
+    }
+    if (command === "create_workspace_mapping") {
+      const request = (args as { request?: { namespaceId?: string; remotePrefix?: string; localPrefix?: string } } | undefined)?.request;
+      workspaceMappings = [...workspaceMappings, {
+        id: "019fa1a0-5555-7555-8555-555555555555",
+        remoteId,
+        namespaceId: String(request?.namespaceId ?? namespaceId),
+        codexHomeKey: "c:/users/demo/.codex",
+        remotePrefix: String(request?.remotePrefix ?? "D:/projects"),
+        localPrefix: String(request?.localPrefix ?? "F:/workspace"),
+        createdAt: "2026-07-28T00:00:00Z",
+        updatedAt: "2026-07-28T00:00:00Z",
+      }];
+      return { remoteId, namespaceId: request?.namespaceId ?? namespaceId, codexHomeKey: "c:/users/demo/.codex", mappings: workspaceMappings };
+    }
+    if (command === "delete_workspace_mapping") {
+      const mappingId = String((args as { mappingId?: string } | undefined)?.mappingId);
+      workspaceMappings = workspaceMappings.filter((mapping) => mapping.id !== mappingId);
+      return { remoteId, namespaceId, codexHomeKey: "c:/users/demo/.codex", mappings: workspaceMappings };
+    }
     if (command === "set_automatic_namespace_selection") {
       automaticEnabled = Boolean((args as { enabled?: boolean } | undefined)?.enabled);
       if (automaticEnabled) manualOverrideNamespaceId = null;
@@ -211,15 +347,20 @@ export async function installDevelopmentPreview(_preview: "conflict" | "mapping"
       return currentMappingState();
     }
     if (command === "start_pull_job") return job("preview-pull", "pull", "running");
+    if (command === "start_workspace_remap_job") return job("preview-remap", "remap", "running");
     if (command === "start_scan_job") return job("preview-scan", "scan", "running");
     if (command === "get_job") {
       const jobId = String((args as { jobId?: string } | undefined)?.jobId);
-      return job(jobId, jobId === "preview-scan" ? "scan" : "pull", "completed");
+      if (preview === "job") return job(jobId, jobId === "preview-scan" ? "scan" : "pull", "running");
+      if (preview === "failure") return {
+        ...job(jobId, jobId === "preview-scan" ? "scan" : "pull", "failed"),
+        error: "预览任务失败：服务器返回的对象未通过哈希校验。",
+      };
+      return job(jobId, jobId === "preview-scan" ? "scan" : jobId === "preview-remap" ? "remap" : "pull", "completed");
     }
     if (command === "take_job_result") {
-      return (args as { jobId?: string } | undefined)?.jobId === "preview-scan"
-        ? scanReport
-        : conflictReport;
+      const jobId = (args as { jobId?: string } | undefined)?.jobId;
+      return jobId === "preview-scan" ? scanReport : jobId === "preview-remap" ? remapReport : conflictReport;
     }
     if (command === "select_remote_namespace") {
       const selected = String((args as { namespaceId?: string } | undefined)?.namespaceId);
