@@ -1,0 +1,22 @@
+services:
+  sync-server:
+    build:
+      context: ../..
+      dockerfile: apps/sync-server/Dockerfile
+    image: codex-session-sync-server:local
+    container_name: codex-session-sync-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SYNC_SERVER_BIND: 0.0.0.0:8787
+      SYNC_SERVER_DATA_DIR: /data
+    ports:
+      - "0.0.0.0:8787:8787"
+    volumes:
+      - sync-server-data:/data
+
+volumes:
+  sync-server-data:
+    name: codex-session-sync-data
+
