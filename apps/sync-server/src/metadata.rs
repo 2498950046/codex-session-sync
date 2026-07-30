@@ -6,13 +6,14 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sync_core::{
-    Namespace, ObjectDescriptor, RevisionManifest, RevisionValidationError, validate_sha256,
+    Namespace, ObjectDescriptor, RevisionManifest, RevisionValidationError, StorageObjectRef,
+    validate_sha256,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const METADATA_SCHEMA_VERSION: i64 = 1;
+const METADATA_SCHEMA_VERSION: i64 = 2;
 const MAX_NAMESPACE_NAME_CHARS: usize = 128;
 pub const MAX_REVISION_OBJECTS: usize = 10_000;
 pub const MAX_REVISION_OBJECT_REFERENCES: usize = 20_000;
@@ -192,9 +193,28 @@ impl MetadataStore {
                      PRIMARY KEY (revision_id, object_sha256),
                      FOREIGN KEY (revision_id) REFERENCES revisions(id) ON DELETE CASCADE
                  );
+                 CREATE TABLE IF NOT EXISTS storage_objects (
+                     kind TEXT NOT NULL,
+                     sha256 TEXT NOT NULL,
+                     byte_length INTEGER NOT NULL CHECK (byte_length >= 0),
+                     created_at TEXT NOT NULL,
+                     PRIMARY KEY (kind, sha256)
+                 );
+                 CREATE TABLE IF NOT EXISTS object_edges (
+                     owner_kind TEXT NOT NULL,
+                     owner_sha256 TEXT NOT NULL,
+                     target_kind TEXT NOT NULL,
+                     target_sha256 TEXT NOT NULL,
+                     PRIMARY KEY (owner_kind, owner_sha256, target_kind, target_sha256)
+                 );
+                 CREATE TABLE IF NOT EXISTS revision_roots (
+                     revision_id TEXT PRIMARY KEY,
+                     root_sha256 TEXT NOT NULL,
+                     root_schema_version INTEGER NOT NULL
+                 );
                  CREATE INDEX IF NOT EXISTS revisions_namespace_id_idx
                      ON revisions(namespace_id, created_at, id);
-                 PRAGMA user_version = 1;
+                 PRAGMA user_version = 2;
                  COMMIT;",
             )?;
             Ok(())
@@ -275,6 +295,54 @@ impl MetadataStore {
                 kind: "revision",
                 id: revision_id,
             })
+        })
+        .await
+    }
+
+    pub async fn record_storage_object(
+        &self,
+        object: StorageObjectRef,
+    ) -> Result<(), MetadataError> {
+        self.with_connection(move |connection| {
+            let byte_length =
+                i64::try_from(object.byte_length).map_err(|_| conflict(&object.sha256))?;
+            connection.execute(
+                "INSERT INTO storage_objects (kind, sha256, byte_length, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(kind, sha256) DO UPDATE SET byte_length = excluded.byte_length
+                 WHERE storage_objects.byte_length = excluded.byte_length",
+                params![
+                    object.kind.wire_name(),
+                    object.sha256,
+                    byte_length,
+                    now_rfc3339()
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn replace_object_edges(
+        &self,
+        owner: StorageObjectRef,
+        targets: Vec<StorageObjectRef>,
+    ) -> Result<(), MetadataError> {
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "DELETE FROM object_edges WHERE owner_kind = ?1 AND owner_sha256 = ?2",
+                params![owner.kind.wire_name(), owner.sha256],
+            )?;
+            for target in targets {
+                transaction.execute(
+                    "INSERT INTO object_edges (owner_kind, owner_sha256, target_kind, target_sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![owner.kind.wire_name(), owner.sha256, target.kind.wire_name(), target.sha256],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
         })
         .await
     }
@@ -642,6 +710,7 @@ mod tests {
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: None,
                     source_path: None,
+                    storage: None,
                 },
                 related_records: RelatedRecords::default(),
                 attachments: Vec::new(),
@@ -682,6 +751,7 @@ mod tests {
                 media_type: "application/octet-stream".to_string(),
                 logical_path: None,
                 source_path: None,
+                storage: None,
             })
             .collect();
         let manifest = RevisionManifest::from_payload(manifest.payload).unwrap();
@@ -847,13 +917,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("metadata.sqlite");
         let connection = Connection::open(&db_path).unwrap();
-        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
         drop(connection);
 
         let store = MetadataStore::new(db_path);
         assert!(matches!(
             store.initialize().await,
-            Err(MetadataError::UnsupportedSchema { actual: 2 })
+            Err(MetadataError::UnsupportedSchema { actual: 3 })
         ));
     }
 }

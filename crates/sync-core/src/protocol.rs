@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::models::{ContentObject, THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle};
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
 pub const REVISION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,6 +18,51 @@ pub struct ProtocolInfoResponse {
     pub service: String,
     pub version: String,
     pub protocol_version: u32,
+    #[serde(default)]
+    pub capabilities: ProtocolCapabilities,
+    #[serde(default)]
+    pub limits: ProtocolLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolCapabilities {
+    pub chunked_objects: bool,
+    pub thread_descriptors: bool,
+    pub revision_roots_v2: bool,
+    pub garbage_collection: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolLimits {
+    pub max_chunk_bytes: u64,
+    pub max_chunks_per_content: usize,
+    pub max_objects_per_revision: usize,
+    pub max_threads_per_revision: usize,
+}
+
+impl Default for ProtocolLimits {
+    fn default() -> Self {
+        Self {
+            max_chunk_bytes: crate::storage_v2::MAX_CHUNK_BYTES,
+            max_chunks_per_content: crate::storage_v2::MAX_CHUNKS_PER_CONTENT,
+            max_objects_per_revision: crate::storage_v2::MAX_OBJECT_REFERENCES,
+            max_threads_per_revision: crate::storage_v2::MAX_THREADS_PER_REVISION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypedMissingObjectsRequest {
+    pub objects: Vec<crate::storage_v2::StorageObjectRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TypedMissingObjectsResponse {
+    pub missing: Vec<crate::storage_v2::StorageObjectRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -419,6 +464,7 @@ mod tests {
                 media_type: "application/x-ndjson".to_string(),
                 logical_path: Some(format!("sessions/rollout-{thread_id}.jsonl")),
                 source_path: None,
+                storage: None,
             },
             related_records: RelatedRecords {
                 source_database: None,

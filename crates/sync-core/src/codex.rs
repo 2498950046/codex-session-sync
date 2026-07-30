@@ -182,6 +182,7 @@ impl ScannedThread {
                 media_type: self.rollout.media_type,
                 logical_path: self.rollout.logical_path,
                 source_path: Some(self.rollout.source_path),
+                storage: None,
             },
             related_records: self.related_records,
             attachments: Vec::new(),

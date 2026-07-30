@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::local::{
     install_prepared_repository_object, repository_object_path, validate_repository_object,
 };
+use crate::storage_v2::ContentStore;
 use crate::{LocalSnapshot, ObjectDescriptor, OperationControl, OperationProgress, ThreadBundle};
 
 const MAX_SESSION_META_BYTES: u64 = 1024 * 1024;
@@ -333,6 +334,12 @@ fn rewrite_rollout_session_meta_cwd(
     object.sha256 = descriptor.sha256;
     object.byte_length = descriptor.byte_length;
     object.source_path = None;
+    let content = crate::storage_v2::FilesystemContentStore::open(repository_root.to_path_buf())?
+        .ingest(
+        &repository_object_path(repository_root, &object.sha256)?,
+        control,
+    )?;
+    object.storage = Some(content.storage);
     Ok(())
 }
 
@@ -765,7 +772,11 @@ mod tests {
         let restored = mapper
             .canonicalize_snapshot_objects(&local, repository.path(), &OperationControl::default())
             .unwrap();
-        assert_eq!(restored, remote);
+        let mut restored_semantic = restored.clone();
+        let mut remote_semantic = remote.clone();
+        restored_semantic.threads[0].rollout.storage = None;
+        remote_semantic.threads[0].rollout.storage = None;
+        assert_eq!(restored_semantic, remote_semantic);
         assert_eq!(restored.threads[0].rollout.sha256, descriptor.sha256);
     }
 
@@ -794,6 +805,7 @@ mod tests {
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: Some("sessions/rollout-thread.jsonl".to_string()),
                     source_path: Some(PathBuf::from("rollout-thread.jsonl")),
+                    storage: None,
                 },
                 related_records: RelatedRecords {
                     source_database: None,

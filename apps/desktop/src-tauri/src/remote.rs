@@ -15,6 +15,7 @@ use sync_core::{
     MissingObjectsRequest, MissingObjectsResponse, Namespace, NamespaceHeadResponse,
     NamespaceListResponse, ObjectDescriptor, OperationControl, ProtocolInfoResponse,
     PutObjectResponse, REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RevisionManifest,
+    StorageObjectRef, TypedMissingObjectsRequest, TypedMissingObjectsResponse,
 };
 use url::Url;
 use uuid::Uuid;
@@ -152,6 +153,65 @@ impl RemoteClient {
             &MissingObjectsRequest { objects },
         )?;
         Ok(response.missing)
+    }
+
+    #[allow(dead_code)]
+    pub fn missing_typed_objects(
+        &self,
+        objects: Vec<StorageObjectRef>,
+    ) -> Result<Vec<StorageObjectRef>> {
+        let response: TypedMissingObjectsResponse = self.send_json(
+            self.client.post(self.endpoint("api/v2/objects/missing")?),
+            &TypedMissingObjectsRequest { objects },
+        )?;
+        Ok(response.missing)
+    }
+
+    #[allow(dead_code)]
+    pub fn upload_typed_object(
+        &self,
+        object: &StorageObjectRef,
+        path: &Path,
+        control: &OperationControl,
+    ) -> Result<bool> {
+        let digest = raw_digest(&object.sha256)?;
+        if std::fs::metadata(path)?.len() != object.byte_length {
+            bail!("typed object length changed before upload");
+        }
+        let file = File::open(path)?;
+        let response = self
+            .client
+            .put(self.endpoint(&format!(
+                "api/v2/objects/{}/{digest}",
+                object.kind.wire_name()
+            ))?)
+            .header(CONTENT_LENGTH, object.byte_length)
+            .body(Body::sized(
+                CancellableReader {
+                    inner: file,
+                    control: control.clone(),
+                },
+                object.byte_length,
+            ))
+            .send()?;
+        let response: PutObjectResponse = parse_json_response(response)?;
+        if response.sha256 != object.sha256 || response.byte_length != object.byte_length {
+            bail!("server acknowledged a different typed object");
+        }
+        Ok(response.created)
+    }
+
+    #[allow(dead_code)]
+    pub fn download_typed_object(&self, object: &StorageObjectRef) -> Result<Response> {
+        let digest = raw_digest(&object.sha256)?;
+        ensure_success(
+            self.client
+                .get(self.endpoint(&format!(
+                    "api/v2/objects/{}/{digest}",
+                    object.kind.wire_name()
+                ))?)
+                .send()?,
+        )
     }
 
     pub fn upload_object(
@@ -495,6 +555,7 @@ mod tests {
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: Some("sessions/rollout-one.jsonl".to_string()),
                     source_path: None,
+                    storage: None,
                 },
                 related_records: RelatedRecords {
                     source_database: None,

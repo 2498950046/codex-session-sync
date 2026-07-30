@@ -23,6 +23,7 @@ use crate::local::{
 use crate::models::{LocalSnapshot, ThreadBundle};
 use crate::operation::{OperationControl, OperationProgress};
 use crate::protocol::validate_sha256;
+use crate::storage_v2::{ContentRef, ContentStore, FilesystemContentStore};
 use crate::sync::{TrackingStore, semantic_thread_hash};
 
 pub const CHECKOUT_JOURNAL_SCHEMA_VERSION: u32 = 1;
@@ -541,8 +542,22 @@ fn stage_rollouts(
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let source = repository_object_path(repository_root, &thread.rollout.sha256)?;
-        copy_verified_object(&source, &target, &thread.rollout.sha256, Some(control))?;
+        if let Some(storage) = thread.rollout.storage.clone() {
+            FilesystemContentStore::open(repository_root.to_path_buf())?.materialize(
+                &ContentRef {
+                    logical_sha256: thread.rollout.sha256.clone(),
+                    byte_length: thread.rollout.byte_length,
+                    storage,
+                    media_type: Some(thread.rollout.media_type.clone()),
+                    logical_path: thread.rollout.logical_path.clone(),
+                },
+                &target,
+                control,
+            )?;
+        } else {
+            let source = repository_object_path(repository_root, &thread.rollout.sha256)?;
+            copy_verified_object(&source, &target, &thread.rollout.sha256, Some(control))?;
+        }
         if fs::metadata(&target)?.len() != thread.rollout.byte_length {
             bail!("staged rollout has an unexpected byte length");
         }
@@ -2199,6 +2214,7 @@ mod tests {
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: Some(format!("sessions/2026/07/26/rollout-{thread_id}.jsonl")),
                     source_path: None,
+                    storage: None,
                 },
                 related_records: RelatedRecords {
                     source_database: None,

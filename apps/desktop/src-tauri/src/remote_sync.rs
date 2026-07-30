@@ -5,14 +5,14 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sync_core::{
-    CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, LocalSnapshot, OperationControl,
-    OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome,
-    TrackingRecord, TrackingStore, WorkspacePathMapper,
-    checkout_local_snapshot_with_tracking_and_projects_control, collect_object_descriptors,
-    create_local_snapshot_with_control, install_repository_object, load_local_snapshot,
-    merge_thread_sets, remote_thread_view, repository_object_path, resolve_thread_sets,
-    revision_to_snapshot, semantic_thread_hash, snapshot_to_revision, store_local_snapshot,
-    validate_repository_object,
+    CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, ContentStore,
+    FilesystemContentStore, LocalSnapshot, OperationControl, OperationProgress, ThreadBundle,
+    ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome, TrackingRecord, TrackingStore,
+    WorkspacePathMapper, checkout_local_snapshot_with_tracking_and_projects_control,
+    collect_object_descriptors, create_local_snapshot_with_control, install_repository_object,
+    load_local_snapshot, merge_thread_sets, remote_thread_view, repository_object_path,
+    resolve_thread_sets, revision_to_snapshot, semantic_thread_hash, snapshot_to_revision,
+    store_local_snapshot, validate_repository_object,
 };
 use uuid::Uuid;
 
@@ -235,7 +235,46 @@ pub fn push_namespace(
         );
     }
 
-    let descriptors = collect_object_descriptors(&revision.payload.threads)?;
+    let typed_store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let mut typed_objects = BTreeSet::new();
+    for thread in &revision.payload.threads {
+        if let Some(storage) = thread.rollout.storage.clone() {
+            typed_objects.extend(typed_store.content_objects(&sync_core::ContentRef {
+                logical_sha256: thread.rollout.sha256.clone(),
+                byte_length: thread.rollout.byte_length,
+                storage,
+                media_type: Some(thread.rollout.media_type.clone()),
+                logical_path: thread.rollout.logical_path.clone(),
+            })?);
+        }
+    }
+    let missing_typed = client.missing_typed_objects(typed_objects.into_iter().collect())?;
+    let mut uploaded = 0;
+    for (index, object) in missing_typed.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "push_typed_objects".to_string(),
+            message: format!("{} {}", object.kind, object.sha256),
+            completed: index as u64,
+            total: Some(missing_typed.len() as u64),
+            unit: "objects".to_string(),
+            cancellable: true,
+        });
+        let path = typed_store.object_path(object)?;
+        if client.upload_typed_object(object, &path, control)? {
+            uploaded += 1;
+        }
+    }
+
+    let descriptors = collect_object_descriptors(
+        &revision
+            .payload
+            .threads
+            .iter()
+            .filter(|thread| thread.rollout.storage.is_none())
+            .cloned()
+            .collect::<Vec<_>>(),
+    )?;
     let missing = client
         .missing_objects(descriptors.clone())?
         .into_iter()
@@ -250,7 +289,6 @@ pub fn push_namespace(
     {
         bail!("server requested an object that is not part of the revision");
     }
-    let mut uploaded = 0;
     for (index, sha256) in missing.iter().enumerate() {
         control.check_cancelled()?;
         control.report(OperationProgress {
@@ -746,9 +784,85 @@ fn download_revision_objects(
     repository_root: &Path,
     control: &OperationControl,
 ) -> Result<usize> {
-    let descriptors = collect_object_descriptors(threads)?;
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut downloaded = 0;
+    for thread in threads {
+        let Some(storage) = thread.rollout.storage.clone() else {
+            continue;
+        };
+        let content = sync_core::ContentRef {
+            logical_sha256: thread.rollout.sha256.clone(),
+            byte_length: thread.rollout.byte_length,
+            storage: storage.clone(),
+            media_type: Some(thread.rollout.media_type.clone()),
+            logical_path: thread.rollout.logical_path.clone(),
+        };
+        match storage {
+            sync_core::StorageRef::Whole { object_sha256 } => {
+                let object = sync_core::StorageObjectRef {
+                    kind: sync_core::StorageObjectKind::Whole,
+                    sha256: object_sha256,
+                    byte_length: content.byte_length,
+                };
+                if !store.contains_storage_object(&object)? {
+                    let response = client.download_typed_object(&object)?;
+                    if store.install(&object, response, control)? {
+                        downloaded += 1;
+                    }
+                }
+            }
+            sync_core::StorageRef::Chunked { manifest_sha256 } => {
+                let manifest_path = store.object_path_by_id(
+                    sync_core::StorageObjectKind::ChunkManifest,
+                    &manifest_sha256,
+                )?;
+                if !manifest_path.exists() {
+                    let probe = sync_core::StorageObjectRef {
+                        kind: sync_core::StorageObjectKind::ChunkManifest,
+                        sha256: manifest_sha256.clone(),
+                        byte_length: 0,
+                    };
+                    let response = client.download_typed_object(&probe)?;
+                    let length = response
+                        .content_length()
+                        .context("typed manifest response has no Content-Length")?;
+                    let object = sync_core::StorageObjectRef {
+                        byte_length: length,
+                        ..probe
+                    };
+                    if store.install(&object, response, control)? {
+                        downloaded += 1;
+                    }
+                }
+                let manifest = store.load_chunk_manifest(&manifest_sha256)?;
+                if manifest.logical_sha256 != content.logical_sha256
+                    || manifest.byte_length != content.byte_length
+                {
+                    bail!("downloaded chunk manifest does not match rollout");
+                }
+                for chunk in manifest.chunks {
+                    let object = sync_core::StorageObjectRef {
+                        kind: sync_core::StorageObjectKind::Chunk,
+                        sha256: chunk.sha256,
+                        byte_length: chunk.byte_length,
+                    };
+                    if !store.contains_storage_object(&object)? {
+                        let response = client.download_typed_object(&object)?;
+                        if store.install(&object, response, control)? {
+                            downloaded += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let descriptors = collect_object_descriptors(threads)?;
     for (index, descriptor) in descriptors.iter().enumerate() {
+        if threads.iter().any(|thread| {
+            thread.rollout.sha256 == descriptor.sha256 && thread.rollout.storage.is_some()
+        }) {
+            continue;
+        }
         control.check_cancelled()?;
         control.report(OperationProgress {
             phase: "pull_objects".to_string(),
@@ -1527,6 +1641,7 @@ mod tests {
                 media_type: "application/x-ndjson".to_string(),
                 logical_path: Some(format!("sessions/rollout-{id}.jsonl")),
                 source_path: None,
+                storage: None,
             },
             related_records: sync_core::RelatedRecords {
                 source_database: None,

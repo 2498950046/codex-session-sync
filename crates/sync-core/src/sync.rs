@@ -471,7 +471,20 @@ pub fn snapshot_to_revision(
         namespace_id,
         parent_revision,
         created_at: snapshot.created_at.clone(),
-        threads: snapshot.threads.iter().map(remote_thread_view).collect(),
+        threads: snapshot
+            .threads
+            .iter()
+            .map(|thread| {
+                let mut remote = remote_thread_view(thread);
+                remote.rollout.storage = thread.rollout.storage.clone();
+                for (remote_attachment, attachment) in
+                    remote.attachments.iter_mut().zip(&thread.attachments)
+                {
+                    remote_attachment.storage = attachment.storage.clone();
+                }
+                remote
+            })
+            .collect(),
         warning_count: snapshot.warning_count,
     })
     .map_err(Into::into)
@@ -652,8 +665,10 @@ pub fn semantic_thread_hash(thread: &ThreadBundle) -> Result<String> {
 pub fn remote_thread_view(thread: &ThreadBundle) -> ThreadBundle {
     let mut thread = thread.clone();
     thread.rollout.source_path = None;
+    thread.rollout.storage = None;
     for attachment in &mut thread.attachments {
         attachment.source_path = None;
+        attachment.storage = None;
     }
     thread.related_records.source_database = None;
     for (table, rows) in &mut thread.related_records.tables {
@@ -737,6 +752,7 @@ mod tests {
                 media_type: "application/x-ndjson".to_string(),
                 logical_path: Some(format!("sessions/rollout-{id}.jsonl")),
                 source_path: None,
+                storage: None,
             },
             related_records: RelatedRecords {
                 source_database: None,

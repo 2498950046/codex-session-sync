@@ -5,6 +5,7 @@ pub mod models;
 pub mod operation;
 pub mod process;
 pub mod protocol;
+pub mod storage_v2;
 pub mod sync;
 pub mod workspace;
 
@@ -25,5 +26,6 @@ pub use models::*;
 pub use operation::{OperationControl, OperationProgress};
 pub use process::{CodexProcess, CodexProcessKind, detect_codex_processes};
 pub use protocol::*;
+pub use storage_v2::*;
 pub use sync::*;
 pub use workspace::*;

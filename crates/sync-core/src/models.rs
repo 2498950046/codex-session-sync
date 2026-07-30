@@ -14,6 +14,10 @@ pub struct ContentObject {
     pub logical_path: Option<String>,
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+    /// Physical v2 storage is optional for v1 compatibility and is removed
+    /// from semantic thread hashing so Whole and Chunked remain equivalent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<crate::storage_v2::StorageRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -259,6 +263,7 @@ mod tests {
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: Some(format!("sessions/rollout-{index}.jsonl")),
                     source_path: None,
+                    storage: None,
                 },
                 related_records: RelatedRecords {
                     source_database: None,
