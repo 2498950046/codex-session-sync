@@ -15,7 +15,7 @@ use crate::protocol::{
     REVISION_SCHEMA_VERSION, RevisionManifest, RevisionPayload, validate_sha256,
 };
 
-const TRACKING_SCHEMA_VERSION: i64 = 1;
+const TRACKING_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +24,7 @@ pub struct TrackingRecord {
     pub namespace_id: Uuid,
     pub codex_home_key: String,
     pub integrated_head: Option<String>,
+    pub remote_epoch: u64,
     pub generation: u64,
     pub updated_at: String,
 }
@@ -125,19 +126,20 @@ impl TrackingStore {
         let connection = self.connection()?;
         connection
             .query_row(
-                "SELECT integrated_head, generation, updated_at
+                "SELECT integrated_head, remote_epoch, generation, updated_at
                  FROM namespace_tracking
                  WHERE codex_home_key = ?1 AND remote_id = ?2 AND namespace_id = ?3",
                 params![key, remote_id.to_string(), namespace_id.to_string()],
                 |row| {
-                    let generation = row.get::<_, i64>(1)?;
+                    let generation = row.get::<_, i64>(2)?;
                     Ok(TrackingRecord {
                         remote_id,
                         namespace_id,
                         codex_home_key: key.clone(),
                         integrated_head: row.get(0)?,
+                        remote_epoch: row.get::<_, i64>(1)? as u64,
                         generation: generation as u64,
-                        updated_at: row.get(2)?,
+                        updated_at: row.get(3)?,
                     })
                 },
             )
@@ -164,27 +166,29 @@ impl TrackingStore {
             .context("failed to lock tracking database")?;
         let current = transaction
             .query_row(
-                "SELECT generation FROM namespace_tracking
+                "SELECT generation, remote_epoch FROM namespace_tracking
                  WHERE codex_home_key = ?1 AND remote_id = ?2 AND namespace_id = ?3",
                 params![key, remote_id.to_string(), namespace_id.to_string()],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?;
         let expected = expected_generation.map(|value| value as i64);
-        if current != expected {
+        if current.map(|value| value.0) != expected {
             bail!(
                 "tracking state changed concurrently: expected generation {:?}, current {:?}",
                 expected_generation,
-                current
+                current.map(|value| value.0)
             );
         }
-        let generation = current.unwrap_or(0) + 1;
+        let generation = current.map(|value| value.0).unwrap_or(0) + 1;
+        let remote_epoch = current.map(|value| value.1).unwrap_or(0);
         transaction.execute(
             "INSERT INTO namespace_tracking (
-                 codex_home_key, remote_id, namespace_id, integrated_head, generation, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 codex_home_key, remote_id, namespace_id, integrated_head, remote_epoch, generation, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(codex_home_key, remote_id, namespace_id) DO UPDATE SET
                  integrated_head = excluded.integrated_head,
+                 remote_epoch = excluded.remote_epoch,
                  generation = excluded.generation,
                  updated_at = excluded.updated_at",
             params![
@@ -192,6 +196,7 @@ impl TrackingStore {
                 remote_id.to_string(),
                 namespace_id.to_string(),
                 integrated_head,
+                remote_epoch,
                 generation,
                 now
             ],
@@ -202,6 +207,7 @@ impl TrackingStore {
             namespace_id,
             codex_home_key: key,
             integrated_head: integrated_head.map(str::to_string),
+            remote_epoch: remote_epoch as u64,
             generation: generation as u64,
             updated_at: now,
         })
@@ -237,7 +243,7 @@ impl TrackingStore {
             .context("failed to lock tracking database")?;
         let current = transaction
             .query_row(
-                "SELECT integrated_head, generation, updated_at
+                "SELECT integrated_head, remote_epoch, generation, updated_at
                  FROM namespace_tracking
                  WHERE codex_home_key = ?1 AND remote_id = ?2 AND namespace_id = ?3",
                 params![key, remote_id_text, namespace_id_text],
@@ -245,12 +251,13 @@ impl TrackingStore {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let already_applied = current.as_ref().is_some_and(|(head, generation, _)| {
+        let already_applied = current.as_ref().is_some_and(|(head, _, generation, _)| {
             *generation == next_generation && head.as_deref() == integrated_head
         });
 
@@ -272,19 +279,20 @@ impl TrackingStore {
                     bail!("tracking checkout was committed without the expected active namespace");
                 }
             }
-            let (head, generation, updated_at) = current.expect("checked above");
+            let (head, remote_epoch, generation, updated_at) = current.expect("checked above");
             transaction.commit()?;
             return Ok(TrackingRecord {
                 remote_id,
                 namespace_id,
                 codex_home_key: key,
                 integrated_head: head,
+                remote_epoch: remote_epoch as u64,
                 generation: generation as u64,
                 updated_at,
             });
         }
 
-        let current_generation = current.as_ref().map(|(_, generation, _)| *generation);
+        let current_generation = current.as_ref().map(|(_, _, generation, _)| *generation);
         if current_generation != expected {
             bail!(
                 "tracking state changed concurrently: expected generation {:?}, current {:?}",
@@ -294,10 +302,11 @@ impl TrackingStore {
         }
         transaction.execute(
             "INSERT INTO namespace_tracking (
-                 codex_home_key, remote_id, namespace_id, integrated_head, generation, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 codex_home_key, remote_id, namespace_id, integrated_head, remote_epoch, generation, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(codex_home_key, remote_id, namespace_id) DO UPDATE SET
                  integrated_head = excluded.integrated_head,
+                 remote_epoch = excluded.remote_epoch,
                  generation = excluded.generation,
                  updated_at = excluded.updated_at",
             params![
@@ -305,6 +314,7 @@ impl TrackingStore {
                 remote_id_text,
                 namespace_id_text,
                 integrated_head,
+                current.as_ref().map(|value| value.1).unwrap_or(0),
                 next_generation,
                 now
             ],
@@ -326,9 +336,32 @@ impl TrackingStore {
             namespace_id,
             codex_home_key: key,
             integrated_head: integrated_head.map(str::to_string),
+            remote_epoch: current.as_ref().map(|value| value.1 as u64).unwrap_or(0),
             generation: next_generation as u64,
             updated_at: now,
         })
+    }
+
+    pub fn update_remote_epoch(
+        &self,
+        codex_home: impl AsRef<Path>,
+        remote_id: Uuid,
+        namespace_id: Uuid,
+        expected_generation: u64,
+        remote_epoch: u64,
+    ) -> Result<TrackingRecord> {
+        let key = codex_home_key(codex_home.as_ref())?;
+        let connection = self.connection()?;
+        let changed = connection.execute(
+            "UPDATE namespace_tracking SET remote_epoch = ?1, updated_at = ?2
+             WHERE codex_home_key = ?3 AND remote_id = ?4 AND namespace_id = ?5 AND generation = ?6",
+            params![remote_epoch as i64, Utc::now().to_rfc3339(), key, remote_id.to_string(), namespace_id.to_string(), expected_generation as i64],
+        )?;
+        if changed != 1 {
+            bail!("tracking state changed before remote epoch reconciliation");
+        }
+        self.load(codex_home, remote_id, namespace_id)?
+            .context("tracking record disappeared")
     }
 
     pub fn active(&self, codex_home: impl AsRef<Path>) -> Result<Option<ActiveNamespaceBinding>> {
@@ -403,8 +436,12 @@ impl TrackingStore {
                 [],
                 |row| row.get::<_, i64>(0),
             )?;
-            if actual != TRACKING_SCHEMA_VERSION {
+            if actual > TRACKING_SCHEMA_VERSION {
                 bail!("unsupported tracking schema version {actual}");
+            }
+            if actual == 1 {
+                transaction.execute("ALTER TABLE namespace_tracking ADD COLUMN remote_epoch INTEGER NOT NULL DEFAULT 0", [])?;
+                transaction.execute("UPDATE schema_info SET version = 2 WHERE id = 1", [])?;
             }
         }
         transaction.execute_batch(
@@ -417,6 +454,7 @@ impl TrackingStore {
                  remote_id TEXT NOT NULL,
                  namespace_id TEXT NOT NULL,
                  integrated_head TEXT,
+                 remote_epoch INTEGER NOT NULL DEFAULT 0,
                  generation INTEGER NOT NULL,
                  updated_at TEXT NOT NULL,
                  PRIMARY KEY(codex_home_key, remote_id, namespace_id)

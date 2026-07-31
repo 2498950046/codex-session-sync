@@ -44,7 +44,7 @@ struct PreparedThread {
     temporary_path: PathBuf,
 }
 
-const SOURCE_OBJECT_INDEX_SCHEMA_VERSION: u32 = 1;
+const SOURCE_OBJECT_INDEX_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,12 +86,8 @@ pub fn default_repository_root() -> PathBuf {
 
 pub fn load_local_snapshot(manifest_path: impl AsRef<Path>) -> Result<LocalSnapshot> {
     let manifest_path = manifest_path.as_ref();
-    let snapshot = if is_v2_snapshot_path(manifest_path)? {
-        let repository_root = snapshot_repository_root(manifest_path)?;
-        load_v2_snapshot(manifest_path, &repository_root)?.0
-    } else {
-        read_json(manifest_path)?
-    };
+    let repository_root = snapshot_repository_root(manifest_path)?;
+    let snapshot = load_v2_snapshot(manifest_path, &repository_root)?.0;
     validate_snapshot_structure(&snapshot)?;
     Ok(snapshot)
 }
@@ -103,29 +99,17 @@ pub fn store_local_snapshot(
     validate_snapshot_structure(snapshot)?;
     let repository_root = repository_root.as_ref();
     ensure_repository_layout(repository_root)?;
-    if snapshot
+    let contents = snapshot
         .threads
         .iter()
-        .all(|thread| thread.rollout.storage.is_some())
-    {
-        let contents = snapshot
-            .threads
-            .iter()
-            .map(|thread| {
-                (
-                    thread.thread_id.clone(),
-                    content_ref_from_object(&thread.rollout),
-                )
-            })
-            .collect();
-        write_v2_snapshot(snapshot, &contents, repository_root)
-    } else {
-        let manifest_path = repository_root
-            .join("snapshots/v1")
-            .join(format!("{}.json", snapshot.snapshot_id));
-        atomic_write_json(&manifest_path, snapshot)?;
-        Ok(manifest_path)
-    }
+        .map(|thread| {
+            Ok((
+                thread.thread_id.clone(),
+                content_ref_from_object(&thread.rollout)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    write_v2_snapshot(snapshot, &contents, repository_root)
 }
 
 pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<ObjectDescriptor>> {
@@ -156,16 +140,11 @@ pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<Object
 }
 
 pub fn repository_object_path(repository_root: impl AsRef<Path>, sha256: &str) -> Result<PathBuf> {
-    let legacy = object_path(repository_root.as_ref(), sha256)?;
-    if legacy.exists() {
-        return Ok(legacy);
-    }
-    let whole = crate::storage_v2::typed_object_path(
+    crate::storage_v2::typed_object_path(
         repository_root.as_ref(),
         crate::storage_v2::StorageObjectKind::Whole,
         sha256,
-    )?;
-    Ok(whole)
+    )
 }
 
 pub fn validate_repository_object(
@@ -186,7 +165,11 @@ pub fn install_repository_object<R: Read>(
         .map_err(|_| anyhow::anyhow!("invalid content object hash {}", descriptor.sha256))?;
     let repository_root = repository_root.as_ref();
     ensure_repository_layout(repository_root)?;
-    let destination = object_path(repository_root, &descriptor.sha256)?;
+    let destination = crate::storage_v2::typed_object_path(
+        repository_root,
+        crate::storage_v2::StorageObjectKind::Whole,
+        &descriptor.sha256,
+    )?;
     if destination.exists() {
         validate_object(&destination, &descriptor.sha256, descriptor.byte_length)?;
         return Ok(false);
@@ -287,7 +270,11 @@ pub(crate) fn install_prepared_repository_object(
             metadata.len()
         );
     }
-    let destination = object_path(repository_root, &descriptor.sha256)?;
+    let destination = crate::storage_v2::typed_object_path(
+        repository_root,
+        crate::storage_v2::StorageObjectKind::Whole,
+        &descriptor.sha256,
+    )?;
     if destination.exists() {
         validate_object(&destination, &descriptor.sha256, descriptor.byte_length)?;
         fs::remove_file(temporary)?;
@@ -562,7 +549,7 @@ pub fn import_local_snapshot_with_control(
         ensure_importable_thread(thread)?;
         prepared.push(PreparedThread {
             bundle: thread.clone(),
-            content: content_ref_from_object(&thread.rollout),
+            content: content_ref_from_object(&thread.rollout)?,
             repository_root: repository_root.clone(),
             target_path,
             temporary_path,
@@ -816,7 +803,7 @@ fn apply_import(
             )?;
         } else {
             copy_verified_object(
-                &object_path(&thread.repository_root, &thread.bundle.rollout.sha256)?,
+                &repository_object_path(&thread.repository_root, &thread.bundle.rollout.sha256)?,
                 &thread.temporary_path,
                 &thread.bundle.rollout.sha256,
                 Some(control),
@@ -1186,14 +1173,11 @@ pub(crate) fn safe_rollout_path(thread: &ThreadBundle) -> Result<PathBuf> {
 
 pub(crate) fn ensure_repository_layout(root: &Path) -> Result<()> {
     for directory in [
-        "objects/sha256",
         "objects/tmp",
         "index",
         "snapshots",
         "backups",
         "journal",
-        "snapshots/v1",
-        "snapshots/v2",
         "objects/whole/sha256",
         "objects/chunks/sha256",
         "objects/chunk-manifests/sha256",
@@ -1208,7 +1192,7 @@ pub(crate) fn ensure_repository_layout(root: &Path) -> Result<()> {
 }
 
 fn source_object_index_path(root: &Path) -> PathBuf {
-    root.join("index").join("source-objects-v1.json")
+    root.join("index").join("source-objects-v2.json")
 }
 
 fn load_source_object_index(path: &Path) -> SourceObjectIndex {
@@ -1247,18 +1231,6 @@ fn source_fingerprint(source: &Path) -> Result<SourceFingerprint> {
         byte_length: metadata.len(),
         modified_unix_nanos,
     })
-}
-
-fn object_path(root: &Path, sha256: &str) -> Result<PathBuf> {
-    validate_sha256(sha256).map_err(|_| anyhow::anyhow!("invalid SHA-256 identifier {sha256}"))?;
-    let digest = sha256
-        .strip_prefix("sha256:")
-        .context("content hash must start with sha256:")?;
-    Ok(root
-        .join("objects")
-        .join("sha256")
-        .join(&digest[..2])
-        .join(&digest[2..]))
 }
 
 fn store_snapshot_object(
@@ -1321,39 +1293,24 @@ fn store_snapshot_object(
     Ok((sha256, storage))
 }
 
-fn content_ref_from_object(object: &crate::ContentObject) -> crate::storage_v2::ContentRef {
-    crate::storage_v2::ContentRef {
+fn content_ref_from_object(object: &crate::ContentObject) -> Result<crate::storage_v2::ContentRef> {
+    Ok(crate::storage_v2::ContentRef {
         logical_sha256: object.sha256.clone(),
         byte_length: object.byte_length,
-        storage: object.storage.clone().unwrap_or_else(|| StorageRef::Whole {
-            object_sha256: object.sha256.clone(),
-        }),
+        storage: object
+            .storage
+            .clone()
+            .context("v2 content object has no physical storage reference")?,
         media_type: Some(object.media_type.clone()),
         logical_path: object.logical_path.clone(),
-    }
-}
-
-fn is_v2_snapshot_path(path: &Path) -> Result<bool> {
-    let file = File::open(path)?;
-    let value: Value = serde_json::from_reader(BufReader::new(file))?;
-    Ok(value.get("schemaVersion").and_then(Value::as_u64)
-        == Some(crate::storage_v2::SNAPSHOT_ROOT_V2_SCHEMA_VERSION as u64)
-        && value
-            .get("threads")
-            .and_then(Value::as_array)
-            .is_some_and(|threads| {
-                threads
-                    .first()
-                    .is_none_or(|thread| thread.get("descriptorSha256").is_some())
-            }))
+    })
 }
 
 fn snapshot_repository_root(path: &Path) -> Result<PathBuf> {
     path.parent()
         .and_then(Path::parent)
-        .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .context("v2 snapshot is not below snapshots/v2")
+        .context("v2 snapshot is not below the repository snapshots directory")
 }
 
 pub(crate) fn copy_verified_object(
@@ -1744,9 +1701,7 @@ mod tests {
         let summary = create_local_snapshot(source.path(), repository.path(), true).unwrap();
         let mut manifest = load_local_snapshot(&summary.manifest_path).unwrap();
         manifest.threads[0].rollout.logical_path = Some("other/rollout-thread-1.jsonl".to_string());
-        atomic_write_json(&summary.manifest_path, &manifest).unwrap();
-
-        let error = validate_local_snapshot(&summary.manifest_path, repository.path()).unwrap_err();
+        let error = store_local_snapshot(&manifest, repository.path()).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -1861,16 +1816,12 @@ mod tests {
             .tables
             .get_mut("threads")
             .unwrap()[0]["title"] = Value::String("blocked".to_string());
-        let legacy_manifest = repository.path().join("snapshots/v1/blocked.json");
-        let typed =
-            repository_object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
-        let legacy = object_path(repository.path(), &manifest.threads[0].rollout.sha256).unwrap();
-        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        fs::copy(typed, legacy).unwrap();
-        atomic_write_json(&legacy_manifest, &manifest).unwrap();
+        manifest.snapshot_id = Uuid::now_v7().to_string();
+        let blocked_manifest = store_local_snapshot(&manifest, repository.path()).unwrap();
 
-        let error = import_local_snapshot(&legacy_manifest, target.path(), repository.path(), true)
-            .unwrap_err();
+        let error =
+            import_local_snapshot(&blocked_manifest, target.path(), repository.path(), true)
+                .unwrap_err();
         assert!(!error.to_string().is_empty());
         let connection = Connection::open(&target_database).unwrap();
         let count: i64 = connection

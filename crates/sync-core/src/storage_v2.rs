@@ -325,6 +325,24 @@ impl FilesystemContentStore {
         })
     }
 
+    pub fn store_revision_root(&self, root: &RevisionRootV2) -> Result<StorageObjectRef> {
+        root.validate()?;
+        self.store_json(StorageObjectKind::RevisionRoot, root)
+    }
+
+    pub fn load_revision_root(&self, revision_id: &str) -> Result<RevisionRootV2> {
+        let root: RevisionRootV2 = self.read_json(
+            StorageObjectKind::RevisionRoot,
+            revision_id,
+            MAX_STRUCTURED_OBJECT_BYTES,
+        )?;
+        root.validate()?;
+        if root.revision_id()? != revision_id {
+            bail!("revision root ID does not match its canonical content");
+        }
+        Ok(root)
+    }
+
     pub fn load_thread(&self, reference: &ThreadRef) -> Result<(ThreadBundle, ContentRef)> {
         validate_sha256(&reference.descriptor_sha256)
             .map_err(|_| anyhow::anyhow!("invalid thread descriptor hash"))?;
@@ -485,8 +503,7 @@ impl FilesystemContentStore {
         }
         for directory in [
             "objects/tmp",
-            "snapshots/v1",
-            "snapshots/v2",
+            "snapshots",
             "index",
             "journal",
             "backups",
@@ -692,16 +709,19 @@ impl ThreadDescriptor {
         let attachments = bundle
             .attachments
             .iter()
-            .map(|object| ContentRef {
-                logical_sha256: object.sha256.clone(),
-                byte_length: object.byte_length,
-                storage: StorageRef::Whole {
-                    object_sha256: object.sha256.clone(),
-                },
-                media_type: Some(object.media_type.clone()),
-                logical_path: object.logical_path.clone(),
+            .map(|object| {
+                Ok(ContentRef {
+                    logical_sha256: object.sha256.clone(),
+                    byte_length: object.byte_length,
+                    storage: object
+                        .storage
+                        .clone()
+                        .context("v2 attachment has no physical storage reference")?,
+                    media_type: Some(object.media_type.clone()),
+                    logical_path: object.logical_path.clone(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let mut rollout = rollout;
         rollout.media_type = Some(bundle.rollout.media_type.clone());
         rollout.logical_path = bundle.rollout.logical_path.clone();
@@ -769,6 +789,11 @@ impl SnapshotRootV2 {
 }
 
 impl RevisionRootV2 {
+    pub fn revision_id(&self) -> Result<String> {
+        self.validate()?;
+        Ok(digest_bytes(&canonical_json(self)?))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.schema_version != REVISION_ROOT_V2_SCHEMA_VERSION {
             bail!(
@@ -784,6 +809,51 @@ impl RevisionRootV2 {
         }
         validate_thread_refs(&self.threads)
     }
+}
+
+pub fn snapshot_to_revision_root(
+    snapshot: &LocalSnapshot,
+    namespace_id: Uuid,
+    parent_revision: Option<String>,
+    repository_root: &Path,
+) -> Result<(RevisionRootV2, StorageObjectRef)> {
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let mut threads = Vec::with_capacity(snapshot.threads.len());
+    for thread in &snapshot.threads {
+        let rollout = content_ref_from_object(&thread.rollout)?;
+        threads.push(store.store_thread(thread, rollout)?);
+    }
+    threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    let root = RevisionRootV2 {
+        schema_version: REVISION_ROOT_V2_SCHEMA_VERSION,
+        namespace_id,
+        parent_revision,
+        created_at: snapshot.created_at.clone(),
+        threads,
+        warning_count: snapshot.warning_count,
+    };
+    let object = store.store_revision_root(&root)?;
+    debug_assert_eq!(object.sha256, root.revision_id()?);
+    Ok((root, object))
+}
+
+pub fn revision_root_to_snapshot(
+    root: &RevisionRootV2,
+    repository_root: &Path,
+) -> Result<LocalSnapshot> {
+    root.validate()?;
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let mut threads = Vec::with_capacity(root.threads.len());
+    for reference in &root.threads {
+        threads.push(store.load_thread(reference)?.0);
+    }
+    Ok(LocalSnapshot {
+        schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: Uuid::now_v7().to_string(),
+        created_at: root.created_at.clone(),
+        threads,
+        warning_count: root.warning_count,
+    })
 }
 
 pub fn typed_object_path(
@@ -865,7 +935,7 @@ pub fn write_v2_snapshot(
     };
     root.validate()?;
     let path = repository_root
-        .join("snapshots/v2")
+        .join("snapshots")
         .join(format!("{}.json", snapshot.snapshot_id));
     atomic_write_bytes(&path, &canonical_json(&root)?)?;
     Ok(path)
@@ -891,16 +961,90 @@ pub fn collect_snapshot_graph(
             sha256: thread_ref.descriptor_sha256.clone(),
             byte_length: descriptor_length,
         });
-        let (_, rollout) = store.load_thread(thread_ref)?;
-        for object in store.content_objects(&rollout)? {
-            references += 1;
-            if references > MAX_OBJECT_REFERENCES {
-                bail!("snapshot graph exceeds the object-reference limit");
+        let descriptor: ThreadDescriptor = store.read_json(
+            StorageObjectKind::Thread,
+            &thread_ref.descriptor_sha256,
+            MAX_STRUCTURED_OBJECT_BYTES,
+        )?;
+        descriptor.validate()?;
+        if descriptor.thread_id != thread_ref.thread_id {
+            bail!("thread reference ID does not match its descriptor");
+        }
+        for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
+            for object in store.content_objects(content)? {
+                references += 1;
+                if references > MAX_OBJECT_REFERENCES {
+                    bail!("snapshot graph exceeds the object-reference limit");
+                }
+                objects.insert(object);
             }
-            objects.insert(object);
         }
     }
     Ok(objects)
+}
+
+pub fn collect_revision_graph(
+    root: &RevisionRootV2,
+    store: &FilesystemContentStore,
+) -> Result<BTreeSet<StorageObjectRef>> {
+    root.validate()?;
+    let root_id = root.revision_id()?;
+    let root_path = store.object_path_by_id(StorageObjectKind::RevisionRoot, &root_id)?;
+    let root_length = fs::metadata(&root_path)
+        .with_context(|| format!("missing revision root object {root_id}"))?
+        .len();
+    let mut objects = BTreeSet::from([StorageObjectRef {
+        kind: StorageObjectKind::RevisionRoot,
+        sha256: root_id,
+        byte_length: root_length,
+    }]);
+    let mut references = 1_usize;
+    for thread_ref in &root.threads {
+        references += 1;
+        if references > MAX_OBJECT_REFERENCES {
+            bail!("revision graph exceeds the object-reference limit");
+        }
+        let descriptor_path =
+            store.object_path_by_id(StorageObjectKind::Thread, &thread_ref.descriptor_sha256)?;
+        let descriptor_length = fs::metadata(&descriptor_path)?.len();
+        objects.insert(StorageObjectRef {
+            kind: StorageObjectKind::Thread,
+            sha256: thread_ref.descriptor_sha256.clone(),
+            byte_length: descriptor_length,
+        });
+        let descriptor: ThreadDescriptor = store.read_json(
+            StorageObjectKind::Thread,
+            &thread_ref.descriptor_sha256,
+            MAX_STRUCTURED_OBJECT_BYTES,
+        )?;
+        descriptor.validate()?;
+        if descriptor.thread_id != thread_ref.thread_id {
+            bail!("thread reference ID does not match its descriptor");
+        }
+        for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
+            for object in store.content_objects(content)? {
+                references += 1;
+                if references > MAX_OBJECT_REFERENCES {
+                    bail!("revision graph exceeds the object-reference limit");
+                }
+                objects.insert(object);
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn content_ref_from_object(object: &ContentObject) -> Result<ContentRef> {
+    Ok(ContentRef {
+        logical_sha256: object.sha256.clone(),
+        byte_length: object.byte_length,
+        storage: object
+            .storage
+            .clone()
+            .context("v2 content object has no physical storage reference")?,
+        media_type: Some(object.media_type.clone()),
+        logical_path: object.logical_path.clone(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -913,71 +1057,442 @@ pub struct GcPlan {
     pub reclaimable_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct RepositoryOptimizationReport {
-    pub migrated_snapshots: usize,
-    pub migrated_threads: usize,
+pub struct RepositoryStorageSummary {
     pub logical_bytes: u64,
-    pub v2_snapshot_paths: Vec<PathBuf>,
+    pub repository_physical_bytes: u64,
+    pub active_physical_bytes: u64,
+    pub shared_physical_bytes: u64,
+    pub exclusive_physical_bytes: u64,
+    pub trash_bytes: u64,
+    pub gc_quarantine_bytes: u64,
+    pub reclaimable_bytes: u64,
+    pub protected_by_journal_bytes: u64,
 }
 
-/// Creates equivalent v2 roots next to retained v1 snapshots. This operation
-/// never rewrites or removes a v1 manifest or whole object.
-pub fn optimize_v1_repository(
-    repository_root: &Path,
-    control: &OperationControl,
-) -> Result<RepositoryOptimizationReport> {
-    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
-    let v1_dir = repository_root.join("snapshots/v1");
-    let mut report = RepositoryOptimizationReport {
-        migrated_snapshots: 0,
-        migrated_threads: 0,
-        logical_bytes: 0,
-        v2_snapshot_paths: Vec::new(),
-    };
-    if !v1_dir.exists() {
-        return Ok(report);
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotMetadata {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub automatic: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSnapshotListItem {
+    pub snapshot_id: String,
+    pub created_at: String,
+    pub manifest_path: PathBuf,
+    pub thread_count: usize,
+    pub object_count: usize,
+    pub logical_bytes: u64,
+    pub physical_referenced_bytes: u64,
+    pub warning_count: usize,
+    pub metadata: SnapshotMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDeletionPlan {
+    pub snapshot_id: String,
+    pub manifest_path: PathBuf,
+    pub pinned: bool,
+    pub protected_by_operations: Vec<String>,
+    pub shared_object_count: usize,
+    pub exclusive_object_count: usize,
+    pub estimated_reclaimable_bytes: u64,
+    pub plan_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotTrashEntry {
+    pub operation_id: String,
+    pub snapshot_id: String,
+    pub trashed_at: String,
+    pub original_manifest_path: PathBuf,
+    pub trash_manifest_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadDiffKind {
+    Added,
+    Modified,
+    Deleted,
+    Unchanged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadDiffItem {
+    pub thread_id: String,
+    pub title: String,
+    pub kind: ThreadDiffKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDiff {
+    pub left_snapshot_id: String,
+    pub right_snapshot_id: String,
+    pub added_count: usize,
+    pub modified_count: usize,
+    pub deleted_count: usize,
+    pub unchanged_count: usize,
+    pub threads: Vec<ThreadDiffItem>,
+}
+
+pub fn compare_local_snapshots(
+    left_manifest: &Path,
+    right_manifest: &Path,
+) -> Result<SnapshotDiff> {
+    let left = crate::local::load_local_snapshot(left_manifest)?;
+    let right = crate::local::load_local_snapshot(right_manifest)?;
+    let left_map = left
+        .threads
+        .iter()
+        .map(|thread| (thread.thread_id.as_str(), thread))
+        .collect::<BTreeMap<_, _>>();
+    let right_map = right
+        .threads
+        .iter()
+        .map(|thread| (thread.thread_id.as_str(), thread))
+        .collect::<BTreeMap<_, _>>();
+    let ids = left_map
+        .keys()
+        .chain(right_map.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut threads = Vec::with_capacity(ids.len());
+    for id in ids {
+        let (title, kind) = match (left_map.get(id), right_map.get(id)) {
+            (None, Some(thread)) => (thread.title.clone(), ThreadDiffKind::Added),
+            (Some(thread), None) => (thread.title.clone(), ThreadDiffKind::Deleted),
+            (Some(before), Some(after)) => {
+                let before_hash =
+                    crate::sync::semantic_thread_hash(&crate::sync::remote_thread_view(before))?;
+                let after_hash =
+                    crate::sync::semantic_thread_hash(&crate::sync::remote_thread_view(after))?;
+                (
+                    after.title.clone(),
+                    if before_hash == after_hash {
+                        ThreadDiffKind::Unchanged
+                    } else {
+                        ThreadDiffKind::Modified
+                    },
+                )
+            }
+            (None, None) => unreachable!(),
+        };
+        threads.push(ThreadDiffItem {
+            thread_id: id.to_string(),
+            title,
+            kind,
+        });
     }
-    for entry in fs::read_dir(v1_dir)? {
-        control.check_cancelled()?;
+    Ok(SnapshotDiff {
+        left_snapshot_id: left.snapshot_id,
+        right_snapshot_id: right.snapshot_id,
+        added_count: threads
+            .iter()
+            .filter(|item| item.kind == ThreadDiffKind::Added)
+            .count(),
+        modified_count: threads
+            .iter()
+            .filter(|item| item.kind == ThreadDiffKind::Modified)
+            .count(),
+        deleted_count: threads
+            .iter()
+            .filter(|item| item.kind == ThreadDiffKind::Deleted)
+            .count(),
+        unchanged_count: threads
+            .iter()
+            .filter(|item| item.kind == ThreadDiffKind::Unchanged)
+            .count(),
+        threads,
+    })
+}
+
+pub fn list_local_snapshots(repository_root: &Path) -> Result<Vec<LocalSnapshotListItem>> {
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let directory = repository_root.join("snapshots");
+    let mut items = Vec::new();
+    if !directory.exists() {
+        return Ok(items);
+    }
+    for entry in fs::read_dir(&directory)? {
         let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let mut snapshot: LocalSnapshot = read_bounded_json(&path, 64 * 1024 * 1024)?;
-        let mut contents = BTreeMap::new();
-        for thread in &mut snapshot.threads {
-            control.check_cancelled()?;
-            let legacy = legacy_object_path(repository_root, &thread.rollout.sha256)?;
-            let mut content = store.ingest(&legacy, control)?;
-            if content.logical_sha256 != thread.rollout.sha256
-                || content.byte_length != thread.rollout.byte_length
-            {
-                bail!("v1 object does not match snapshot metadata");
-            }
-            content.media_type = Some(thread.rollout.media_type.clone());
-            content.logical_path = thread.rollout.logical_path.clone();
-            thread.rollout.storage = Some(content.storage.clone());
-            report.logical_bytes = report
-                .logical_bytes
-                .checked_add(content.byte_length)
-                .context("optimization byte count overflow")?;
-            report.migrated_threads += 1;
-            contents.insert(thread.thread_id.clone(), content);
+        let root: SnapshotRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+        root.validate()?;
+        let graph = collect_snapshot_graph(&root, &store)?;
+        let mut logical_bytes = 0_u64;
+        for reference in &root.threads {
+            let descriptor: ThreadDescriptor = store.read_json(
+                StorageObjectKind::Thread,
+                &reference.descriptor_sha256,
+                MAX_STRUCTURED_OBJECT_BYTES,
+            )?;
+            logical_bytes = std::iter::once(&descriptor.rollout)
+                .chain(descriptor.attachments.iter())
+                .try_fold(logical_bytes, |total, content| {
+                    total
+                        .checked_add(content.byte_length)
+                        .context("snapshot logical byte count overflow")
+                })?;
         }
-        let target = write_v2_snapshot(&snapshot, &contents, repository_root)?;
-        load_v2_snapshot(&target, repository_root)?;
-        report.migrated_snapshots += 1;
-        report.v2_snapshot_paths.push(target);
+        let physical_referenced_bytes = graph.iter().try_fold(0_u64, |total, object| {
+            total
+                .checked_add(object.byte_length)
+                .context("snapshot physical byte count overflow")
+        })?;
+        items.push(LocalSnapshotListItem {
+            snapshot_id: root.snapshot_id.clone(),
+            created_at: root.created_at,
+            manifest_path: path,
+            thread_count: root.threads.len(),
+            object_count: graph.len(),
+            logical_bytes,
+            physical_referenced_bytes,
+            warning_count: root.warning_count,
+            metadata: load_snapshot_metadata(repository_root, &root.snapshot_id)?,
+        });
     }
-    Ok(report)
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
+    });
+    Ok(items)
+}
+
+pub fn update_snapshot_metadata(
+    repository_root: &Path,
+    snapshot_id: &str,
+    mut metadata: SnapshotMetadata,
+) -> Result<SnapshotMetadata> {
+    let path = snapshot_manifest_path(repository_root, snapshot_id)?;
+    if !path.is_file() {
+        bail!("snapshot not found: {snapshot_id}");
+    }
+    metadata.description = metadata.description.trim().chars().take(500).collect();
+    metadata.tags = metadata
+        .tags
+        .into_iter()
+        .map(|tag| tag.trim().chars().take(64).collect::<String>())
+        .filter(|tag| !tag.is_empty())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(32)
+        .collect();
+    atomic_write_bytes(
+        &snapshot_metadata_path(repository_root, snapshot_id)?,
+        &canonical_json(&metadata)?,
+    )?;
+    Ok(metadata)
+}
+
+pub fn plan_snapshot_deletion(
+    repository_root: &Path,
+    snapshot_id: &str,
+) -> Result<SnapshotDeletionPlan> {
+    let manifest_path = snapshot_manifest_path(repository_root, snapshot_id)?;
+    let root: SnapshotRootV2 = read_bounded_json(&manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
+    if root.snapshot_id != snapshot_id {
+        bail!("snapshot ID does not match its manifest name");
+    }
+    let metadata = load_snapshot_metadata(repository_root, snapshot_id)?;
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let target = collect_snapshot_graph(&root, &store)?;
+    let mut other = BTreeSet::new();
+    for item in list_local_snapshots(repository_root)? {
+        if item.snapshot_id == snapshot_id {
+            continue;
+        }
+        let other_root: SnapshotRootV2 =
+            read_bounded_json(&item.manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
+        other.extend(collect_snapshot_graph(&other_root, &store)?);
+    }
+    let exclusive = target.difference(&other).cloned().collect::<Vec<_>>();
+    let estimated_reclaimable_bytes = exclusive.iter().try_fold(0_u64, |total, object| {
+        total
+            .checked_add(object.byte_length)
+            .context("deletion byte count overflow")
+    })?;
+    let fingerprint = digest_bytes(&canonical_json(&(snapshot_id, &target, &other))?);
+    let protected_by_operations = snapshot_operation_references(repository_root, snapshot_id)?;
+    Ok(SnapshotDeletionPlan {
+        snapshot_id: snapshot_id.to_string(),
+        manifest_path,
+        pinned: metadata.pinned,
+        protected_by_operations,
+        shared_object_count: target.len() - exclusive.len(),
+        exclusive_object_count: exclusive.len(),
+        estimated_reclaimable_bytes,
+        plan_fingerprint: fingerprint,
+    })
+}
+
+pub fn trash_local_snapshot(
+    repository_root: &Path,
+    expected: &SnapshotDeletionPlan,
+) -> Result<SnapshotTrashEntry> {
+    let current = plan_snapshot_deletion(repository_root, &expected.snapshot_id)?;
+    if &current != expected {
+        bail!("snapshot deletion plan became stale");
+    }
+    if current.pinned {
+        bail!("pinned snapshots cannot be moved to trash");
+    }
+    if !current.protected_by_operations.is_empty() {
+        bail!("snapshot is protected by a non-terminal operation journal");
+    }
+    let operation_id = Uuid::now_v7().to_string();
+    let trash_dir = repository_root.join("trash/snapshots").join(&operation_id);
+    fs::create_dir_all(&trash_dir)?;
+    let trash_manifest_path = trash_dir.join("snapshot.json");
+    let entry = SnapshotTrashEntry {
+        operation_id,
+        snapshot_id: current.snapshot_id,
+        trashed_at: chrono::Utc::now().to_rfc3339(),
+        original_manifest_path: current.manifest_path,
+        trash_manifest_path,
+    };
+    atomic_write_bytes(&trash_dir.join("entry.json"), &canonical_json(&entry)?)?;
+    fs::rename(&entry.original_manifest_path, &entry.trash_manifest_path)?;
+    let metadata_path = snapshot_metadata_path(repository_root, &entry.snapshot_id)?;
+    if metadata_path.is_file() {
+        fs::rename(metadata_path, trash_dir.join("metadata.json"))?;
+    }
+    Ok(entry)
+}
+
+pub fn list_local_snapshot_trash(repository_root: &Path) -> Result<Vec<SnapshotTrashEntry>> {
+    let directory = repository_root.join("trash/snapshots");
+    let mut entries = Vec::new();
+    if !directory.exists() {
+        return Ok(entries);
+    }
+    for child in fs::read_dir(directory)? {
+        let path = child?.path().join("entry.json");
+        if path.is_file() {
+            let entry: SnapshotTrashEntry = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+            if entry.trash_manifest_path.is_file() {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by(|left: &SnapshotTrashEntry, right| right.trashed_at.cmp(&left.trashed_at));
+    Ok(entries)
+}
+
+pub fn restore_trashed_snapshot(repository_root: &Path, operation_id: &str) -> Result<PathBuf> {
+    validate_uuid(operation_id, "trash operation")?;
+    let directory = repository_root.join("trash/snapshots").join(operation_id);
+    let entry: SnapshotTrashEntry =
+        read_bounded_json(&directory.join("entry.json"), MAX_STRUCTURED_OBJECT_BYTES)?;
+    if entry.original_manifest_path.exists() {
+        bail!("snapshot manifest already exists");
+    }
+    fs::rename(&entry.trash_manifest_path, &entry.original_manifest_path)?;
+    let metadata = directory.join("metadata.json");
+    if metadata.is_file() {
+        fs::rename(
+            metadata,
+            snapshot_metadata_path(repository_root, &entry.snapshot_id)?,
+        )?;
+    }
+    fs::remove_file(directory.join("entry.json"))?;
+    let _ = fs::remove_dir(&directory);
+    Ok(entry.original_manifest_path)
+}
+
+fn load_snapshot_metadata(repository_root: &Path, snapshot_id: &str) -> Result<SnapshotMetadata> {
+    let path = snapshot_metadata_path(repository_root, snapshot_id)?;
+    if path.is_file() {
+        read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)
+    } else {
+        Ok(SnapshotMetadata::default())
+    }
+}
+
+fn snapshot_manifest_path(repository_root: &Path, snapshot_id: &str) -> Result<PathBuf> {
+    validate_uuid(snapshot_id, "snapshot")?;
+    Ok(repository_root
+        .join("snapshots")
+        .join(format!("{snapshot_id}.json")))
+}
+
+fn snapshot_metadata_path(repository_root: &Path, snapshot_id: &str) -> Result<PathBuf> {
+    validate_uuid(snapshot_id, "snapshot")?;
+    Ok(repository_root
+        .join("metadata/snapshots")
+        .join(format!("{snapshot_id}.json")))
+}
+
+fn snapshot_operation_references(repository_root: &Path, snapshot_id: &str) -> Result<Vec<String>> {
+    let directory = repository_root.join("journal");
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut operations = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > MAX_STRUCTURED_OBJECT_BYTES {
+            continue;
+        }
+        let value: serde_json::Value = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if object.get("snapshotId").and_then(serde_json::Value::as_str) != Some(snapshot_id) {
+            continue;
+        }
+        let status = object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_ascii_lowercase();
+        if matches!(status.as_str(), "completed" | "rolled_back" | "rolledback") {
+            continue;
+        }
+        operations.push(
+            object
+                .get("operationId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        );
+    }
+    operations.sort();
+    operations.dedup();
+    Ok(operations)
+}
+
+fn validate_uuid(value: &str, kind: &str) -> Result<()> {
+    Uuid::parse_str(value).with_context(|| format!("invalid {kind} ID"))?;
+    Ok(())
 }
 
 pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut reachable = BTreeSet::new();
-    let snapshot_dir = repository_root.join("snapshots/v2");
+    let snapshot_dir = repository_root.join("snapshots");
     if snapshot_dir.exists() {
         for entry in fs::read_dir(&snapshot_dir)? {
             let path = entry?.path();
@@ -988,6 +1503,37 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
             reachable.extend(collect_snapshot_graph(&root, &store)?);
         }
     }
+    let snapshot_trash = repository_root.join("trash/snapshots");
+    if snapshot_trash.exists() {
+        for entry in fs::read_dir(&snapshot_trash)? {
+            let path = entry?.path().join("snapshot.json");
+            if !path.is_file() {
+                continue;
+            }
+            let root: SnapshotRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+            reachable.extend(collect_snapshot_graph(&root, &store)?);
+        }
+    }
+    let revision_root_dir = repository_root
+        .join("objects")
+        .join(StorageObjectKind::RevisionRoot.directory())
+        .join("sha256");
+    if revision_root_dir.exists() {
+        for prefix in fs::read_dir(&revision_root_dir)? {
+            let prefix = prefix?;
+            if !prefix.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path())? {
+                let path = entry?.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let root: RevisionRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+                reachable.extend(collect_revision_graph(&root, &store)?);
+            }
+        }
+    }
     let mut unreachable = Vec::new();
     let mut reclaimable_bytes = 0_u64;
     for kind in [
@@ -995,6 +1541,7 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
         StorageObjectKind::Chunk,
         StorageObjectKind::ChunkManifest,
         StorageObjectKind::Thread,
+        StorageObjectKind::RevisionRoot,
     ] {
         let kind_root = repository_root
             .join("objects")
@@ -1038,6 +1585,118 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
         unreachable_objects: unreachable,
         reclaimable_bytes,
     })
+}
+
+pub fn repository_storage_summary(repository_root: &Path) -> Result<RepositoryStorageSummary> {
+    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+    let snapshots = list_local_snapshots(repository_root)?;
+    let logical_bytes = snapshots.iter().try_fold(0_u64, |total, snapshot| {
+        total
+            .checked_add(snapshot.logical_bytes)
+            .context("repository logical byte count overflow")
+    })?;
+    let mut active_counts = BTreeMap::<StorageObjectRef, usize>::new();
+    for snapshot in &snapshots {
+        let root: SnapshotRootV2 =
+            read_bounded_json(&snapshot.manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
+        for object in collect_snapshot_graph(&root, &store)? {
+            *active_counts.entry(object).or_default() += 1;
+        }
+    }
+    let mut trash_objects = BTreeSet::new();
+    for entry in list_local_snapshot_trash(repository_root)? {
+        if entry.trash_manifest_path.is_file() {
+            let root: SnapshotRootV2 =
+                read_bounded_json(&entry.trash_manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
+            trash_objects.extend(collect_snapshot_graph(&root, &store)?);
+        }
+    }
+    let revision_root_dir = repository_root
+        .join("objects")
+        .join(StorageObjectKind::RevisionRoot.directory())
+        .join("sha256");
+    if revision_root_dir.exists() {
+        for prefix in fs::read_dir(&revision_root_dir)? {
+            let prefix = prefix?;
+            if !prefix.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(prefix.path())? {
+                let path = entry?.path();
+                if path.is_file() {
+                    let root: RevisionRootV2 =
+                        read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+                    for object in collect_revision_graph(&root, &store)? {
+                        *active_counts.entry(object).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    let active_physical_bytes = active_counts.keys().try_fold(0_u64, |total, object| {
+        total
+            .checked_add(object.byte_length)
+            .context("active physical byte count overflow")
+    })?;
+    let shared_physical_bytes = active_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .try_fold(0_u64, |total, (object, _)| {
+            total
+                .checked_add(object.byte_length)
+                .context("shared physical byte count overflow")
+        })?;
+    let exclusive_physical_bytes = active_counts
+        .iter()
+        .filter(|(_, count)| **count == 1)
+        .try_fold(0_u64, |total, (object, _)| {
+            total
+                .checked_add(object.byte_length)
+                .context("exclusive physical byte count overflow")
+        })?;
+    let trash_bytes = trash_objects
+        .difference(&active_counts.keys().cloned().collect())
+        .try_fold(0_u64, |total, object| {
+            total
+                .checked_add(object.byte_length)
+                .context("trash byte count overflow")
+        })?;
+    let gc = plan_local_gc(repository_root)?;
+    let gc_quarantine_bytes = directory_file_bytes(&repository_root.join("trash/gc"))?;
+    let repository_physical_bytes = directory_file_bytes(&repository_root.join("objects"))?;
+    Ok(RepositoryStorageSummary {
+        logical_bytes,
+        repository_physical_bytes,
+        active_physical_bytes,
+        shared_physical_bytes,
+        exclusive_physical_bytes,
+        trash_bytes,
+        gc_quarantine_bytes,
+        reclaimable_bytes: gc.reclaimable_bytes,
+        protected_by_journal_bytes: 0,
+    })
+}
+
+fn directory_file_bytes(root: &Path) -> Result<u64> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total
+                    .checked_add(metadata.len())
+                    .context("directory byte count overflow")?;
+            }
+        }
+    }
+    Ok(total)
 }
 
 pub fn quarantine_local_gc_plan(repository_root: &Path, plan: &GcPlan) -> Result<PathBuf> {
@@ -1094,15 +1753,6 @@ fn validate_thread_refs(threads: &[ThreadRef]) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("invalid thread descriptor hash"))?;
     }
     Ok(())
-}
-
-fn legacy_object_path(repository_root: &Path, sha256: &str) -> Result<PathBuf> {
-    validate_sha256(sha256).map_err(|_| anyhow::anyhow!("invalid legacy object hash"))?;
-    let digest = sha256.strip_prefix("sha256:").expect("validated prefix");
-    Ok(repository_root
-        .join("objects/sha256")
-        .join(&digest[..2])
-        .join(&digest[2..]))
 }
 
 fn validate_content_ref(content: &ContentRef) -> Result<()> {
@@ -1599,5 +2249,88 @@ mod tests {
                 .join(orphan_ref.sha256.strip_prefix("sha256:").unwrap())
                 .exists()
         );
+    }
+
+    #[test]
+    fn snapshot_history_supports_metadata_trash_restore_and_stale_plan_rejection() {
+        let temp = tempdir().unwrap();
+        let store = FilesystemContentStore::open(temp.path()).unwrap();
+        let source = temp.path().join("source-history");
+        fs::write(&source, b"history").unwrap();
+        let content = store.ingest(&source, &OperationControl::default()).unwrap();
+        let bundle = ThreadBundle {
+            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+            thread_id: "history-thread".to_string(),
+            title: "History".to_string(),
+            archived: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            model_provider: None,
+            workspace: WorkspaceRef::default(),
+            rollout: ContentObject {
+                sha256: content.logical_sha256.clone(),
+                byte_length: content.byte_length,
+                media_type: "application/x-ndjson".to_string(),
+                logical_path: Some("sessions/rollout-history-thread.jsonl".to_string()),
+                source_path: None,
+                storage: Some(content.storage.clone()),
+            },
+            related_records: RelatedRecords::default(),
+            attachments: Vec::new(),
+        };
+        let snapshot = LocalSnapshot {
+            schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: Uuid::now_v7().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            threads: vec![bundle],
+            warning_count: 0,
+        };
+        write_v2_snapshot(
+            &snapshot,
+            &BTreeMap::from([("history-thread".to_string(), content)]),
+            temp.path(),
+        )
+        .unwrap();
+        let items = list_local_snapshots(temp.path()).unwrap();
+        assert_eq!((items.len(), items[0].thread_count), (1, 1));
+        update_snapshot_metadata(
+            temp.path(),
+            &snapshot.snapshot_id,
+            SnapshotMetadata {
+                description: " Keep me ".to_string(),
+                tags: vec!["manual".to_string()],
+                pinned: true,
+                automatic: false,
+            },
+        )
+        .unwrap();
+        let pinned = plan_snapshot_deletion(temp.path(), &snapshot.snapshot_id).unwrap();
+        assert!(pinned.pinned);
+        assert!(trash_local_snapshot(temp.path(), &pinned).is_err());
+        update_snapshot_metadata(
+            temp.path(),
+            &snapshot.snapshot_id,
+            SnapshotMetadata::default(),
+        )
+        .unwrap();
+        let plan = plan_snapshot_deletion(temp.path(), &snapshot.snapshot_id).unwrap();
+        let entry = trash_local_snapshot(temp.path(), &plan).unwrap();
+        assert!(list_local_snapshots(temp.path()).unwrap().is_empty());
+        assert_eq!(
+            list_local_snapshot_trash(temp.path()).unwrap(),
+            vec![entry.clone()]
+        );
+        restore_trashed_snapshot(temp.path(), &entry.operation_id).unwrap();
+        assert_eq!(list_local_snapshots(temp.path()).unwrap().len(), 1);
+        update_snapshot_metadata(
+            temp.path(),
+            &snapshot.snapshot_id,
+            SnapshotMetadata {
+                pinned: true,
+                ..SnapshotMetadata::default()
+            },
+        )
+        .unwrap();
+        assert!(trash_local_snapshot(temp.path(), &plan).is_err());
     }
 }

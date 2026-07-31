@@ -2181,17 +2181,19 @@ mod tests {
         .into_bytes();
         rollout.extend_from_slice(content);
         let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&rollout)));
-        let descriptor = crate::ObjectDescriptor {
+        let descriptor = crate::StorageObjectRef {
+            kind: crate::StorageObjectKind::Whole,
             sha256: sha256.clone(),
             byte_length: rollout.len() as u64,
         };
-        crate::install_repository_object(
-            repository,
-            &descriptor,
-            rollout.as_slice(),
-            &OperationControl::default(),
-        )
-        .unwrap();
+        crate::FilesystemContentStore::open(repository.to_path_buf())
+            .unwrap()
+            .install(
+                &descriptor,
+                rollout.as_slice(),
+                &OperationControl::default(),
+            )
+            .unwrap();
         LocalSnapshot {
             schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id: Uuid::now_v7().to_string(),
@@ -2209,12 +2211,14 @@ mod tests {
                     source_path: Some("C:/work".to_string()),
                 },
                 rollout: ContentObject {
-                    sha256,
+                    sha256: sha256.clone(),
                     byte_length: rollout.len() as u64,
                     media_type: "application/x-ndjson".to_string(),
                     logical_path: Some(format!("sessions/2026/07/26/rollout-{thread_id}.jsonl")),
                     source_path: None,
-                    storage: None,
+                    storage: Some(crate::StorageRef::Whole {
+                        object_sha256: sha256.clone(),
+                    }),
                 },
                 related_records: RelatedRecords {
                     source_database: None,

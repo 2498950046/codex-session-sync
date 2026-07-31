@@ -71,6 +71,8 @@ pub struct Namespace {
     pub id: Uuid,
     pub display_name: String,
     pub head: Option<String>,
+    #[serde(default)]
+    pub namespace_epoch: u64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -98,6 +100,27 @@ pub struct RenameNamespaceRequest {
 pub struct NamespaceHeadResponse {
     pub namespace_id: Uuid,
     pub head: Option<String>,
+    pub namespace_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitRevisionRootRequest {
+    pub expected_head: Option<String>,
+    pub expected_namespace_epoch: u64,
+    pub revision_root_sha256: String,
+}
+
+impl CommitRevisionRootRequest {
+    pub fn validate(&self) -> Result<(), RevisionValidationError> {
+        if let Some(expected_head) = &self.expected_head {
+            validate_sha256(expected_head)
+                .map_err(|_| RevisionValidationError::InvalidExpectedHead(expected_head.clone()))?;
+        }
+        validate_sha256(&self.revision_root_sha256).map_err(|_| {
+            RevisionValidationError::InvalidRevisionId(self.revision_root_sha256.clone())
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -247,6 +270,107 @@ pub struct CommitRevisionResponse {
     pub namespace_id: Uuid,
     pub head: String,
     pub created: bool,
+    pub namespace_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RevisionState {
+    Active,
+    Trashed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionSummary {
+    pub revision_id: String,
+    pub namespace_id: Uuid,
+    pub parent_revision: Option<String>,
+    pub created_at: String,
+    pub thread_count: u64,
+    pub object_count: u64,
+    pub logical_bytes: u64,
+    pub physical_referenced_bytes: u64,
+    pub state: RevisionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionListResponse {
+    pub revisions: Vec<RevisionSummary>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TruncateHistoryRequest {
+    pub expected_head: Option<String>,
+    pub expected_namespace_epoch: u64,
+    pub new_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreHistoryRequest {
+    pub expected_head: Option<String>,
+    pub expected_namespace_epoch: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryTrashOperation {
+    pub operation_id: Uuid,
+    pub namespace_id: Uuid,
+    pub old_head: Option<String>,
+    pub new_head: Option<String>,
+    pub epoch_before: u64,
+    pub epoch_after: u64,
+    pub created_at: String,
+    pub expires_at: String,
+    pub revision_count: usize,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryTrashListResponse {
+    pub operations: Vec<HistoryTrashOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerGcPlan {
+    pub created_at: String,
+    pub reachable_object_count: usize,
+    pub candidates: Vec<crate::storage_v2::StorageObjectRef>,
+    pub reclaimable_bytes: u64,
+    pub plan_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerGcQuarantineRequest {
+    pub plan_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerGcQuarantineResponse {
+    pub operation_id: Uuid,
+    pub quarantined_object_count: usize,
+    pub quarantined_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerStorageSummary {
+    pub object_count: usize,
+    pub repository_physical_bytes: u64,
+    pub reachable_object_count: usize,
+    pub reachable_physical_bytes: u64,
+    pub reclaimable_object_count: usize,
+    pub reclaimable_bytes: u64,
+    pub gc_quarantine_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -508,6 +632,7 @@ mod tests {
             id: namespace_id(),
             display_name: "Laptop A".to_string(),
             head: None,
+            namespace_epoch: 0,
             created_at: "2026-07-26T10:30:00Z".to_string(),
             updated_at: "2026-07-26T10:30:00Z".to_string(),
         })
