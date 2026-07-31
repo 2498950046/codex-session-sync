@@ -5,7 +5,6 @@ use sync_core::{ApiError, ApiErrorCode};
 
 use crate::metadata::MetadataError;
 use crate::object_store::ObjectStoreError;
-use crate::revision_store::RevisionStoreError;
 
 #[derive(Debug)]
 pub struct HttpError {
@@ -78,7 +77,7 @@ impl HttpError {
         }
     }
 
-    fn internal(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(error = %error, "sync server request failed");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -118,6 +117,11 @@ impl From<MetadataError> for HttpError {
                     missing_objects: Vec::new(),
                 },
             },
+            MetadataError::EpochMismatch { current } => Self::new(
+                StatusCode::CONFLICT,
+                ApiErrorCode::HeadMismatch,
+                format!("namespace epoch changed; current epoch is {current}"),
+            ),
             MetadataError::RevisionConflict { .. } => Self::new(
                 StatusCode::CONFLICT,
                 ApiErrorCode::InvalidRequest,
@@ -135,7 +139,8 @@ impl From<MetadataError> for HttpError {
             MetadataError::RevisionValidation(error) => Self::invalid_request(error.to_string()),
             error @ (MetadataError::UnsupportedSchema { .. }
             | MetadataError::Sqlite(_)
-            | MetadataError::Join(_)) => Self::internal(error),
+            | MetadataError::Join(_)
+            | MetadataError::Json(_)) => Self::internal(error),
         }
     }
 }
@@ -166,30 +171,6 @@ impl From<ObjectStoreError> for HttpError {
                 "object not found",
             ),
             error @ ObjectStoreError::Io { .. } => Self::internal(error),
-        }
-    }
-}
-
-impl From<RevisionStoreError> for HttpError {
-    fn from(error: RevisionStoreError) -> Self {
-        match error {
-            RevisionStoreError::InvalidDigest { .. } => Self::invalid_digest(error.to_string()),
-            RevisionStoreError::Validation(error) => Self::invalid_request(error.to_string()),
-            RevisionStoreError::ManifestTooLarge { .. } => Self::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                ApiErrorCode::ObjectTooLarge,
-                error.to_string(),
-            ),
-            RevisionStoreError::ImmutableConflict { .. } => Self::new(
-                StatusCode::CONFLICT,
-                ApiErrorCode::InvalidRequest,
-                error.to_string(),
-            ),
-            RevisionStoreError::NotFound { .. } => Self::revision_not_found(),
-            error @ (RevisionStoreError::HashMismatch { .. }
-            | RevisionStoreError::NonCanonical { .. }
-            | RevisionStoreError::Decode { .. }
-            | RevisionStoreError::Io { .. }) => Self::internal(error),
         }
     }
 }

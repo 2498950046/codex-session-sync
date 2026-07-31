@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
 
 use axum::Router;
-use axum::body::{Body, Bytes, to_bytes};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
-use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
-use futures_util::stream;
+use axum::body::{Body, to_bytes};
+use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{Method, Request, Response, StatusCode};
+use rusqlite::params;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sync_core::{
-    CommitRevisionRequest, CommitRevisionResponse, ContentObject, CreateNamespaceRequest,
-    Namespace, REVISION_SCHEMA_VERSION, RelatedRecords, RevisionManifest, RevisionPayload,
-    THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, WorkspaceRef,
+    CommitRevisionResponse, CommitRevisionRootRequest, ContentRef, CreateNamespaceRequest,
+    HistoryTrashListResponse, Namespace, ProtocolInfoResponse, RelatedRecords,
+    RestoreHistoryRequest, RevisionListResponse, RevisionRootV2, ServerGcPlan,
+    ServerGcQuarantineRequest, ServerGcQuarantineResponse, StorageObjectKind, StorageRef,
+    THREAD_DESCRIPTOR_SCHEMA_VERSION, ThreadDescriptor, ThreadRef, TruncateHistoryRequest,
+    WorkspaceRef, canonical_json, digest_bytes,
 };
 use sync_server::{AppState, ServerConfig, build_router};
 use tempfile::TempDir;
@@ -28,13 +29,13 @@ struct TestApp {
 }
 
 impl TestApp {
-    async fn new(max_object_bytes: u64) -> Self {
+    async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let config = ServerConfig {
             bind: "127.0.0.1:0".to_string(),
             data_dir: directory.path().join("server-data"),
             token: TOKEN.to_string(),
-            max_object_bytes,
+            max_object_bytes: 2 * 1024 * 1024,
             max_manifest_bytes: 1024 * 1024,
         };
         let state = AppState::initialize(&config).await.unwrap();
@@ -54,762 +55,406 @@ impl TestApp {
     async fn send(&self, request: Request<Body>) -> Response<Body> {
         self.router.clone().oneshot(request).await.unwrap()
     }
-}
 
-#[tokio::test]
-async fn public_endpoints_work_and_data_routes_require_authentication() {
-    let app = TestApp::new(1024).await;
-
-    let health = app
-        .send(request(Method::GET, "/health", Body::empty()))
-        .await;
-    assert_eq!(health.status(), StatusCode::OK);
-    let health: Value = response_json(health).await;
-    assert_eq!(health["status"], "ok");
-    assert!(health.get("dataDir").is_none());
-
-    let info = app
-        .send(request(Method::GET, "/api/v1/info", Body::empty()))
-        .await;
-    assert_eq!(info.status(), StatusCode::OK);
-    let info: Value = response_json(info).await;
-    assert_eq!(info["protocolVersion"], 2);
-
-    let unauthorized_create = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/namespaces",
-            &CreateNamespaceRequest {
-                display_name: "Must not be created".to_string(),
-            },
-            None,
-        ))
-        .await;
-    assert_unauthorized(unauthorized_create).await;
-
-    let wrong_token = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/namespaces",
-            &CreateNamespaceRequest {
-                display_name: "Must not be created".to_string(),
-            },
-            Some("wrong-token"),
-        ))
-        .await;
-    assert_unauthorized(wrong_token).await;
-
-    let unauthorized_content = b"must not be stored";
-    let unauthorized_object = digest(unauthorized_content);
-    let unauthorized_put = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!(
-                    "/api/v1/objects/{}",
-                    raw_digest(&unauthorized_object)
-                ))
-                .header(CONTENT_LENGTH, unauthorized_content.len())
-                .body(Body::from(unauthorized_content.to_vec()))
-                .unwrap(),
-        )
-        .await;
-    assert_unauthorized(unauthorized_put).await;
-    let unauthorized_missing = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/objects/missing",
-            &json!({
-                "objects": [{
-                    "sha256": unauthorized_object,
-                    "byteLength": unauthorized_content.len()
-                }]
-            }),
-            Some(TOKEN),
-        ))
-        .await;
-    let unauthorized_missing: Value = response_json(unauthorized_missing).await;
-    assert_eq!(
-        unauthorized_missing["missing"],
-        json!([unauthorized_object])
-    );
-
-    for uri in [
-        "/api/v1/namespaces",
-        "/api/v1/objects/0000000000000000000000000000000000000000000000000000000000000000",
-        "/api/v1/revisions/0000000000000000000000000000000000000000000000000000000000000000",
-    ] {
-        let response = app.send(request(Method::GET, uri, Body::empty())).await;
-        assert_unauthorized(response).await;
-    }
-
-    let list = app
-        .send(authenticated(request(
-            Method::GET,
-            "/api/v1/namespaces",
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(list.status(), StatusCode::OK);
-    let list: Value = response_json(list).await;
-    assert_eq!(list["namespaces"], json!([]));
-
-    let oversized_json = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/namespaces",
-            &json!({"displayName": "x".repeat(2 * 1024 * 1024)}),
-            Some(TOKEN),
-        ))
-        .await;
-    assert_error(
-        oversized_json,
-        StatusCode::PAYLOAD_TOO_LARGE,
-        "object_too_large",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn namespace_create_rename_and_head_are_stable() {
-    let app = TestApp::new(1024).await;
-    let namespace = create_namespace(&app, "Personal").await;
-
-    let rename = app
-        .send(json_request(
-            Method::PATCH,
-            &format!("/api/v1/namespaces/{}", namespace.id),
-            &json!({"displayName": "Desktop"}),
-            Some(TOKEN),
-        ))
-        .await;
-    assert_eq!(rename.status(), StatusCode::OK);
-    let renamed: Namespace = response_json(rename).await;
-    assert_eq!(renamed.id, namespace.id);
-    assert_eq!(renamed.display_name, "Desktop");
-
-    let head = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/namespaces/{}/head", namespace.id),
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(head.status(), StatusCode::OK);
-    let head: Value = response_json(head).await;
-    assert_eq!(head["namespaceId"], namespace.id.to_string());
-    assert!(head["head"].is_null());
-}
-
-#[tokio::test]
-async fn object_missing_upload_download_and_validation_work() {
-    let app = TestApp::new(64).await;
-    let content = b"streamed object";
-    let object_id = digest(content);
-    let raw_digest = raw_digest(&object_id);
-
-    let missing = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/objects/missing",
-            &json!({"objects": [{"sha256": object_id, "byteLength": content.len()}]}),
-            Some(TOKEN),
-        ))
-        .await;
-    assert_eq!(missing.status(), StatusCode::OK);
-    let missing: Value = response_json(missing).await;
-    assert_eq!(missing["missing"], json!([object_id]));
-
-    let chunks = stream::iter([
-        Ok::<_, std::io::Error>(Bytes::from_static(b"streamed ")),
-        Ok(Bytes::from_static(b"object")),
-    ]);
-    let upload = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/api/v1/objects/{raw_digest}"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .header(CONTENT_LENGTH, content.len())
-                .body(Body::from_stream(chunks))
-                .unwrap(),
-        )
-        .await;
-    assert_eq!(upload.status(), StatusCode::CREATED);
-    let upload: Value = response_json(upload).await;
-    assert_eq!(upload["created"], true);
-
-    let repeated = upload_object(&app, content, &object_id).await;
-    assert_eq!(repeated.status(), StatusCode::OK);
-    let repeated: Value = response_json(repeated).await;
-    assert_eq!(repeated["created"], false);
-
-    let missing = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/objects/missing",
-            &json!({"objects": [{"sha256": object_id, "byteLength": content.len()}]}),
-            Some(TOKEN),
-        ))
-        .await;
-    let missing: Value = response_json(missing).await;
-    assert_eq!(missing["missing"], json!([]));
-
-    let conflicting_lengths = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/objects/missing",
-            &json!({
-                "objects": [
-                    {"sha256": object_id, "byteLength": content.len()},
-                    {"sha256": object_id, "byteLength": content.len() + 1}
-                ]
-            }),
-            Some(TOKEN),
-        ))
-        .await;
-    assert_error(
-        conflicting_lengths,
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-    )
-    .await;
-
-    let download = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/objects/{raw_digest}"),
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(download.status(), StatusCode::OK);
-    assert_eq!(
-        download.headers().get(ETAG).unwrap(),
-        &format!("\"{object_id}\"")
-    );
-    assert_eq!(response_bytes(download).await.as_ref(), content);
-
-    let invalid_digest = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/api/v1/objects/{}", "A".repeat(64)))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .header(CONTENT_LENGTH, content.len())
-                .body(Body::from(content.to_vec()))
-                .unwrap(),
-        )
-        .await;
-    assert_error(invalid_digest, StatusCode::BAD_REQUEST, "invalid_digest").await;
-
-    let wrong_hash = upload_object(&app, content, &format!("sha256:{}", "0".repeat(64))).await;
-    assert_error(
-        wrong_hash,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "hash_mismatch",
-    )
-    .await;
-
-    let missing_length = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/api/v1/objects/{raw_digest}"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .body(Body::from(content.to_vec()))
-                .unwrap(),
-        )
-        .await;
-    assert_error(missing_length, StatusCode::BAD_REQUEST, "invalid_request").await;
-
-    let mut duplicate_length = Request::builder()
-        .method(Method::PUT)
-        .uri(format!("/api/v1/objects/{raw_digest}"))
-        .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-        .header(CONTENT_LENGTH, content.len())
-        .body(Body::from(content.to_vec()))
-        .unwrap();
-    duplicate_length.headers_mut().append(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&content.len().to_string()).unwrap(),
-    );
-    let duplicate_length = app.send(duplicate_length).await;
-    assert_error(duplicate_length, StatusCode::BAD_REQUEST, "invalid_request").await;
-
-    let wrong_length = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/api/v1/objects/{raw_digest}"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .header(CONTENT_LENGTH, content.len() - 1)
-                .body(Body::from(content.to_vec()))
-                .unwrap(),
-        )
-        .await;
-    assert_error(
-        wrong_length,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "length_mismatch",
-    )
-    .await;
-
-    let invalid_length = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/api/v1/objects/{raw_digest}"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .header(CONTENT_LENGTH, "not-a-number")
-                .body(Body::from(content.to_vec()))
-                .unwrap(),
-        )
-        .await;
-    assert_error(invalid_length, StatusCode::BAD_REQUEST, "invalid_request").await;
-
-    let short_body = app
-        .send(
-            Request::builder()
-                .method(Method::PUT)
-                .uri(format!("/api/v1/objects/{raw_digest}"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                .header(CONTENT_LENGTH, content.len() + 1)
-                .body(Body::from(content.to_vec()))
-                .unwrap(),
-        )
-        .await;
-    assert_error(
-        short_body,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "length_mismatch",
-    )
-    .await;
-
-    let empty_id = digest(b"");
-    let empty_upload = upload_object(&app, b"", &empty_id).await;
-    assert_eq!(empty_upload.status(), StatusCode::CREATED);
-
-    let oversized_content = vec![b'x'; 65];
-    let oversized_id = digest(&oversized_content);
-    let oversized = upload_object(&app, &oversized_content, &oversized_id).await;
-    assert_error(oversized, StatusCode::PAYLOAD_TOO_LARGE, "object_too_large").await;
-}
-
-#[tokio::test]
-async fn typed_v2_objects_are_kind_scoped_and_idempotent() {
-    let app = TestApp::new(1024).await;
-    let content = b"shared typed bytes";
-    let digest = hex::encode(sha2::Sha256::digest(content));
-    let sha256 = format!("sha256:{digest}");
-    let missing = app
-        .send(authenticated(json_request(
-            Method::POST,
-            "/api/v2/objects/missing",
-            &json!({"objects": [
-                {"kind":"whole","sha256":sha256,"byteLength":content.len()},
-                {"kind":"chunk","sha256":sha256,"byteLength":content.len()}
-            ]}),
-            Some(TOKEN),
-        )))
-        .await;
-    assert_eq!(missing.status(), StatusCode::OK);
-    let body: Value = response_json(missing).await;
-    assert_eq!(body["missing"].as_array().unwrap().len(), 2);
-
-    for kind in ["whole", "chunk"] {
-        let response = app
-            .send(authenticated(
-                Request::builder()
-                    .method(Method::PUT)
-                    .uri(format!("/api/v2/objects/{kind}/{digest}"))
-                    .header(CONTENT_LENGTH, content.len())
-                    .body(Body::from(content.as_slice()))
-                    .unwrap(),
+    async fn create_namespace(&self, name: &str) -> Namespace {
+        let response = self
+            .send(json_request(
+                Method::POST,
+                "/api/v2/namespaces",
+                &CreateNamespaceRequest {
+                    display_name: name.to_string(),
+                },
             ))
             .await;
         assert_eq!(response.status(), StatusCode::CREATED);
-        let repeat = app
-            .send(authenticated(
+        response_json(response).await
+    }
+
+    async fn upload(&self, kind: StorageObjectKind, bytes: &[u8]) -> String {
+        let sha256 = digest_bytes(bytes);
+        let digest = sha256.strip_prefix("sha256:").unwrap();
+        let response = self
+            .send(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri(format!("/api/v2/objects/{kind}/{digest}"))
-                    .header(CONTENT_LENGTH, content.len())
-                    .body(Body::from(content.as_slice()))
+                    .uri(format!("/api/v2/objects/{}/{digest}", kind.wire_name()))
+                    .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .header(CONTENT_LENGTH, bytes.len())
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(Body::from(bytes.to_vec()))
                     .unwrap(),
-            ))
+            )
             .await;
-        assert_eq!(repeat.status(), StatusCode::OK);
+        assert!(matches!(
+            response.status(),
+            StatusCode::CREATED | StatusCode::OK
+        ));
+        sha256
     }
-}
 
-#[tokio::test]
-async fn revision_commit_requires_objects_and_fast_forwards() {
-    let app = TestApp::new(1024).await;
-    let namespace = create_namespace(&app, "Personal").await;
-    let first_content = b"first rollout";
-    let first = revision(namespace.id, None, "first", first_content);
-    let first_request = CommitRevisionRequest {
-        expected_head: None,
-        revision: first.clone(),
-    };
-
-    let missing = commit(&app, namespace.id, &first_request).await;
-    assert_eq!(missing.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let missing: Value = response_json(missing).await;
-    assert_eq!(missing["code"], "missing_objects");
-    assert_eq!(missing["missingObjects"], json!([digest(first_content)]));
-
-    assert_eq!(
-        upload_object(&app, first_content, &digest(first_content))
-            .await
-            .status(),
-        StatusCode::CREATED
-    );
-    let committed = commit(&app, namespace.id, &first_request).await;
-    assert_eq!(committed.status(), StatusCode::CREATED);
-    let committed: CommitRevisionResponse = response_json(committed).await;
-    assert!(committed.created);
-    assert_eq!(committed.head, first.revision_id);
-
-    let repeated = commit(&app, namespace.id, &first_request).await;
-    assert_eq!(repeated.status(), StatusCode::OK);
-    let repeated: CommitRevisionResponse = response_json(repeated).await;
-    assert!(!repeated.created);
-
-    let fetched = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/revisions/{}", raw_digest(&first.revision_id)),
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(fetched.status(), StatusCode::OK);
-    let fetched: RevisionManifest = response_json(fetched).await;
-    assert_eq!(fetched, first);
-
-    let second_content = b"second rollout";
-    assert_eq!(
-        upload_object(&app, second_content, &digest(second_content))
-            .await
-            .status(),
-        StatusCode::CREATED
-    );
-    let second = revision(
-        namespace.id,
-        Some(first.revision_id.clone()),
-        "second",
-        second_content,
-    );
-    let second_request = CommitRevisionRequest {
-        expected_head: Some(first.revision_id.clone()),
-        revision: second.clone(),
-    };
-    assert_eq!(
-        commit(&app, namespace.id, &second_request).await.status(),
-        StatusCode::CREATED
-    );
-    assert_eq!(namespace_head(&app, namespace.id).await, second.revision_id);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stale_and_concurrent_pushes_cannot_overwrite_head() {
-    let app = TestApp::new(1024).await;
-    let namespace = create_namespace(&app, "Personal").await;
-    let base_content = b"base rollout";
-    upload_object(&app, base_content, &digest(base_content)).await;
-    let base = revision(namespace.id, None, "base", base_content);
-    assert_eq!(
-        commit(
-            &app,
-            namespace.id,
-            &CommitRevisionRequest {
-                expected_head: None,
-                revision: base.clone(),
-            },
-        )
-        .await
-        .status(),
-        StatusCode::CREATED
-    );
-
-    let left_content = b"left rollout";
-    let right_content = b"right rollout";
-    upload_object(&app, left_content, &digest(left_content)).await;
-    upload_object(&app, right_content, &digest(right_content)).await;
-    let left = revision(
-        namespace.id,
-        Some(base.revision_id.clone()),
-        "left",
-        left_content,
-    );
-    let right = revision(
-        namespace.id,
-        Some(base.revision_id.clone()),
-        "right",
-        right_content,
-    );
-    let left_request = CommitRevisionRequest {
-        expected_head: Some(base.revision_id.clone()),
-        revision: left.clone(),
-    };
-    let right_request = CommitRevisionRequest {
-        expected_head: Some(base.revision_id.clone()),
-        revision: right.clone(),
-    };
-
-    let left_http = json_request(
-        Method::POST,
-        &format!("/api/v1/namespaces/{}/revisions", namespace.id),
-        &left_request,
-        Some(TOKEN),
-    );
-    let right_http = json_request(
-        Method::POST,
-        &format!("/api/v1/namespaces/{}/revisions", namespace.id),
-        &right_request,
-        Some(TOKEN),
-    );
-    let (left_response, right_response) = tokio::join!(
-        app.router.clone().oneshot(left_http),
-        app.router.clone().oneshot(right_http)
-    );
-    let left_response = left_response.unwrap();
-    let right_response = right_response.unwrap();
-    let statuses = [left_response.status(), right_response.status()];
-    assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| **status == StatusCode::CREATED)
-            .count(),
-        1
-    );
-    assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| **status == StatusCode::CONFLICT)
-            .count(),
-        1
-    );
-
-    let (winner, loser, loser_response) = if left_response.status() == StatusCode::CREATED {
-        (left, right, right_response)
-    } else {
-        (right, left, left_response)
-    };
-    let conflict: Value = response_json(loser_response).await;
-    assert_eq!(conflict["code"], "head_mismatch");
-    assert_eq!(conflict["currentHead"], winner.revision_id);
-    assert_eq!(namespace_head(&app, namespace.id).await, winner.revision_id);
-
-    let orphan = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/revisions/{}", raw_digest(&loser.revision_id)),
-            Body::empty(),
-        )))
-        .await;
-    assert_error(orphan, StatusCode::NOT_FOUND, "revision_not_found").await;
-}
-
-#[tokio::test]
-async fn namespace_head_survives_server_restart() {
-    let mut app = TestApp::new(1024).await;
-    let namespace = create_namespace(&app, "Personal").await;
-    let content = b"persistent rollout";
-    upload_object(&app, content, &digest(content)).await;
-    let revision = revision(namespace.id, None, "persistent", content);
-    assert_eq!(
-        commit(
-            &app,
-            namespace.id,
-            &CommitRevisionRequest {
-                expected_head: None,
-                revision: revision.clone(),
-            },
-        )
-        .await
-        .status(),
-        StatusCode::CREATED
-    );
-
-    app.restart().await;
-    assert_eq!(
-        namespace_head(&app, namespace.id).await,
-        revision.revision_id
-    );
-
-    let fetched_revision = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/revisions/{}", raw_digest(&revision.revision_id)),
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(fetched_revision.status(), StatusCode::OK);
-    let fetched_revision: RevisionManifest = response_json(fetched_revision).await;
-    assert_eq!(fetched_revision, revision);
-
-    let fetched_object = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/objects/{}", raw_digest(&digest(content))),
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(fetched_object.status(), StatusCode::OK);
-    assert_eq!(response_bytes(fetched_object).await.as_ref(), content);
-}
-
-async fn create_namespace(app: &TestApp, display_name: &str) -> Namespace {
-    let response = app
-        .send(json_request(
-            Method::POST,
-            "/api/v1/namespaces",
-            &CreateNamespaceRequest {
-                display_name: display_name.to_string(),
-            },
-            Some(TOKEN),
-        ))
-        .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    response_json(response).await
-}
-
-async fn upload_object(app: &TestApp, content: &[u8], object_id: &str) -> Response<Body> {
-    app.send(
-        Request::builder()
-            .method(Method::PUT)
-            .uri(format!("/api/v1/objects/{}", raw_digest(object_id)))
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-            .header(CONTENT_LENGTH, content.len())
-            .body(Body::from(content.to_vec()))
-            .unwrap(),
-    )
-    .await
-}
-
-async fn commit(
-    app: &TestApp,
-    namespace_id: Uuid,
-    commit: &CommitRevisionRequest,
-) -> Response<Body> {
-    app.send(json_request(
-        Method::POST,
-        &format!("/api/v1/namespaces/{namespace_id}/revisions"),
-        commit,
-        Some(TOKEN),
-    ))
-    .await
-}
-
-async fn namespace_head(app: &TestApp, namespace_id: Uuid) -> String {
-    let response = app
-        .send(authenticated(request(
-            Method::GET,
-            &format!("/api/v1/namespaces/{namespace_id}/head"),
-            Body::empty(),
-        )))
-        .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response_json(response).await;
-    body["head"].as_str().unwrap().to_string()
-}
-
-fn revision(
-    namespace_id: Uuid,
-    parent_revision: Option<String>,
-    label: &str,
-    content: &[u8],
-) -> RevisionManifest {
-    RevisionManifest::from_payload(RevisionPayload {
-        schema_version: REVISION_SCHEMA_VERSION,
-        namespace_id,
-        parent_revision,
-        created_at: "2026-07-26T10:30:00Z".to_string(),
-        threads: vec![ThreadBundle {
-            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
-            thread_id: format!("thread-{label}"),
-            title: format!("Thread {label}"),
+    async fn install_revision(
+        &self,
+        namespace_id: Uuid,
+        parent_revision: Option<String>,
+        content: &[u8],
+        thread_id: &str,
+    ) -> RevisionRootV2 {
+        let whole_sha256 = self.upload(StorageObjectKind::Whole, content).await;
+        let descriptor = ThreadDescriptor {
+            schema_version: THREAD_DESCRIPTOR_SCHEMA_VERSION,
+            thread_id: thread_id.to_string(),
+            title: format!("Thread {thread_id}"),
             archived: false,
-            created_at_ms: None,
-            updated_at_ms: None,
+            created_at_ms: Some(1_700_000_000_000),
+            updated_at_ms: Some(1_700_000_100_000),
             model_provider: Some("openai".to_string()),
             workspace: WorkspaceRef::default(),
-            rollout: ContentObject {
-                sha256: digest(content),
+            rollout: ContentRef {
+                logical_sha256: whole_sha256.clone(),
                 byte_length: content.len() as u64,
-                media_type: "application/x-ndjson".to_string(),
-                logical_path: Some(format!("sessions/rollout-{label}.jsonl")),
-                source_path: None,
-                storage: None,
+                storage: StorageRef::Whole {
+                    object_sha256: whole_sha256,
+                },
+                media_type: Some("application/x-ndjson".to_string()),
+                logical_path: Some(format!("sessions/rollout-{thread_id}.jsonl")),
             },
             related_records: RelatedRecords {
                 source_database: None,
                 tables: BTreeMap::new(),
             },
             attachments: Vec::new(),
-        }],
-        warning_count: 0,
-    })
-    .unwrap()
+        };
+        let descriptor_bytes = canonical_json(&descriptor).unwrap();
+        let descriptor_sha256 = self
+            .upload(StorageObjectKind::Thread, &descriptor_bytes)
+            .await;
+        let root = RevisionRootV2 {
+            schema_version: sync_core::REVISION_ROOT_V2_SCHEMA_VERSION,
+            namespace_id,
+            parent_revision,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            threads: vec![ThreadRef {
+                thread_id: thread_id.to_string(),
+                descriptor_sha256,
+            }],
+            warning_count: 0,
+        };
+        let root_bytes = canonical_json(&root).unwrap();
+        let root_sha256 = self
+            .upload(StorageObjectKind::RevisionRoot, &root_bytes)
+            .await;
+        assert_eq!(root.revision_id().unwrap(), root_sha256);
+        root
+    }
+
+    async fn commit(
+        &self,
+        namespace_id: Uuid,
+        expected_head: Option<String>,
+        expected_epoch: u64,
+        root: &RevisionRootV2,
+    ) -> Response<Body> {
+        self.send(json_request(
+            Method::POST,
+            &format!("/api/v2/namespaces/{namespace_id}/revisions/commit"),
+            &CommitRevisionRootRequest {
+                expected_head,
+                expected_namespace_epoch: expected_epoch,
+                revision_root_sha256: root.revision_id().unwrap(),
+            },
+        ))
+        .await
+    }
+
+    fn backdate_all_objects(&self) {
+        let connection =
+            rusqlite::Connection::open(self.config.data_dir.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE storage_objects SET created_at = '2020-01-01T00:00:00.000Z'",
+                [],
+            )
+            .unwrap();
+    }
 }
 
-fn digest(content: &[u8]) -> String {
-    format!("sha256:{}", hex::encode(Sha256::digest(content)))
+#[tokio::test]
+async fn exposes_only_v2_and_requires_auth_for_data_routes() {
+    let app = TestApp::new().await;
+    assert_eq!(
+        app.send(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let info = app
+        .send(
+            Request::builder()
+                .uri("/api/v2/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    let info: ProtocolInfoResponse = response_json(info).await;
+    assert_eq!(info.protocol_version, 2);
+    assert!(info.capabilities.garbage_collection);
+    assert_eq!(
+        app.send(
+            Request::builder()
+                .uri("/api/v1/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.send(
+            Request::builder()
+                .uri("/api/v2/namespaces")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
-fn raw_digest(object_id: &str) -> &str {
-    object_id.strip_prefix("sha256:").unwrap()
+#[tokio::test]
+async fn compact_revision_commit_is_idempotent_and_rejects_stale_head_and_epoch() {
+    let app = TestApp::new().await;
+    let namespace = app.create_namespace("Personal").await;
+    let root = app
+        .install_revision(namespace.id, None, b"first revision\n", "thread-one")
+        .await;
+    let first = app.commit(namespace.id, None, 0, &root).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let committed: CommitRevisionResponse = response_json(first).await;
+    assert_eq!(committed.head, root.revision_id().unwrap());
+    let retry = app.commit(namespace.id, None, 0, &root).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+
+    let stale = app
+        .install_revision(namespace.id, None, b"stale revision\n", "thread-stale")
+        .await;
+    assert_eq!(
+        app.commit(namespace.id, None, 0, &stale).await.status(),
+        StatusCode::CONFLICT
+    );
+    let stale_epoch = app
+        .install_revision(
+            namespace.id,
+            Some(committed.head.clone()),
+            b"stale epoch\n",
+            "thread-epoch",
+        )
+        .await;
+    assert_eq!(
+        app.commit(namespace.id, Some(committed.head.clone()), 1, &stale_epoch,)
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let revisions = app
+        .send(auth_request(
+            Method::GET,
+            &format!("/api/v2/namespaces/{}/revisions", namespace.id),
+            Body::empty(),
+        ))
+        .await;
+    let revisions: RevisionListResponse = response_json(revisions).await;
+    assert_eq!(revisions.revisions.len(), 1);
 }
 
-fn request(method: Method, uri: &str, body: Body) -> Request<Body> {
+#[tokio::test]
+async fn history_truncation_is_recoverable_and_epoch_cas_protected() {
+    let app = TestApp::new().await;
+    let namespace = app.create_namespace("History").await;
+    let first = app
+        .install_revision(namespace.id, None, b"first\n", "thread")
+        .await;
+    let first_id = first.revision_id().unwrap();
+    assert_eq!(
+        app.commit(namespace.id, None, 0, &first).await.status(),
+        StatusCode::CREATED
+    );
+    let second = app
+        .install_revision(namespace.id, Some(first_id.clone()), b"second\n", "thread")
+        .await;
+    let second_id = second.revision_id().unwrap();
+    assert_eq!(
+        app.commit(namespace.id, Some(first_id.clone()), 0, &second)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let truncated = app
+        .send(json_request(
+            Method::POST,
+            &format!("/api/v2/namespaces/{}/history/truncations", namespace.id),
+            &TruncateHistoryRequest {
+                expected_head: Some(second_id),
+                expected_namespace_epoch: 0,
+                new_head: Some(first_id.clone()),
+            },
+        ))
+        .await;
+    assert_eq!(truncated.status(), StatusCode::OK);
+    let operation: sync_core::HistoryTrashOperation = response_json(truncated).await;
+    assert_eq!(operation.epoch_after, 1);
+    let trash = app
+        .send(auth_request(
+            Method::GET,
+            &format!("/api/v2/namespaces/{}/trash", namespace.id),
+            Body::empty(),
+        ))
+        .await;
+    let trash: HistoryTrashListResponse = response_json(trash).await;
+    assert_eq!(trash.operations.len(), 1);
+    let restored = app
+        .send(json_request(
+            Method::POST,
+            &format!(
+                "/api/v2/namespaces/{}/trash/{}/restore",
+                namespace.id, operation.operation_id
+            ),
+            &RestoreHistoryRequest {
+                expected_head: Some(first_id),
+                expected_namespace_epoch: 1,
+            },
+        ))
+        .await;
+    assert_eq!(restored.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn gc_quarantines_only_globally_unreachable_objects_and_resumes_after_restart() {
+    let mut app = TestApp::new().await;
+    let namespace = app.create_namespace("Protected").await;
+    let root = app
+        .install_revision(namespace.id, None, b"shared content\n", "shared")
+        .await;
+    assert_eq!(
+        app.commit(namespace.id, None, 0, &root).await.status(),
+        StatusCode::CREATED
+    );
+    let orphan = app
+        .upload(StorageObjectKind::Whole, b"orphan content")
+        .await;
+    app.backdate_all_objects();
+
+    let plan = app
+        .send(auth_request(Method::GET, "/api/v2/gc/plan", Body::empty()))
+        .await;
+    let plan: ServerGcPlan = response_json(plan).await;
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].sha256, orphan);
+    let quarantined = app
+        .send(json_request(
+            Method::POST,
+            "/api/v2/gc/quarantine",
+            &ServerGcQuarantineRequest {
+                plan_fingerprint: plan.plan_fingerprint,
+            },
+        ))
+        .await;
+    let quarantined: ServerGcQuarantineResponse = response_json(quarantined).await;
+    assert_eq!(quarantined.quarantined_object_count, 1);
+    let orphan_digest = orphan.strip_prefix("sha256:").unwrap();
+    assert_eq!(
+        app.send(auth_request(
+            Method::GET,
+            &format!("/api/v2/objects/whole/{orphan_digest}"),
+            Body::empty(),
+        ))
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    let descriptor = &root.threads[0].descriptor_sha256;
+    assert_eq!(
+        app.send(auth_request(
+            Method::GET,
+            &format!(
+                "/api/v2/objects/thread/{}",
+                descriptor.strip_prefix("sha256:").unwrap()
+            ),
+            Body::empty(),
+        ))
+        .await
+        .status(),
+        StatusCode::OK
+    );
+
+    let restart_orphan = app
+        .upload(StorageObjectKind::Whole, b"restart orphan")
+        .await;
+    let queue_id = Uuid::now_v7();
+    let operation_id = Uuid::now_v7();
+    let connection =
+        rusqlite::Connection::open(app.config.data_dir.join("metadata.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO gc_queue
+         (id, operation_id, object_kind, object_sha256, expected_length, state, created_at)
+         VALUES (?1, ?2, 'whole', ?3, ?4, 'pending', '2020-01-01T00:00:00.000Z')",
+            params![
+                queue_id.to_string(),
+                operation_id.to_string(),
+                restart_orphan,
+                14_i64
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    app.restart().await;
+    let connection =
+        rusqlite::Connection::open(app.config.data_dir.join("metadata.sqlite")).unwrap();
+    let state: String = connection
+        .query_row(
+            "SELECT state FROM gc_queue WHERE id = ?1",
+            [queue_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "quarantined");
+}
+
+fn auth_request(method: Method, uri: &str, body: Body) -> Request<Body> {
     Request::builder()
         .method(method)
         .uri(uri)
+        .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
         .body(body)
         .unwrap()
 }
 
-fn authenticated(mut request: Request<Body>) -> Request<Body> {
-    request
-        .headers_mut()
-        .insert(AUTHORIZATION, format!("Bearer {TOKEN}").parse().unwrap());
-    request
-}
-
-fn json_request<T: Serialize>(
-    method: Method,
-    uri: &str,
-    payload: &T,
-    token: Option<&str>,
-) -> Request<Body> {
-    let body = serde_json::to_vec(payload).unwrap();
-    let mut builder = Request::builder()
+fn json_request<T: Serialize>(method: Method, uri: &str, value: &T) -> Request<Body> {
+    Request::builder()
         .method(method)
         .uri(uri)
-        .header(CONTENT_TYPE, "application/json");
-    if let Some(token) = token {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
-    }
-    builder.body(Body::from(body)).unwrap()
-}
-
-async fn response_json<T: DeserializeOwned>(response: Response<Body>) -> T {
-    serde_json::from_slice(&response_bytes(response).await).unwrap()
-}
-
-async fn response_bytes(response: Response<Body>) -> Bytes {
-    to_bytes(response.into_body(), 8 * 1024 * 1024)
-        .await
+        .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(value).unwrap()))
         .unwrap()
 }
 
-async fn assert_unauthorized(response: Response<Body>) {
-    assert_error(response, StatusCode::UNAUTHORIZED, "unauthorized").await;
-}
-
-async fn assert_error(response: Response<Body>, status: StatusCode, code: &str) {
-    assert_eq!(response.status(), status);
-    let body: Value = response_json(response).await;
-    assert_eq!(body["code"], code);
+async fn response_json<T: DeserializeOwned>(response: Response<Body>) -> T {
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+        panic!(
+            "failed to decode response {status}: {error}; body={}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }

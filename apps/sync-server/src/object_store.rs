@@ -229,6 +229,35 @@ impl ObjectStore {
         })
     }
 
+    pub async fn quarantine(
+        &self,
+        digest: &str,
+        destination: &Path,
+    ) -> Result<bool, ObjectStoreError> {
+        let source = self.object_path(digest)?;
+        if !file_exists(&source).await? {
+            return file_exists(destination).await;
+        }
+        if let Some(parent) = destination.parent() {
+            create_dir_all(parent).await?;
+        }
+        match tokio::fs::rename(&source, destination).await {
+            Ok(()) => {
+                if let Some(parent) = source.parent() {
+                    sync_directory(parent).await?;
+                }
+                if let Some(parent) = destination.parent() {
+                    sync_directory(parent).await?;
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(file_exists(destination).await?)
+            }
+            Err(source_error) => Err(io_error("quarantine object", &source, source_error)),
+        }
+    }
+
     async fn write_verified_temp<S, E>(
         &self,
         temp_path: &Path,

@@ -4,7 +4,6 @@ pub mod config;
 pub mod error;
 pub mod metadata;
 pub mod object_store;
-pub mod revision_store;
 
 pub use api::{AppState, build_router};
 pub use config::ServerConfig;
