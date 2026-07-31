@@ -1,18 +1,20 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use sync_core::repository_object_path;
 use sync_core::{
-    CheckoutReport, CheckoutTrackingUpdate, CommitRevisionRequest, ContentStore,
-    FilesystemContentStore, LocalSnapshot, OperationControl, OperationProgress, ThreadBundle,
-    ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome, TrackingRecord, TrackingStore,
-    WorkspacePathMapper, checkout_local_snapshot_with_tracking_and_projects_control,
-    collect_object_descriptors, create_local_snapshot_with_control, install_repository_object,
-    load_local_snapshot, merge_thread_sets, remote_thread_view, repository_object_path,
-    resolve_thread_sets, revision_to_snapshot, semantic_thread_hash, snapshot_to_revision,
-    store_local_snapshot, validate_repository_object,
+    CheckoutReport, CheckoutTrackingUpdate, ContentStore, FilesystemContentStore, LocalSnapshot,
+    OperationControl, OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution,
+    ThreadMergeOutcome, TrackingRecord, TrackingStore, WorkspacePathMapper,
+    checkout_local_snapshot_with_tracking_and_projects_control, create_local_snapshot_with_control,
+    load_local_snapshot, merge_thread_sets, remote_thread_view, resolve_thread_sets,
+    semantic_thread_hash, store_local_snapshot,
 };
 use uuid::Uuid;
 
@@ -59,6 +61,122 @@ impl<'a> LocalSyncContext<'a> {
     }
 }
 
+pub fn download_remote_revision_as_snapshot(
+    namespace_id: Uuid,
+    revision_id: &str,
+    client: &RemoteClient,
+    repository_root: &Path,
+    control: &OperationControl,
+) -> Result<sync_core::SnapshotSummary> {
+    let (root, threads, _) =
+        download_revision_graph(client, revision_id, repository_root, control)?;
+    validate_revision_root_namespace(&root, namespace_id)?;
+    let snapshot = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: Uuid::now_v7().to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads,
+        warning_count: root.warning_count,
+    };
+    let manifest_path = store_local_snapshot(&snapshot, repository_root)?;
+    let item = sync_core::list_local_snapshots(repository_root)?
+        .into_iter()
+        .find(|item| item.snapshot_id == snapshot.snapshot_id)
+        .context("downloaded snapshot was not indexed")?;
+    sync_core::update_snapshot_metadata(
+        repository_root,
+        &snapshot.snapshot_id,
+        sync_core::SnapshotMetadata {
+            description: format!("Remote {}", &revision_id["sha256:".len()..][..12]),
+            tags: vec!["remote".to_string()],
+            pinned: false,
+            automatic: false,
+        },
+    )?;
+    Ok(sync_core::SnapshotSummary {
+        snapshot_id: snapshot.snapshot_id,
+        manifest_path,
+        thread_count: item.thread_count,
+        object_count: item.object_count,
+        total_bytes: item.logical_bytes,
+        warning_count: item.warning_count,
+    })
+}
+
+pub fn restore_remote_revision_locally(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    revision_id: &str,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<CheckoutReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    let current = client
+        .namespace_head(namespace_id)?
+        .context("remote namespace has no Head")?;
+    let tracking = TrackingStore::open(repository_root)?;
+    let record = tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .context("namespace has no local tracking state")?;
+    if record.integrated_head.as_deref() != Some(current.as_str()) {
+        bail!("pull the current remote Head before restoring an older revision");
+    }
+    let (root, threads, _) =
+        download_revision_graph(client, revision_id, repository_root, control)?;
+    validate_revision_root_namespace(&root, namespace_id)?;
+    if root.warning_count > 0 {
+        bail!("incomplete remote revisions cannot be restored");
+    }
+    let snapshot = workspace_mapper.materialize_snapshot_objects(
+        &LocalSnapshot {
+            schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: Uuid::now_v7().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            threads,
+            warning_count: 0,
+        },
+        repository_root,
+        control,
+    )?;
+    let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    sync_core::checkout_local_snapshot_with_control(
+        manifest,
+        codex_home,
+        repository_root,
+        true,
+        control,
+    )
+}
+
+pub fn restore_remote_revision_and_publish(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    revision_id: &str,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<SyncReport> {
+    restore_remote_revision_locally(remote_id, namespace_id, revision_id, client, context)?;
+    let publish = context.control.non_cancellable();
+    push_namespace(
+        remote_id,
+        namespace_id,
+        client,
+        LocalSyncContext::new(
+            context.codex_home,
+            context.repository_root,
+            context.workspace_mapper,
+            &publish,
+        ),
+    )
+    .context("the revision was restored locally, but publishing failed; use Push to retry")
+}
+
 pub fn reapply_workspace_mappings(
     remote_id: Uuid,
     namespace_id: Uuid,
@@ -83,14 +201,15 @@ pub fn reapply_workspace_mappings(
     let record = tracking
         .load(codex_home, remote_id, namespace_id)?
         .context("active namespace has no tracking record")?;
-    let reference = record
-        .integrated_head
-        .as_deref()
-        .map(|head| client.revision(head))
-        .transpose()?;
-    if let Some(revision) = &reference {
-        validate_revision_namespace(revision, namespace_id)?;
-    }
+    let reference_threads = match record.integrated_head.as_deref() {
+        Some(head) => {
+            let (root, threads, _) =
+                download_revision_graph(client, head, repository_root, control)?;
+            validate_revision_root_namespace(&root, namespace_id)?;
+            threads
+        }
+        None => Vec::new(),
+    };
     let local_summary =
         create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
     if local_summary.warning_count > 0 {
@@ -99,10 +218,7 @@ pub fn reapply_workspace_mappings(
     let local = load_local_snapshot(local_summary.manifest_path)?;
     let snapshot = workspace_mapper.materialize_snapshot_objects_with_reference(
         &local,
-        reference
-            .as_ref()
-            .map(|revision| revision.payload.threads.as_slice())
-            .unwrap_or_default(),
+        &reference_threads,
         repository_root,
         control,
     )?;
@@ -179,7 +295,17 @@ pub fn push_namespace(
     let integrated_head = record
         .as_ref()
         .and_then(|record| record.integrated_head.clone());
-    let remote_head = client.namespace_head(namespace_id)?;
+    let remote_state = client.namespace_head_state(namespace_id)?;
+    if let Some(record) = &record
+        && record.remote_epoch != remote_state.namespace_epoch
+    {
+        bail!(
+            "remote history epoch changed from {} to {}; use an exact namespace switch to coordinate the rewritten history",
+            record.remote_epoch,
+            remote_state.namespace_epoch
+        );
+    }
+    let remote_head = remote_state.head.clone();
     let summary = create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
     if summary.warning_count > 0 {
         bail!(
@@ -192,33 +318,47 @@ pub fn push_namespace(
         repository_root,
         control,
     )?;
-    let revision = snapshot_to_revision(&snapshot, namespace_id, remote_head.clone())?;
+    let (revision_root, _) = sync_core::snapshot_to_revision_root(
+        &snapshot,
+        namespace_id,
+        remote_head.clone(),
+        repository_root,
+    )?;
+    let revision_id = revision_root.revision_id()?;
     if let Some(head) = remote_head.as_deref() {
-        let current = client.revision(head)?;
-        validate_revision_namespace(&current, namespace_id)?;
-        if thread_states_equal(&current.payload.threads, &revision.payload.threads)?
-            && current.payload.warning_count == revision.payload.warning_count
+        let (current_root, current_threads, _) =
+            download_revision_graph(client, head, repository_root, control)?;
+        validate_revision_root_namespace(&current_root, namespace_id)?;
+        if thread_states_equal(&current_threads, &snapshot.threads)?
+            && current_root.warning_count == revision_root.warning_count
         {
-            let reconciled_head = if integrated_head.as_deref() == Some(head) && active.is_some() {
-                remote_head.clone()
+            let reconciled = if integrated_head.as_deref() == Some(head) && active.is_some() {
+                record
+                    .clone()
+                    .context("active namespace has no tracking record")?
             } else {
-                tracking
-                    .reconcile_checkout(
-                        codex_home,
-                        remote_id,
-                        namespace_id,
-                        record.as_ref().map(|record| record.generation),
-                        Some(head),
-                        true,
-                    )?
-                    .integrated_head
+                tracking.reconcile_checkout(
+                    codex_home,
+                    remote_id,
+                    namespace_id,
+                    record.as_ref().map(|record| record.generation),
+                    Some(head),
+                    true,
+                )?
             };
+            let reconciled = tracking.update_remote_epoch(
+                codex_home,
+                remote_id,
+                namespace_id,
+                reconciled.generation,
+                remote_state.namespace_epoch,
+            )?;
             return Ok(SyncReport {
                 kind: SyncOutcomeKind::NoChanges,
                 namespace_id,
                 previous_head: remote_head.clone(),
-                head: reconciled_head,
-                revision_id: Some(current.revision_id),
+                head: reconciled.integrated_head,
+                revision_id: Some(head.to_string()),
                 uploaded_objects: 0,
                 downloaded_objects: 0,
                 thread_count: snapshot.threads.len(),
@@ -236,18 +376,7 @@ pub fn push_namespace(
     }
 
     let typed_store = FilesystemContentStore::open(repository_root.to_path_buf())?;
-    let mut typed_objects = BTreeSet::new();
-    for thread in &revision.payload.threads {
-        if let Some(storage) = thread.rollout.storage.clone() {
-            typed_objects.extend(typed_store.content_objects(&sync_core::ContentRef {
-                logical_sha256: thread.rollout.sha256.clone(),
-                byte_length: thread.rollout.byte_length,
-                storage,
-                media_type: Some(thread.rollout.media_type.clone()),
-                logical_path: thread.rollout.logical_path.clone(),
-            })?);
-        }
-    }
+    let typed_objects = sync_core::collect_revision_graph(&revision_root, &typed_store)?;
     let missing_typed = client.missing_typed_objects(typed_objects.into_iter().collect())?;
     let mut uploaded = 0;
     for (index, object) in missing_typed.iter().enumerate() {
@@ -266,49 +395,11 @@ pub fn push_namespace(
         }
     }
 
-    let descriptors = collect_object_descriptors(
-        &revision
-            .payload
-            .threads
-            .iter()
-            .filter(|thread| thread.rollout.storage.is_none())
-            .cloned()
-            .collect::<Vec<_>>(),
-    )?;
-    let missing = client
-        .missing_objects(descriptors.clone())?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let descriptor_map = descriptors
-        .iter()
-        .map(|descriptor| (descriptor.sha256.as_str(), descriptor))
-        .collect::<BTreeMap<_, _>>();
-    if missing
-        .iter()
-        .any(|sha256| !descriptor_map.contains_key(sha256.as_str()))
-    {
-        bail!("server requested an object that is not part of the revision");
-    }
-    for (index, sha256) in missing.iter().enumerate() {
-        control.check_cancelled()?;
-        control.report(OperationProgress {
-            phase: "push_objects".to_string(),
-            message: sha256.clone(),
-            completed: index as u64,
-            total: Some(missing.len() as u64),
-            unit: "objects".to_string(),
-            cancellable: true,
-        });
-        let descriptor = descriptor_map[sha256.as_str()];
-        let path = repository_object_path(repository_root, sha256)?;
-        if client.upload_object(descriptor, &path, control)? {
-            uploaded += 1;
-        }
-    }
     control.check_cancelled()?;
-    let request = CommitRevisionRequest {
+    let request = sync_core::CommitRevisionRootRequest {
         expected_head: remote_head.clone(),
-        revision: revision.clone(),
+        expected_namespace_epoch: remote_state.namespace_epoch,
+        revision_root_sha256: revision_id.clone(),
     };
     control.report(OperationProgress {
         phase: "push_commit".to_string(),
@@ -318,23 +409,22 @@ pub fn push_namespace(
         unit: "steps".to_string(),
         cancellable: false,
     });
-    let commit = match client.commit(namespace_id, &request) {
+    let commit = match client.commit_root(namespace_id, &request) {
         Ok(commit) => commit,
         Err(error) => {
-            if client.namespace_head(namespace_id)?.as_deref()
-                == Some(revision.revision_id.as_str())
-            {
+            if client.namespace_head(namespace_id)?.as_deref() == Some(revision_id.as_str()) {
                 sync_core::CommitRevisionResponse {
                     namespace_id,
-                    head: revision.revision_id.clone(),
+                    head: revision_id.clone(),
                     created: true,
+                    namespace_epoch: remote_state.namespace_epoch,
                 }
             } else {
                 return Err(error);
             }
         }
     };
-    if commit.namespace_id != namespace_id || commit.head != revision.revision_id {
+    if commit.namespace_id != namespace_id || commit.head != revision_id {
         bail!("server committed an unexpected revision");
     }
     let updated = tracking.reconcile_checkout(
@@ -345,12 +435,19 @@ pub fn push_namespace(
         Some(&commit.head),
         true,
     )?;
+    let updated = tracking.update_remote_epoch(
+        codex_home,
+        remote_id,
+        namespace_id,
+        updated.generation,
+        commit.namespace_epoch,
+    )?;
     Ok(SyncReport {
         kind: SyncOutcomeKind::Pushed,
         namespace_id,
         previous_head: remote_head,
         head: updated.integrated_head,
-        revision_id: Some(revision.revision_id),
+        revision_id: Some(revision_id),
         uploaded_objects: uploaded,
         downloaded_objects: 0,
         thread_count: snapshot.threads.len(),
@@ -407,6 +504,17 @@ pub fn pull_namespace(
         },
         prepared.merged.threads,
         context,
+    )?;
+    let tracking = TrackingStore::open(context.repository_root)?;
+    let applied = tracking
+        .load(context.codex_home, remote_id, namespace_id)?
+        .context("checkout completed without tracking state")?;
+    tracking.update_remote_epoch(
+        context.codex_home,
+        remote_id,
+        namespace_id,
+        applied.generation,
+        prepared.remote_epoch,
     )?;
     Ok(SyncReport {
         kind: SyncOutcomeKind::Pulled,
@@ -525,6 +633,7 @@ struct PullMergePreparation {
     remote_threads: Vec<ThreadBundle>,
     merged: ThreadMergeOutcome,
     downloaded: usize,
+    remote_epoch: u64,
 }
 
 fn prepare_pull(
@@ -552,7 +661,15 @@ fn prepare_pull(
         .load(codex_home, remote_id, namespace_id)?
         .context("active namespace has no tracking record")?;
     let previous_head = record.integrated_head.clone();
-    let remote_head = client.namespace_head(namespace_id)?;
+    let remote_state = client.namespace_head_state(namespace_id)?;
+    if record.remote_epoch != remote_state.namespace_epoch {
+        bail!(
+            "remote history epoch changed from {} to {}; use an exact namespace switch to coordinate the rewritten history",
+            record.remote_epoch,
+            remote_state.namespace_epoch
+        );
+    }
+    let remote_head = remote_state.head;
     if remote_head == previous_head {
         return Ok(PreparedPull::NoChanges {
             head: previous_head,
@@ -562,17 +679,12 @@ fn prepare_pull(
     if let Some(previous) = previous_head.as_deref() {
         ensure_ancestor(client, namespace_id, &remote_head, previous)?;
     }
-    let remote_revision = client.revision(&remote_head)?;
-    validate_revision_namespace(&remote_revision, namespace_id)?;
-    if remote_revision.payload.warning_count > 0 {
+    let (remote_root, remote_threads, downloaded) =
+        download_revision_graph(client, &remote_head, repository_root, control)?;
+    validate_revision_root_namespace(&remote_root, namespace_id)?;
+    if remote_root.warning_count > 0 {
         bail!("remote revision is incomplete and cannot be checked out safely");
     }
-    let downloaded = download_revision_objects(
-        client,
-        &remote_revision.payload.threads,
-        repository_root,
-        control,
-    )?;
     let local_summary =
         create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
     if local_summary.warning_count > 0 {
@@ -585,13 +697,13 @@ fn prepare_pull(
     )?;
     let base = match previous_head.as_deref() {
         Some(head) => {
-            let revision = client.revision(head)?;
-            validate_revision_namespace(&revision, namespace_id)?;
-            revision.payload.threads
+            let (root, threads, _) =
+                download_revision_graph(client, head, repository_root, control)?;
+            validate_revision_root_namespace(&root, namespace_id)?;
+            threads
         }
         None => Vec::new(),
     };
-    let remote_threads = remote_revision.payload.threads;
     let merged = merge_thread_sets(&base, &local.threads, &remote_threads)?;
     Ok(PreparedPull::Merge(Box::new(PullMergePreparation {
         record,
@@ -602,6 +714,7 @@ fn prepare_pull(
         remote_threads,
         merged,
         downloaded,
+        remote_epoch: remote_state.namespace_epoch,
     })))
 }
 
@@ -660,38 +773,50 @@ pub fn switch_namespace(
     let tracking = TrackingStore::open(repository_root)?;
     if let Some(active) = tracking.active(codex_home)? {
         if active.remote_id == remote_id && active.namespace_id == namespace_id {
-            return pull_namespace(remote_id, namespace_id, target_client, context);
+            let record = tracking
+                .load(codex_home, remote_id, namespace_id)?
+                .context("active namespace has no tracking record")?;
+            let remote = target_client.namespace_head_state(namespace_id)?;
+            if record.remote_epoch == remote.namespace_epoch {
+                return pull_namespace(remote_id, namespace_id, target_client, context);
+            }
+        } else {
+            let current_client = current_client.context(
+                "the active namespace uses a different remote, but its client is unavailable",
+            )?;
+            ensure_active_namespace_clean(
+                &tracking,
+                &active,
+                current_client,
+                codex_home,
+                repository_root,
+                current_workspace_mapper.unwrap_or(target_workspace_mapper),
+                control,
+            )?;
         }
-        let current_client = current_client.context(
-            "the active namespace uses a different remote, but its client is unavailable",
-        )?;
-        ensure_active_namespace_clean(
-            &tracking,
-            &active,
-            current_client,
-            codex_home,
-            repository_root,
-            current_workspace_mapper.unwrap_or(target_workspace_mapper),
-            control,
-        )?;
     }
 
     let previous = tracking.load(codex_home, remote_id, namespace_id)?;
-    let target_head = target_client.namespace_head(namespace_id)?;
+    let target_state = target_client.namespace_head_state(namespace_id)?;
+    let target_head = target_state.head.clone();
     let (snapshot, downloaded) = match target_head.as_deref() {
         Some(head) => {
-            let revision = target_client.revision(head)?;
-            validate_revision_namespace(&revision, namespace_id)?;
-            if revision.payload.warning_count > 0 {
+            let (root, threads, downloaded) =
+                download_revision_graph(target_client, head, repository_root, control)?;
+            validate_revision_root_namespace(&root, namespace_id)?;
+            if root.warning_count > 0 {
                 bail!("target namespace revision is incomplete and cannot be checked out");
             }
-            let downloaded = download_revision_objects(
-                target_client,
-                &revision.payload.threads,
-                repository_root,
-                control,
-            )?;
-            (revision_to_snapshot(&revision)?, downloaded)
+            (
+                LocalSnapshot {
+                    schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+                    snapshot_id: Uuid::now_v7().to_string(),
+                    created_at: root.created_at,
+                    threads,
+                    warning_count: root.warning_count,
+                },
+                downloaded,
+            )
         }
         None => (
             LocalSnapshot {
@@ -726,6 +851,16 @@ pub fn switch_namespace(
         },
         &project_roots,
         control,
+    )?;
+    let applied = tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .context("namespace switch completed without tracking state")?;
+    tracking.update_remote_epoch(
+        codex_home,
+        remote_id,
+        namespace_id,
+        applied.generation,
+        target_state.namespace_epoch,
     )?;
     Ok(SyncReport {
         kind: SyncOutcomeKind::Switched,
@@ -766,9 +901,10 @@ fn ensure_active_namespace_clean(
     )?;
     let base = match record.integrated_head.as_deref() {
         Some(head) => {
-            let revision = client.revision(head)?;
-            validate_revision_namespace(&revision, active.namespace_id)?;
-            revision.payload.threads
+            let (root, threads, _) =
+                download_revision_graph(client, head, repository_root, control)?;
+            validate_revision_root_namespace(&root, active.namespace_id)?;
+            threads
         }
         None => Vec::new(),
     };
@@ -778,73 +914,64 @@ fn ensure_active_namespace_clean(
     Ok(())
 }
 
-fn download_revision_objects(
+pub(crate) fn download_revision_graph(
     client: &RemoteClient,
-    threads: &[ThreadBundle],
+    revision_id: &str,
     repository_root: &Path,
     control: &OperationControl,
-) -> Result<usize> {
+) -> Result<(sync_core::RevisionRootV2, Vec<ThreadBundle>, usize)> {
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut downloaded = 0;
-    for thread in threads {
-        let Some(storage) = thread.rollout.storage.clone() else {
-            continue;
-        };
-        let content = sync_core::ContentRef {
-            logical_sha256: thread.rollout.sha256.clone(),
-            byte_length: thread.rollout.byte_length,
-            storage: storage.clone(),
-            media_type: Some(thread.rollout.media_type.clone()),
-            logical_path: thread.rollout.logical_path.clone(),
-        };
-        match storage {
-            sync_core::StorageRef::Whole { object_sha256 } => {
-                let object = sync_core::StorageObjectRef {
-                    kind: sync_core::StorageObjectKind::Whole,
-                    sha256: object_sha256,
-                    byte_length: content.byte_length,
-                };
-                if !store.contains_storage_object(&object)? {
-                    let response = client.download_typed_object(&object)?;
-                    if store.install(&object, response, control)? {
-                        downloaded += 1;
-                    }
-                }
-            }
-            sync_core::StorageRef::Chunked { manifest_sha256 } => {
-                let manifest_path = store.object_path_by_id(
-                    sync_core::StorageObjectKind::ChunkManifest,
-                    &manifest_sha256,
-                )?;
-                if !manifest_path.exists() {
-                    let probe = sync_core::StorageObjectRef {
-                        kind: sync_core::StorageObjectKind::ChunkManifest,
-                        sha256: manifest_sha256.clone(),
-                        byte_length: 0,
-                    };
-                    let response = client.download_typed_object(&probe)?;
-                    let length = response
-                        .content_length()
-                        .context("typed manifest response has no Content-Length")?;
+    let root_path =
+        store.object_path_by_id(sync_core::StorageObjectKind::RevisionRoot, revision_id)?;
+    let root = if root_path.exists() {
+        store.load_revision_root(revision_id)?
+    } else {
+        let root = client.revision_root(revision_id)?;
+        store.store_revision_root(&root)?;
+        downloaded += 1;
+        root
+    };
+    let mut threads = Vec::with_capacity(root.threads.len());
+    for (index, thread_ref) in root.threads.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "pull_revision_graph".to_string(),
+            message: thread_ref.thread_id.clone(),
+            completed: index as u64,
+            total: Some(root.threads.len() as u64),
+            unit: "threads".to_string(),
+            cancellable: true,
+        });
+        let descriptor_path = store.object_path_by_id(
+            sync_core::StorageObjectKind::Thread,
+            &thread_ref.descriptor_sha256,
+        )?;
+        if !descriptor_path.exists() {
+            downloaded += download_unknown_typed_object(
+                client,
+                &store,
+                sync_core::StorageObjectKind::Thread,
+                &thread_ref.descriptor_sha256,
+                control,
+            )? as usize;
+        }
+        let descriptor: sync_core::ThreadDescriptor = store.read_json(
+            sync_core::StorageObjectKind::Thread,
+            &thread_ref.descriptor_sha256,
+            sync_core::MAX_STRUCTURED_OBJECT_BYTES,
+        )?;
+        descriptor.validate()?;
+        if descriptor.thread_id != thread_ref.thread_id {
+            bail!("thread reference ID does not match its descriptor");
+        }
+        for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
+            match &content.storage {
+                sync_core::StorageRef::Whole { object_sha256 } => {
                     let object = sync_core::StorageObjectRef {
-                        byte_length: length,
-                        ..probe
-                    };
-                    if store.install(&object, response, control)? {
-                        downloaded += 1;
-                    }
-                }
-                let manifest = store.load_chunk_manifest(&manifest_sha256)?;
-                if manifest.logical_sha256 != content.logical_sha256
-                    || manifest.byte_length != content.byte_length
-                {
-                    bail!("downloaded chunk manifest does not match rollout");
-                }
-                for chunk in manifest.chunks {
-                    let object = sync_core::StorageObjectRef {
-                        kind: sync_core::StorageObjectKind::Chunk,
-                        sha256: chunk.sha256,
-                        byte_length: chunk.byte_length,
+                        kind: sync_core::StorageObjectKind::Whole,
+                        sha256: object_sha256.clone(),
+                        byte_length: content.byte_length,
                     };
                     if !store.contains_storage_object(&object)? {
                         let response = client.download_typed_object(&object)?;
@@ -853,36 +980,68 @@ fn download_revision_objects(
                         }
                     }
                 }
+                sync_core::StorageRef::Chunked { manifest_sha256 } => {
+                    let manifest_path = store.object_path_by_id(
+                        sync_core::StorageObjectKind::ChunkManifest,
+                        manifest_sha256,
+                    )?;
+                    if !manifest_path.exists() {
+                        downloaded += download_unknown_typed_object(
+                            client,
+                            &store,
+                            sync_core::StorageObjectKind::ChunkManifest,
+                            manifest_sha256,
+                            control,
+                        )? as usize;
+                    }
+                    let manifest = store.load_chunk_manifest(manifest_sha256)?;
+                    if manifest.logical_sha256 != content.logical_sha256
+                        || manifest.byte_length != content.byte_length
+                    {
+                        bail!("downloaded chunk manifest does not match rollout");
+                    }
+                    for chunk in manifest.chunks {
+                        let object = sync_core::StorageObjectRef {
+                            kind: sync_core::StorageObjectKind::Chunk,
+                            sha256: chunk.sha256,
+                            byte_length: chunk.byte_length,
+                        };
+                        if !store.contains_storage_object(&object)? {
+                            let response = client.download_typed_object(&object)?;
+                            if store.install(&object, response, control)? {
+                                downloaded += 1;
+                            }
+                        }
+                    }
+                }
             }
         }
+        threads.push(descriptor.into_bundle());
     }
-    let descriptors = collect_object_descriptors(threads)?;
-    for (index, descriptor) in descriptors.iter().enumerate() {
-        if threads.iter().any(|thread| {
-            thread.rollout.sha256 == descriptor.sha256 && thread.rollout.storage.is_some()
-        }) {
-            continue;
-        }
-        control.check_cancelled()?;
-        control.report(OperationProgress {
-            phase: "pull_objects".to_string(),
-            message: descriptor.sha256.clone(),
-            completed: index as u64,
-            total: Some(descriptors.len() as u64),
-            unit: "objects".to_string(),
-            cancellable: true,
-        });
-        let path = repository_object_path(repository_root, &descriptor.sha256)?;
-        if path.exists() {
-            validate_repository_object(repository_root, descriptor)?;
-            continue;
-        }
-        let response = client.download_object(descriptor)?;
-        if install_repository_object(repository_root, descriptor, response, control)? {
-            downloaded += 1;
-        }
-    }
-    Ok(downloaded)
+    Ok((root, threads, downloaded))
+}
+
+fn download_unknown_typed_object(
+    client: &RemoteClient,
+    store: &FilesystemContentStore,
+    kind: sync_core::StorageObjectKind,
+    sha256: &str,
+    control: &OperationControl,
+) -> Result<bool> {
+    let probe = sync_core::StorageObjectRef {
+        kind,
+        sha256: sha256.to_string(),
+        byte_length: 0,
+    };
+    let response = client.download_typed_object(&probe)?;
+    let byte_length = response
+        .content_length()
+        .context("typed object response has no Content-Length")?;
+    let object = sync_core::StorageObjectRef {
+        byte_length,
+        ..probe
+    };
+    store.install(&object, response, control)
 }
 
 fn ensure_ancestor(
@@ -896,9 +1055,9 @@ fn ensure_ancestor(
         if current == ancestor {
             return Ok(());
         }
-        let revision = client.revision(&current)?;
-        validate_revision_namespace(&revision, namespace_id)?;
-        let Some(parent) = revision.payload.parent_revision else {
+        let revision = client.revision_root(&current)?;
+        validate_revision_root_namespace(&revision, namespace_id)?;
+        let Some(parent) = revision.parent_revision else {
             bail!("remote revision history does not contain the locally tracked head");
         };
         current = parent;
@@ -906,12 +1065,12 @@ fn ensure_ancestor(
     bail!("remote revision ancestry exceeds the safety limit")
 }
 
-fn validate_revision_namespace(
-    revision: &sync_core::RevisionManifest,
+fn validate_revision_root_namespace(
+    revision: &sync_core::RevisionRootV2,
     namespace_id: Uuid,
 ) -> Result<()> {
     revision.validate()?;
-    if revision.payload.namespace_id != namespace_id {
+    if revision.namespace_id != namespace_id {
         bail!("server returned a revision for the wrong namespace");
     }
     Ok(())
@@ -1094,20 +1253,27 @@ mod tests {
             first_record.generation
         );
 
-        let current = client.revision(&first_head).unwrap();
-        let mut advanced_payload = current.payload;
-        advanced_payload.parent_revision = Some(first_head.clone());
-        advanced_payload.created_at = "2100-01-01T00:00:00Z".to_string();
-        let advanced_revision =
-            sync_core::RevisionManifest::from_payload(advanced_payload).unwrap();
-        let advanced_head = advanced_revision.revision_id.clone();
+        let mut advanced_root = client.revision_root(&first_head).unwrap();
+        advanced_root.parent_revision = Some(first_head.clone());
+        advanced_root.created_at = "2100-01-01T00:00:00Z".to_string();
+        let advanced_head = advanced_root.revision_id().unwrap();
         assert_ne!(advanced_head, first_head);
+        let store = FilesystemContentStore::open(&repository_b).unwrap();
+        let root_object = store.store_revision_root(&advanced_root).unwrap();
         client
-            .commit(
+            .upload_typed_object(
+                &root_object,
+                &store.object_path(&root_object).unwrap(),
+                &OperationControl::default(),
+            )
+            .unwrap();
+        client
+            .commit_root(
                 namespace.id,
-                &CommitRevisionRequest {
+                &sync_core::CommitRevisionRootRequest {
                     expected_head: Some(first_head),
-                    revision: advanced_revision,
+                    expected_namespace_epoch: 0,
+                    revision_root_sha256: advanced_head.clone(),
                 },
             )
             .unwrap();
@@ -1210,10 +1376,14 @@ mod tests {
         .unwrap();
         assert_eq!(pushed_a.kind, SyncOutcomeKind::Pushed);
         let pushed_a_head = pushed_a.head.as_deref().unwrap();
-        let pushed_a_revision = client.revision(pushed_a_head).unwrap();
-        let thread_a_remote_hash = pushed_a_revision
-            .payload
-            .threads
+        let (_, pushed_a_threads, _) = download_revision_graph(
+            &client,
+            pushed_a_head,
+            &repository_a,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        let thread_a_remote_hash = pushed_a_threads
             .iter()
             .find(|thread| thread.thread_id == "thread-a")
             .unwrap()
@@ -1310,10 +1480,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pushed_b.kind, SyncOutcomeKind::Pushed);
-        let pushed_b_revision = client.revision(pushed_b.head.as_deref().unwrap()).unwrap();
-        let pushed_b_threads = pushed_b_revision
-            .payload
-            .threads
+        let (_, pushed_b_revision_threads, _) = download_revision_graph(
+            &client,
+            pushed_b.head.as_deref().unwrap(),
+            &repository_b,
+            &OperationControl::default(),
+        )
+        .unwrap();
+        let pushed_b_threads = pushed_b_revision_threads
             .iter()
             .map(|thread| (thread.thread_id.as_str(), &thread.rollout.sha256))
             .collect::<BTreeMap<_, _>>();

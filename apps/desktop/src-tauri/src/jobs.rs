@@ -36,6 +36,13 @@ pub struct JobSnapshot {
 pub struct JobManager {
     jobs: Arc<Mutex<HashMap<String, JobEntry>>>,
     active_codex_homes: Arc<Mutex<HashSet<String>>>,
+    repositories: Arc<Mutex<HashMap<String, RepositoryLeaseState>>>,
+}
+
+#[derive(Debug, Default)]
+struct RepositoryLeaseState {
+    readers: usize,
+    writer: bool,
 }
 
 struct JobEntry {
@@ -58,11 +65,39 @@ impl Drop for CodexHomeWriteLease {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct RepositoryLease {
+    key: String,
+    exclusive: bool,
+    repositories: Arc<Mutex<HashMap<String, RepositoryLeaseState>>>,
+}
+
+impl Drop for RepositoryLease {
+    fn drop(&mut self) {
+        let Ok(mut repositories) = self.repositories.lock() else {
+            return;
+        };
+        let mut remove = false;
+        if let Some(state) = repositories.get_mut(&self.key) {
+            if self.exclusive {
+                state.writer = false;
+            } else {
+                state.readers = state.readers.saturating_sub(1);
+            }
+            remove = !state.writer && state.readers == 0;
+        }
+        if remove {
+            repositories.remove(&self.key);
+        }
+    }
+}
+
 impl Default for JobManager {
     fn default() -> Self {
         Self {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             active_codex_homes: Arc::new(Mutex::new(HashSet::new())),
+            repositories: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -88,6 +123,92 @@ impl JobManager {
             key,
             active_codex_homes: self.active_codex_homes.clone(),
         })
+    }
+
+    pub(crate) fn try_acquire_repository_shared(
+        &self,
+        repository: &Path,
+    ) -> Result<RepositoryLease, String> {
+        self.try_acquire_repository(repository, false)
+    }
+
+    pub(crate) fn try_acquire_repository_exclusive(
+        &self,
+        repository: &Path,
+    ) -> Result<RepositoryLease, String> {
+        self.try_acquire_repository(repository, true)
+    }
+
+    fn try_acquire_repository(
+        &self,
+        repository: &Path,
+        exclusive: bool,
+    ) -> Result<RepositoryLease, String> {
+        let key = normalized_path(repository)?;
+        let mut repositories = self
+            .repositories
+            .lock()
+            .map_err(|_| "repository lease registry is unavailable".to_string())?;
+        let state = repositories.entry(key.clone()).or_default();
+        if state.writer || (exclusive && state.readers > 0) {
+            return Err(format!(
+                "repository {} already has an incompatible active operation",
+                repository.display()
+            ));
+        }
+        if exclusive {
+            state.writer = true;
+        } else {
+            state.readers = state
+                .readers
+                .checked_add(1)
+                .ok_or_else(|| "repository reader count overflow".to_string())?;
+        }
+        drop(repositories);
+        Ok(RepositoryLease {
+            key,
+            exclusive,
+            repositories: self.repositories.clone(),
+        })
+    }
+
+    pub(crate) fn start_home_repository_shared<R, F>(
+        &self,
+        codex_home: &Path,
+        repository: &Path,
+        kind: impl Into<String>,
+        cancellable: bool,
+        operation: F,
+    ) -> Result<JobSnapshot, String>
+    where
+        R: Serialize + Send + 'static,
+        F: FnOnce(OperationControl) -> anyhow::Result<R> + Send + 'static,
+    {
+        let home_lease = self.try_acquire_codex_home(codex_home)?;
+        let repository_lease = self.try_acquire_repository_shared(repository)?;
+        Ok(self.start(kind, cancellable, move |control| {
+            let _home_lease = home_lease;
+            let _repository_lease = repository_lease;
+            operation(control)
+        }))
+    }
+
+    pub(crate) fn start_repository_shared<R, F>(
+        &self,
+        repository: &Path,
+        kind: impl Into<String>,
+        cancellable: bool,
+        operation: F,
+    ) -> Result<JobSnapshot, String>
+    where
+        R: Serialize + Send + 'static,
+        F: FnOnce(OperationControl) -> anyhow::Result<R> + Send + 'static,
+    {
+        let repository_lease = self.try_acquire_repository_shared(repository)?;
+        Ok(self.start(kind, cancellable, move |control| {
+            let _repository_lease = repository_lease;
+            operation(control)
+        }))
     }
 
     pub(crate) fn start_exclusive<R, F>(
@@ -241,12 +362,33 @@ impl JobManager {
 }
 
 fn normalized_codex_home(path: &Path) -> Result<String, String> {
+    normalized_existing_path(path, "Codex Home")
+}
+
+fn normalized_existing_path(path: &Path, kind: &str) -> Result<String, String> {
     let resolved = std::fs::canonicalize(path)
-        .map_err(|error| format!("failed to normalize Codex Home {}: {error}", path.display()))?;
+        .map_err(|error| format!("failed to normalize {kind} {}: {error}", path.display()))?;
     let normalized = resolved.to_string_lossy().replace('\\', "/");
     #[cfg(windows)]
     let normalized = normalized.to_lowercase();
     Ok(normalized)
+}
+
+fn normalized_path(path: &Path) -> Result<String, String> {
+    if path.exists() {
+        return normalized_existing_path(path, "repository");
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| format!("failed to resolve repository path: {error}"))?
+            .join(path)
+    };
+    let normalized = absolute.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    Ok(normalized.trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -284,5 +426,36 @@ mod tests {
         let second = jobs.try_acquire_codex_home(&second_home).unwrap();
 
         drop((first, second));
+    }
+
+    #[test]
+    fn repository_shared_and_exclusive_leases_enforce_read_write_rules() {
+        let directory = tempdir().unwrap();
+        let jobs = JobManager::default();
+        let first = jobs
+            .try_acquire_repository_shared(directory.path())
+            .unwrap();
+        let second = jobs
+            .try_acquire_repository_shared(directory.path())
+            .unwrap();
+        assert!(
+            jobs.try_acquire_repository_exclusive(directory.path())
+                .is_err()
+        );
+        drop((first, second));
+
+        let writer = jobs
+            .try_acquire_repository_exclusive(directory.path())
+            .unwrap();
+        assert!(
+            jobs.try_acquire_repository_shared(directory.path())
+                .is_err()
+        );
+        assert!(
+            jobs.try_acquire_repository_exclusive(directory.path())
+                .is_err()
+        );
+        drop(writer);
+        assert!(jobs.try_acquire_repository_shared(directory.path()).is_ok());
     }
 }

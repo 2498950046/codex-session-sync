@@ -11,11 +11,12 @@ use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sync_core::{
-    ApiError, CommitRevisionRequest, CommitRevisionResponse, CreateNamespaceRequest,
-    MissingObjectsRequest, MissingObjectsResponse, Namespace, NamespaceHeadResponse,
-    NamespaceListResponse, ObjectDescriptor, OperationControl, ProtocolInfoResponse,
-    PutObjectResponse, REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RevisionManifest,
-    StorageObjectRef, TypedMissingObjectsRequest, TypedMissingObjectsResponse,
+    ApiError, CommitRevisionResponse, CommitRevisionRootRequest, CreateNamespaceRequest,
+    HistoryTrashListResponse, HistoryTrashOperation, Namespace, NamespaceHeadResponse,
+    NamespaceListResponse, OperationControl, ProtocolInfoResponse, PutObjectResponse,
+    REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RestoreHistoryRequest, RevisionListResponse,
+    RevisionRootV2, RevisionSummary, StorageObjectRef, TruncateHistoryRequest,
+    TypedMissingObjectsRequest, TypedMissingObjectsResponse, digest_bytes,
 };
 use url::Url;
 use uuid::Uuid;
@@ -90,7 +91,7 @@ impl RemoteClient {
     pub fn info(&self) -> Result<ProtocolInfoResponse> {
         let response = self
             .client
-            .get(self.endpoint("api/v1/info")?)
+            .get(self.endpoint("api/v2/info")?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to connect to synchronization server")?;
@@ -111,7 +112,7 @@ impl RemoteClient {
     pub fn list_namespaces(&self) -> Result<Vec<Namespace>> {
         let response = self
             .client
-            .get(self.endpoint("api/v1/namespaces")?)
+            .get(self.endpoint("api/v2/namespaces")?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to list remote namespaces")?;
@@ -120,7 +121,7 @@ impl RemoteClient {
 
     pub fn create_namespace(&self, display_name: String) -> Result<Namespace> {
         self.send_json(
-            self.client.post(self.endpoint("api/v1/namespaces")?),
+            self.client.post(self.endpoint("api/v2/namespaces")?),
             &CreateNamespaceRequest { display_name },
         )
     }
@@ -128,7 +129,7 @@ impl RemoteClient {
     pub fn rename_namespace(&self, namespace_id: Uuid, display_name: String) -> Result<Namespace> {
         self.send_json(
             self.client
-                .patch(self.endpoint(&format!("api/v1/namespaces/{namespace_id}"))?),
+                .patch(self.endpoint(&format!("api/v2/namespaces/{namespace_id}"))?),
             &RenameNamespaceRequest { display_name },
         )
     }
@@ -136,7 +137,7 @@ impl RemoteClient {
     pub fn namespace_head(&self, namespace_id: Uuid) -> Result<Option<String>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v1/namespaces/{namespace_id}/head"))?)
+            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/head"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to read namespace head")?;
@@ -147,15 +148,66 @@ impl RemoteClient {
         Ok(response.head)
     }
 
-    pub fn missing_objects(&self, objects: Vec<ObjectDescriptor>) -> Result<Vec<String>> {
-        let response: MissingObjectsResponse = self.send_json(
-            self.client.post(self.endpoint("api/v1/objects/missing")?),
-            &MissingObjectsRequest { objects },
-        )?;
-        Ok(response.missing)
+    pub fn namespace_head_state(&self, namespace_id: Uuid) -> Result<NamespaceHeadResponse> {
+        let response = self
+            .client
+            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/head"))?)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .context("failed to read namespace head")?;
+        let response: NamespaceHeadResponse = parse_json_response(response)?;
+        if response.namespace_id != namespace_id {
+            bail!("server returned a head for the wrong namespace");
+        }
+        Ok(response)
     }
 
-    #[allow(dead_code)]
+    pub fn list_revisions(&self, namespace_id: Uuid) -> Result<Vec<RevisionSummary>> {
+        let response = self
+            .client
+            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/revisions"))?)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .context("failed to list remote revisions")?;
+        Ok(parse_json_response::<RevisionListResponse>(response)?.revisions)
+    }
+
+    pub fn truncate_history(
+        &self,
+        namespace_id: Uuid,
+        request: &TruncateHistoryRequest,
+    ) -> Result<HistoryTrashOperation> {
+        self.send_json(
+            self.client.post(self.endpoint(&format!(
+                "api/v2/namespaces/{namespace_id}/history/truncations"
+            ))?),
+            request,
+        )
+    }
+
+    pub fn list_history_trash(&self, namespace_id: Uuid) -> Result<Vec<HistoryTrashOperation>> {
+        let response = self
+            .client
+            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/trash"))?)
+            .timeout(REQUEST_TIMEOUT)
+            .send()?;
+        Ok(parse_json_response::<HistoryTrashListResponse>(response)?.operations)
+    }
+
+    pub fn restore_history_trash(
+        &self,
+        namespace_id: Uuid,
+        operation_id: Uuid,
+        request: &RestoreHistoryRequest,
+    ) -> Result<HistoryTrashOperation> {
+        self.send_json(
+            self.client.post(self.endpoint(&format!(
+                "api/v2/namespaces/{namespace_id}/trash/{operation_id}/restore"
+            ))?),
+            request,
+        )
+    }
+
     pub fn missing_typed_objects(
         &self,
         objects: Vec<StorageObjectRef>,
@@ -167,7 +219,6 @@ impl RemoteClient {
         Ok(response.missing)
     }
 
-    #[allow(dead_code)]
     pub fn upload_typed_object(
         &self,
         object: &StorageObjectRef,
@@ -201,7 +252,6 @@ impl RemoteClient {
         Ok(response.created)
     }
 
-    #[allow(dead_code)]
     pub fn download_typed_object(&self, object: &StorageObjectRef) -> Result<Response> {
         let digest = raw_digest(&object.sha256)?;
         ensure_success(
@@ -214,78 +264,33 @@ impl RemoteClient {
         )
     }
 
-    pub fn upload_object(
-        &self,
-        descriptor: &ObjectDescriptor,
-        path: &Path,
-        control: &OperationControl,
-    ) -> Result<bool> {
-        let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to inspect local object {}", path.display()))?;
-        if metadata.len() != descriptor.byte_length {
-            bail!(
-                "local object length changed before upload: expected {}, got {}",
-                descriptor.byte_length,
-                metadata.len()
-            );
+    pub fn revision_root(&self, revision_id: &str) -> Result<RevisionRootV2> {
+        let object = StorageObjectRef {
+            kind: sync_core::StorageObjectKind::RevisionRoot,
+            sha256: revision_id.to_string(),
+            byte_length: 0,
+        };
+        let bytes = self.download_typed_object(&object)?.bytes()?;
+        if digest_bytes(&bytes) != revision_id {
+            bail!("server returned a corrupt revision root");
         }
-        let digest = raw_digest(&descriptor.sha256)?;
-        let file = File::open(path)
-            .with_context(|| format!("failed to open local object {}", path.display()))?;
-        let response = self
-            .client
-            .put(self.endpoint(&format!("api/v1/objects/{digest}"))?)
-            .header(CONTENT_LENGTH, descriptor.byte_length)
-            .body(Body::sized(
-                CancellableReader {
-                    inner: file,
-                    control: control.clone(),
-                },
-                descriptor.byte_length,
-            ))
-            .send()
-            .with_context(|| format!("failed to upload object {}", descriptor.sha256))?;
-        let response: PutObjectResponse = parse_json_response(response)?;
-        if response.sha256 != descriptor.sha256 || response.byte_length != descriptor.byte_length {
-            bail!("server acknowledged a different object than the one uploaded");
+        let root: RevisionRootV2 = serde_json::from_slice(&bytes)?;
+        root.validate()?;
+        if root.revision_id()? != revision_id {
+            bail!("server returned a non-canonical revision root");
         }
-        Ok(response.created)
+        Ok(root)
     }
 
-    pub fn download_object(&self, descriptor: &ObjectDescriptor) -> Result<Response> {
-        let digest = raw_digest(&descriptor.sha256)?;
-        let response = self
-            .client
-            .get(self.endpoint(&format!("api/v1/objects/{digest}"))?)
-            .send()
-            .with_context(|| format!("failed to download object {}", descriptor.sha256))?;
-        ensure_success(response)
-    }
-
-    pub fn revision(&self, revision_id: &str) -> Result<RevisionManifest> {
-        let digest = raw_digest(revision_id)?;
-        let response = self
-            .client
-            .get(self.endpoint(&format!("api/v1/revisions/{digest}"))?)
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .with_context(|| format!("failed to fetch revision {revision_id}"))?;
-        let revision: RevisionManifest = parse_json_response(response)?;
-        revision.validate()?;
-        if revision.revision_id != revision_id {
-            bail!("server returned a different revision than requested");
-        }
-        Ok(revision)
-    }
-
-    pub fn commit(
+    pub fn commit_root(
         &self,
         namespace_id: Uuid,
-        request: &CommitRevisionRequest,
+        request: &CommitRevisionRootRequest,
     ) -> Result<CommitRevisionResponse> {
         self.send_json(
-            self.client
-                .post(self.endpoint(&format!("api/v1/namespaces/{namespace_id}/revisions"))?),
+            self.client.post(self.endpoint(&format!(
+                "api/v2/namespaces/{namespace_id}/revisions/commit"
+            ))?),
             request,
         )
     }
@@ -401,14 +406,10 @@ fn read_limited(mut reader: Take<Response>, limit: u64) -> Result<Vec<u8>> {
 mod tests {
     use axum::Router;
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::thread;
-    use sync_core::{
-        CommitRevisionRequest, ContentObject, RelatedRecords, RevisionManifest, RevisionPayload,
-        THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle, WorkspaceRef,
-    };
+    use sync_core::{StorageObjectKind, StorageObjectRef};
     use tempfile::tempdir;
 
     use super::*;
@@ -439,7 +440,8 @@ mod tests {
     fn object_download_can_exceed_the_timeout_window_while_the_stream_keeps_making_progress() {
         let content = b"slow-but-active-object";
         let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(content)));
-        let descriptor = ObjectDescriptor {
+        let descriptor = StorageObjectRef {
+            kind: StorageObjectKind::Whole,
             sha256,
             byte_length: content.len() as u64,
         };
@@ -471,7 +473,7 @@ mod tests {
         )
         .unwrap();
         let downloaded = client
-            .download_object(&descriptor)
+            .download_typed_object(&descriptor)
             .unwrap()
             .bytes()
             .unwrap();
@@ -481,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn client_runs_the_authenticated_namespace_object_and_revision_flow() {
+    fn client_runs_the_authenticated_v2_namespace_and_typed_object_flow() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -514,75 +516,37 @@ mod tests {
             REMOTE_PROTOCOL_VERSION
         );
         assert!(client.list_namespaces().unwrap().is_empty());
-        let namespace = client.create_namespace("Personal".to_string()).unwrap();
+        let _namespace = client.create_namespace("Personal".to_string()).unwrap();
 
         let content = b"remote-client-object";
         let sha256 = format!("sha256:{}", hex::encode(Sha256::digest(content)));
-        let descriptor = ObjectDescriptor {
+        let descriptor = StorageObjectRef {
+            kind: StorageObjectKind::Whole,
             sha256: sha256.clone(),
             byte_length: content.len() as u64,
         };
         assert_eq!(
-            client.missing_objects(vec![descriptor.clone()]).unwrap(),
-            vec![sha256.clone()]
+            client
+                .missing_typed_objects(vec![descriptor.clone()])
+                .unwrap(),
+            vec![descriptor.clone()]
         );
         let object_path = temp.path().join("object");
         std::fs::write(&object_path, content).unwrap();
         assert!(
             client
-                .upload_object(&descriptor, &object_path, &OperationControl::default())
+                .upload_typed_object(&descriptor, &object_path, &OperationControl::default())
                 .unwrap()
         );
-        assert!(client.missing_objects(vec![descriptor]).unwrap().is_empty());
-
-        let revision = RevisionManifest::from_payload(RevisionPayload {
-            schema_version: sync_core::REVISION_SCHEMA_VERSION,
-            namespace_id: namespace.id,
-            parent_revision: None,
-            created_at: "2026-07-26T10:30:00Z".to_string(),
-            threads: vec![ThreadBundle {
-                schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
-                thread_id: "thread-one".to_string(),
-                title: "Thread one".to_string(),
-                archived: false,
-                created_at_ms: None,
-                updated_at_ms: None,
-                model_provider: Some("openai".to_string()),
-                workspace: WorkspaceRef::default(),
-                rollout: ContentObject {
-                    sha256: sha256.clone(),
-                    byte_length: content.len() as u64,
-                    media_type: "application/x-ndjson".to_string(),
-                    logical_path: Some("sessions/rollout-one.jsonl".to_string()),
-                    source_path: None,
-                    storage: None,
-                },
-                related_records: RelatedRecords {
-                    source_database: None,
-                    tables: BTreeMap::new(),
-                },
-                attachments: Vec::new(),
-            }],
-            warning_count: 0,
-        })
-        .unwrap();
-        let committed = client
-            .commit(
-                namespace.id,
-                &CommitRevisionRequest {
-                    expected_head: None,
-                    revision: revision.clone(),
-                },
-            )
-            .unwrap();
-        assert_eq!(committed.head, revision.revision_id);
-        assert_eq!(client.revision(&revision.revision_id).unwrap(), revision);
+        assert!(
+            client
+                .missing_typed_objects(vec![descriptor.clone()])
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             client
-                .download_object(&ObjectDescriptor {
-                    sha256,
-                    byte_length: content.len() as u64,
-                })
+                .download_typed_object(&descriptor)
                 .unwrap()
                 .bytes()
                 .unwrap()

@@ -20,19 +20,21 @@ use remote_config::{
     CredentialStore, RemoteProfile, RemoteProfileStore, RemoteProfileSummary, SystemCredentialStore,
 };
 use remote_sync::{
-    LocalSyncContext, pull_namespace, push_namespace, reapply_workspace_mappings,
-    resolve_pull_conflicts, switch_namespace,
+    LocalSyncContext, download_remote_revision_as_snapshot, download_revision_graph,
+    pull_namespace, push_namespace, reapply_workspace_mappings, resolve_pull_conflicts,
+    restore_remote_revision_and_publish, restore_remote_revision_locally, switch_namespace,
 };
 use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
-    CheckoutJournal, ImportReport, OperationJournal, QuarantinedRollout, ScanDashboardReport,
-    SnapshotSummary, SnapshotValidationReport, ThreadConflictResolution, TrackingStore,
-    create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
-    default_repository_root, detect_codex_processes, import_local_snapshot,
-    import_local_snapshot_with_control, quarantine_empty_rollout, recover_checkout_operation,
-    recover_incomplete_operation, scan_codex_home_dashboard,
-    scan_codex_home_dashboard_with_control, validate_local_snapshot,
+    CheckoutJournal, GcPlan, ImportReport, LocalSnapshotListItem, OperationJournal,
+    QuarantinedRollout, RepositoryStorageSummary, ScanDashboardReport, SnapshotDeletionPlan,
+    SnapshotDiff, SnapshotMetadata, SnapshotSummary, SnapshotTrashEntry, SnapshotValidationReport,
+    ThreadConflictResolution, TrackingStore, create_local_snapshot,
+    create_local_snapshot_with_control, default_codex_home, default_repository_root,
+    detect_codex_processes, import_local_snapshot, import_local_snapshot_with_control,
+    quarantine_empty_rollout, recover_checkout_operation, recover_incomplete_operation,
+    scan_codex_home_dashboard, scan_codex_home_dashboard_with_control, validate_local_snapshot,
     validate_local_snapshot_with_control,
 };
 use tauri::State;
@@ -120,6 +122,19 @@ struct RecoveryJournalDescriptor {
     target_codex_home: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryPoint {
+    operation_id: String,
+    kind: String,
+    status: String,
+    journal_path: PathBuf,
+    target_codex_home: PathBuf,
+    started_at: Option<String>,
+    updated_at: Option<String>,
+    requires_attention: bool,
+}
+
 #[tauri::command]
 fn get_default_codex_home() -> String {
     default_codex_home().to_string_lossy().into_owned()
@@ -156,8 +171,10 @@ async fn quarantine_empty_rollout_file(
     let home = resolve_codex_home(codex_home);
     let repository = resolve_repository_root(repository_root);
     let lease = jobs.try_acquire_codex_home(&home)?;
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
+        let _repository_lease = repository_lease;
         quarantine_empty_rollout(home, repository, rollout_path, confirmed_codex_closed)
             .map_err(|error| error.to_string())
     })
@@ -176,8 +193,10 @@ async fn create_snapshot(
     let home = resolve_codex_home(codex_home);
     let repository = resolve_repository_root(repository_root);
     let lease = jobs.try_acquire_codex_home(&home)?;
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
+        let _repository_lease = repository_lease;
         create_local_snapshot(home, repository, confirmed_codex_closed)
             .map_err(|error| error.to_string())
     })
@@ -187,18 +206,451 @@ async fn create_snapshot(
 
 #[tauri::command]
 async fn validate_snapshot(
+    jobs: State<'_, JobManager>,
     manifest_path: String,
     repository_root: Option<String>,
 ) -> Result<SnapshotValidationReport, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
     tauri::async_runtime::spawn_blocking(move || {
-        let repository = repository_root
-            .filter(|value| !value.trim().is_empty())
-            .map(Into::into)
-            .unwrap_or_else(default_repository_root);
+        let _repository_lease = repository_lease;
         validate_local_snapshot(manifest_path, repository).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn list_local_snapshots(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+) -> Result<Vec<LocalSnapshotListItem>, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::list_local_snapshots(&repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn compare_local_snapshots(
+    jobs: State<'_, JobManager>,
+    left_manifest: String,
+    right_manifest: String,
+) -> Result<SnapshotDiff, String> {
+    let repository = Path::new(&left_manifest)
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            "snapshot manifest is not inside a repository snapshots directory".to_string()
+        })?
+        .to_path_buf();
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::compare_local_snapshots(Path::new(&left_manifest), Path::new(&right_manifest))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn update_snapshot_metadata(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    snapshot_id: String,
+    metadata: SnapshotMetadata,
+) -> Result<SnapshotMetadata, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::update_snapshot_metadata(&repository, &snapshot_id, metadata)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn plan_snapshot_deletion(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    snapshot_id: String,
+) -> Result<SnapshotDeletionPlan, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::plan_snapshot_deletion(&repository, &snapshot_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn trash_local_snapshot(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    plan: SnapshotDeletionPlan,
+) -> Result<SnapshotTrashEntry, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::trash_local_snapshot(&repository, &plan)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_local_snapshot_trash(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+) -> Result<Vec<SnapshotTrashEntry>, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::list_local_snapshot_trash(&repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn restore_trashed_snapshot(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    operation_id: String,
+) -> Result<String, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::restore_trashed_snapshot(&repository, &operation_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map(|path| path.to_string_lossy().into_owned())
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn plan_local_gc(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+) -> Result<GcPlan, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::plan_local_gc(&repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_repository_storage_summary(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+) -> Result<RepositoryStorageSummary, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::repository_storage_summary(&repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_recovery_points(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+) -> Result<Vec<RecoveryPoint>, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        discover_recovery_points(&repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn quarantine_local_gc(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    plan: GcPlan,
+) -> Result<String, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::quarantine_local_gc_plan(&repository, &plan)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map(|path| path.to_string_lossy().into_owned())
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_snapshot_restore_job(
+    jobs: State<'_, JobManager>,
+    manifest_path: String,
+    codex_home: Option<String>,
+    repository_root: Option<String>,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let home = resolve_codex_home(codex_home);
+    let repository = resolve_repository_root(repository_root);
+    let lock_home = home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "restore",
+        false,
+        move |control| {
+            sync_core::checkout_local_snapshot_with_control(
+                manifest_path,
+                home,
+                repository,
+                confirmed_codex_closed,
+                &control,
+            )
+        },
+    )
+}
+
+#[tauri::command]
+async fn list_remote_revisions(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+) -> Result<Vec<sync_core::RevisionSummary>, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        let (_, client) = load_remote_client(&repository, parse_uuid(&remote_id)?)?;
+        client.list_revisions(parse_uuid(&namespace_id)?)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_remote_history_trash(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+) -> Result<Vec<sync_core::HistoryTrashOperation>, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        let (_, client) = load_remote_client(&repository, parse_uuid(&remote_id)?)?;
+        client.list_history_trash(parse_uuid(&namespace_id)?)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn truncate_remote_history(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    new_head: Option<String>,
+) -> Result<sync_core::HistoryTrashOperation, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        let remote_id = parse_uuid(&remote_id)?;
+        let (_, client) = load_remote_client(&repository, remote_id)?;
+        let namespace_id = parse_uuid(&namespace_id)?;
+        let state = client.namespace_head_state(namespace_id)?;
+        let operation = client.truncate_history(
+            namespace_id,
+            &sync_core::TruncateHistoryRequest {
+                expected_head: state.head,
+                expected_namespace_epoch: state.namespace_epoch,
+                new_head,
+            },
+        )?;
+        let tracking = TrackingStore::open(&repository)?;
+        if let Some(record) = tracking.load(&codex_home, remote_id, namespace_id)? {
+            tracking.update_remote_epoch(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                record.generation,
+                operation.epoch_after,
+            )?;
+        }
+        Ok::<_, anyhow::Error>(operation)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn restore_remote_history_trash(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    operation_id: String,
+) -> Result<sync_core::HistoryTrashOperation, String> {
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        let remote_id = parse_uuid(&remote_id)?;
+        let (_, client) = load_remote_client(&repository, remote_id)?;
+        let namespace_id = parse_uuid(&namespace_id)?;
+        let state = client.namespace_head_state(namespace_id)?;
+        let operation = client.restore_history_trash(
+            namespace_id,
+            parse_uuid(&operation_id)?,
+            &sync_core::RestoreHistoryRequest {
+                expected_head: state.head,
+                expected_namespace_epoch: state.namespace_epoch,
+            },
+        )?;
+        let current = client.namespace_head_state(namespace_id)?;
+        let tracking = TrackingStore::open(&repository)?;
+        if let Some(record) = tracking.load(&codex_home, remote_id, namespace_id)? {
+            tracking.update_remote_epoch(
+                &codex_home,
+                remote_id,
+                namespace_id,
+                record.generation,
+                current.namespace_epoch,
+            )?;
+        }
+        Ok::<_, anyhow::Error>(operation)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_remote_revision_download_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    revision_id: String,
+) -> Result<JobSnapshot, String> {
+    let repository = resolve_repository_root(repository_root);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    jobs.start_repository_shared(
+        &repository.clone(),
+        "revision-download",
+        true,
+        move |control| {
+            download_remote_revision_as_snapshot(
+                namespace_id,
+                &revision_id,
+                &client,
+                &repository,
+                &control,
+            )
+        },
+    )
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn start_remote_revision_restore_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    revision_id: String,
+    publish: bool,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        if publish {
+            "revision-publish"
+        } else {
+            "revision-restore"
+        },
+        false,
+        move |control| {
+            let context = LocalSyncContext::new(&home, &repository, &mapper, &control);
+            if publish {
+                serde_json::to_value(restore_remote_revision_and_publish(
+                    remote_id,
+                    namespace_id,
+                    &revision_id,
+                    &client,
+                    context,
+                )?)
+                .map_err(Into::into)
+            } else {
+                serde_json::to_value(restore_remote_revision_locally(
+                    remote_id,
+                    namespace_id,
+                    &revision_id,
+                    &client,
+                    context,
+                )?)
+                .map_err(Into::into)
+            }
+        },
+    )
 }
 
 #[tauri::command]
@@ -213,8 +665,10 @@ async fn import_snapshot(
     let home = resolve_codex_home(codex_home);
     let repository = resolve_repository_root(repository_root);
     let lease = jobs.try_acquire_codex_home(&home)?;
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
     tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
+        let _repository_lease = repository_lease;
         import_local_snapshot(manifest_path, home, repository, confirmed_codex_closed)
             .map_err(|error| error.to_string())
     })
@@ -266,9 +720,15 @@ fn start_snapshot_job(
     let home = resolve_codex_home(codex_home);
     let repository = resolve_repository_root(repository_root);
     let lock_home = home.clone();
-    jobs.start_exclusive(&lock_home, "snapshot", true, move |control| {
-        create_local_snapshot_with_control(home, repository, confirmed_codex_closed, &control)
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "snapshot",
+        true,
+        move |control| {
+            create_local_snapshot_with_control(home, repository, confirmed_codex_closed, &control)
+        },
+    )
 }
 
 #[tauri::command]
@@ -276,9 +736,9 @@ fn start_validation_job(
     jobs: State<'_, JobManager>,
     manifest_path: String,
     repository_root: Option<String>,
-) -> JobSnapshot {
+) -> Result<JobSnapshot, String> {
     let repository = resolve_repository_root(repository_root);
-    jobs.start("validate", true, move |control| {
+    jobs.start_repository_shared(&repository.clone(), "validate", true, move |control| {
         validate_local_snapshot_with_control(manifest_path, repository, &control)
     })
 }
@@ -295,15 +755,21 @@ fn start_import_job(
     let home = resolve_codex_home(codex_home);
     let repository = resolve_repository_root(repository_root);
     let lock_home = home.clone();
-    jobs.start_exclusive(&lock_home, "import", true, move |control| {
-        import_local_snapshot_with_control(
-            manifest_path,
-            home,
-            repository,
-            confirmed_codex_closed,
-            &control,
-        )
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "import",
+        true,
+        move |control| {
+            import_local_snapshot_with_control(
+                manifest_path,
+                home,
+                repository,
+                confirmed_codex_closed,
+                &control,
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -699,11 +1165,16 @@ async fn get_workspace_pull_plan(
         let remote_head = client.namespace_head(namespace_id)?;
         let remote_paths = match remote_head.as_deref() {
             Some(head) => {
-                let revision = client.revision(head)?;
-                if revision.payload.namespace_id != namespace_id {
+                let (revision, threads, _) = download_revision_graph(
+                    &client,
+                    head,
+                    &repository,
+                    &sync_core::OperationControl::default(),
+                )?;
+                if revision.namespace_id != namespace_id {
                     bail!("remote revision belongs to a different namespace");
                 }
-                collect_workspace_paths(&revision.payload.threads)
+                collect_workspace_paths(&threads)
             }
             None => Vec::new(),
         };
@@ -741,11 +1212,16 @@ async fn create_automatic_workspace_mappings(
         }
         let remote_paths = match current_head.as_deref() {
             Some(head) => {
-                let revision = client.revision(head)?;
-                if revision.payload.namespace_id != namespace_id {
+                let (revision, threads, _) = download_revision_graph(
+                    &client,
+                    head,
+                    &repository,
+                    &sync_core::OperationControl::default(),
+                )?;
+                if revision.namespace_id != namespace_id {
                     bail!("remote revision belongs to a different namespace");
                 }
-                collect_workspace_paths(&revision.payload.threads)
+                collect_workspace_paths(&threads)
             }
             None => Vec::new(),
         };
@@ -881,14 +1357,20 @@ fn start_push_job(
         .mapper(&codex_home, remote_id, namespace_id)
         .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
-    jobs.start_exclusive(&lock_home, "push", true, move |control| {
-        push_namespace(
-            remote_id,
-            namespace_id,
-            &client,
-            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
-        )
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "push",
+        true,
+        move |control| {
+            push_namespace(
+                remote_id,
+                namespace_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -912,14 +1394,20 @@ fn start_pull_job(
         .mapper(&codex_home, remote_id, namespace_id)
         .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
-    jobs.start_exclusive(&lock_home, "pull", true, move |control| {
-        pull_namespace(
-            remote_id,
-            namespace_id,
-            &client,
-            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
-        )
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "pull",
+        true,
+        move |control| {
+            pull_namespace(
+                remote_id,
+                namespace_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -944,15 +1432,21 @@ fn start_conflict_resolution_job(
         .mapper(&codex_home, remote_id, namespace_id)
         .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
-    jobs.start_exclusive(&lock_home, "resolve", true, move |control| {
-        resolve_pull_conflicts(
-            remote_id,
-            namespace_id,
-            &resolutions,
-            &client,
-            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
-        )
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "resolve",
+        true,
+        move |control| {
+            resolve_pull_conflicts(
+                remote_id,
+                namespace_id,
+                &resolutions,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -1002,16 +1496,22 @@ fn start_namespace_switch_job(
         .transpose()
         .map_err(|error| error.to_string())?;
     let lock_home = codex_home.clone();
-    jobs.start_exclusive(&lock_home, "switch", true, move |control| {
-        switch_namespace(
-            remote_id,
-            namespace_id,
-            &target_client,
-            current_client.as_ref(),
-            current_workspace_mapper.as_ref(),
-            LocalSyncContext::new(&codex_home, &repository, &target_workspace_mapper, &control),
-        )
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "switch",
+        true,
+        move |control| {
+            switch_namespace(
+                remote_id,
+                namespace_id,
+                &target_client,
+                current_client.as_ref(),
+                current_workspace_mapper.as_ref(),
+                LocalSyncContext::new(&codex_home, &repository, &target_workspace_mapper, &control),
+            )
+        },
+    )
 }
 
 #[tauri::command]
@@ -1038,14 +1538,20 @@ fn start_workspace_remap_job(
         return Err("at least one workspace path mapping is required".to_string());
     }
     let lock_home = codex_home.clone();
-    jobs.start_exclusive(&lock_home, "remap", true, move |control| {
-        reapply_workspace_mappings(
-            remote_id,
-            namespace_id,
-            &client,
-            LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
-        )
-    })
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "remap",
+        true,
+        move |control| {
+            reapply_workspace_mappings(
+                remote_id,
+                namespace_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
 }
 
 fn inspect_recovery_journal(journal_path: &Path) -> anyhow::Result<RecoveryJournalDescriptor> {
@@ -1095,6 +1601,84 @@ fn inspect_recovery_journal(journal_path: &Path) -> anyhow::Result<RecoveryJourn
         });
     }
     bail!("unsupported recovery journal type")
+}
+
+fn discover_recovery_points(repository_root: &Path) -> anyhow::Result<Vec<RecoveryPoint>> {
+    let journal_directory = repository_root.join("journal");
+    if !journal_directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut points = Vec::new();
+    for entry in std::fs::read_dir(journal_directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = std::fs::metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > sync_core::MAX_STRUCTURED_OBJECT_BYTES {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_reader(BufReader::new(File::open(&path)?))?;
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let kind = if ["backupDir", "plannedRollouts", "importedThreadIds"]
+            .iter()
+            .any(|field| object.contains_key(*field))
+        {
+            "import"
+        } else if [
+            "repositoryBackupDir",
+            "databaseBackups",
+            "directorySwaps",
+            "expectedThreadHashes",
+        ]
+        .iter()
+        .any(|field| object.contains_key(*field))
+        {
+            "checkout"
+        } else {
+            continue;
+        };
+        let string_field = |name: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        };
+        let status = string_field("status").unwrap_or_else(|| "unknown".to_string());
+        let target_codex_home = string_field("targetCodexHome")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let normalized_status = status.to_ascii_lowercase();
+        let requires_attention = !matches!(
+            normalized_status.as_str(),
+            "completed" | "rolled_back" | "rolledback"
+        );
+        points.push(RecoveryPoint {
+            operation_id: string_field("operationId").unwrap_or_else(|| {
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+            kind: kind.to_string(),
+            status,
+            journal_path: path,
+            target_codex_home,
+            started_at: string_field("startedAt"),
+            updated_at: string_field("updatedAt"),
+            requires_attention,
+        });
+    }
+    points.sort_by(|left, right| {
+        right
+            .requires_attention
+            .cmp(&left.requires_attention)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| right.operation_id.cmp(&left.operation_id))
+    });
+    Ok(points)
 }
 
 #[cfg(test)]
@@ -1227,6 +1811,24 @@ pub fn run() {
             quarantine_empty_rollout_file,
             create_snapshot,
             validate_snapshot,
+            list_local_snapshots,
+            compare_local_snapshots,
+            update_snapshot_metadata,
+            plan_snapshot_deletion,
+            trash_local_snapshot,
+            list_local_snapshot_trash,
+            restore_trashed_snapshot,
+            plan_local_gc,
+            get_repository_storage_summary,
+            list_recovery_points,
+            quarantine_local_gc,
+            start_snapshot_restore_job,
+            list_remote_revisions,
+            list_remote_history_trash,
+            truncate_remote_history,
+            restore_remote_history_trash,
+            start_remote_revision_download_job,
+            start_remote_revision_restore_job,
             import_snapshot,
             recover_operation,
             list_codex_processes,
@@ -1378,6 +1980,50 @@ mod tests {
         let error = recover_local_operation(&journal_path, true).unwrap_err();
 
         assert!(error.to_string().contains("ambiguous recovery journal"));
+    }
+
+    #[test]
+    fn recovery_point_discovery_pins_incomplete_journals_first() {
+        let repository = tempdir().unwrap();
+        let journal_directory = repository.path().join("journal");
+        std::fs::create_dir_all(&journal_directory).unwrap();
+        let incomplete = serde_json::json!({
+            "operationId": "01900000-0000-7000-8000-000000000001",
+            "targetCodexHome": "C:/temp/codex",
+            "status": "recovery_required",
+            "startedAt": "2026-07-31T10:00:00Z",
+            "updatedAt": "2026-07-31T10:02:00Z",
+            "repositoryBackupDir": "C:/temp/backup",
+            "databaseBackups": [],
+            "directorySwaps": [],
+            "expectedThreadHashes": {}
+        });
+        let completed = serde_json::json!({
+            "operationId": "01900000-0000-7000-8000-000000000002",
+            "targetCodexHome": "C:/temp/codex",
+            "status": "completed",
+            "startedAt": "2026-07-31T11:00:00Z",
+            "updatedAt": "2026-07-31T11:02:00Z",
+            "backupDir": "C:/temp/backup",
+            "plannedRollouts": [],
+            "importedThreadIds": []
+        });
+        std::fs::write(
+            journal_directory.join("checkout.json"),
+            serde_json::to_vec(&incomplete).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            journal_directory.join("import.json"),
+            serde_json::to_vec(&completed).unwrap(),
+        )
+        .unwrap();
+
+        let points = discover_recovery_points(repository.path()).unwrap();
+        assert_eq!(points.len(), 2);
+        assert!(points[0].requires_attention);
+        assert_eq!(points[0].kind, "checkout");
+        assert!(!points[1].requires_attention);
     }
 
     #[tokio::test]
