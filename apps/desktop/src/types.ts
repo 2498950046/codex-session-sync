@@ -87,7 +87,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "push" | "pull" | "resolve" | "switch" | "remap";
+  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "pull" | "resolve" | "switch" | "remap";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
@@ -114,6 +114,7 @@ export type RemoteNamespace = {
   id: string;
   displayName: string;
   head: string | null;
+  namespaceEpoch: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -178,6 +179,100 @@ export type NamespaceMappingState = {
     matchedMappingId: string | null;
     ambiguousMappingIds: string[];
   };
+};
+
+export type SnapshotMetadata = {
+  description: string;
+  tags: string[];
+  pinned: boolean;
+  automatic: boolean;
+};
+
+export type LocalSnapshotListItem = {
+  snapshotId: string;
+  createdAt: string;
+  manifestPath: string;
+  threadCount: number;
+  objectCount: number;
+  logicalBytes: number;
+  physicalReferencedBytes: number;
+  warningCount: number;
+  metadata: SnapshotMetadata;
+};
+
+export type RevisionSummary = {
+  revisionId: string;
+  namespaceId: string;
+  parentRevision: string | null;
+  createdAt: string;
+  threadCount: number;
+  objectCount: number;
+  logicalBytes: number;
+  physicalReferencedBytes: number;
+  state: "active" | "trashed";
+};
+
+export type SnapshotDeletionPlan = {
+  snapshotId: string;
+  manifestPath: string;
+  pinned: boolean;
+  protectedByOperations?: string[];
+  sharedObjectCount: number;
+  exclusiveObjectCount: number;
+  estimatedReclaimableBytes: number;
+  planFingerprint: string;
+};
+
+export type SnapshotTrashEntry = {
+  operationId: string;
+  snapshotId: string;
+  trashedAt: string;
+  originalManifestPath: string;
+  trashManifestPath: string;
+};
+
+export type RemoteHistoryTrashOperation = {
+  operationId: string;
+  namespaceId: string;
+  oldHead: string | null;
+  newHead: string | null;
+  epochBefore: number;
+  epochAfter: number;
+  createdAt: string;
+  expiresAt: string;
+  revisionCount: number;
+  state: string;
+};
+
+export type GcPlan = {
+  schemaVersion: number;
+  createdAt: string;
+  reachableObjects: number;
+  unreachableObjects: Array<{ kind: string; sha256: string; byteLength: number }>;
+  reclaimableBytes: number;
+};
+
+export type RepositoryStorageSummary = {
+  logicalBytes: number;
+  repositoryPhysicalBytes: number;
+  activePhysicalBytes: number;
+  sharedPhysicalBytes: number;
+  exclusivePhysicalBytes: number;
+  trashBytes: number;
+  gcQuarantineBytes: number;
+  reclaimableBytes: number;
+  protectedByJournalBytes: number;
+};
+
+export type RecoveryPoint = {
+  operationId: string;
+  kind: "import" | "checkout";
+  status: string;
+  journalPath: string;
+  targetCodexHome: string;
+  startedAt: string | null;
+  updatedAt: string | null;
+  requiresAttention: boolean;
 };
 
 export type WorkspaceMappingRule = {

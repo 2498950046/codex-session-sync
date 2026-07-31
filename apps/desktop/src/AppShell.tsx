@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from "react";
 import { NavLink, useLocation } from "./router";
 import {
   Activity,
+  ArchiveRestore,
   Boxes,
   ChevronRight,
   CloudCog,
@@ -17,6 +18,7 @@ import iconUrl from "../app-icon.svg";
 import type { CodexProcess } from "./types";
 
 const navigation = [
+  { to: "/history", label: "快照与恢复", icon: ArchiveRestore },
   { to: "/overview", label: "概览", icon: Home },
   { to: "/sync", label: "同步", icon: RefreshCw },
   { to: "/sessions", label: "会话", icon: MessagesSquare },
@@ -26,6 +28,7 @@ const navigation = [
 ] as const;
 
 const titles: Record<string, { title: string; description: string }> = {
+  "/history": { title: "快照与恢复", description: "浏览本地快照、远端版本与可恢复删除记录" },
   "/overview": { title: "概览", description: "查看同步环境、配置状态和最近结果" },
   "/sync": { title: "同步", description: "安全推送、拉取或切换 Codex 会话" },
   "/sessions": { title: "会话", description: "扫描本机会话并检查兼容性" },

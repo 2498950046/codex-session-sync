@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { Navigate, NavLink, Route, Routes, useLocation, useNavigate } from "./router";
 import {
   AlertTriangle,
+  ArchiveRestore,
   ArrowDownToLine,
   ArrowRight,
   ArrowUpFromLine,
@@ -13,33 +14,45 @@ import {
   Copy,
   Database,
   FolderCog,
+  GitBranch,
   KeyRound,
   Moon,
   Plus,
   RefreshCw,
+  RotateCcw,
   Server,
   Settings,
   ShieldAlert,
   Sun,
+  Trash2,
   X,
 } from "lucide-react";
 import { AppShell } from "./AppShell";
 import { useTheme } from "./theme";
 import type {
   AutomaticWorkspaceMappingResult,
+  CheckoutReport,
   CodexProcess,
   ImportReport,
+  GcPlan,
   JobSnapshot,
+  LocalSnapshotListItem,
   NamespaceMappingState,
   OperationJournal,
   QuarantinedRollout,
+  RepositoryStorageSummary,
+  RecoveryPoint,
   RemoteConnectionStatus,
   RemoteNamespace,
   RemoteNamespaceStatus,
   RemoteProfileSummary,
+  RemoteHistoryTrashOperation,
+  RevisionSummary,
   ScanReport,
   ScanWarning,
   SnapshotSummary,
+  SnapshotDeletionPlan,
+  SnapshotTrashEntry,
   SnapshotValidationReport,
   SyncReport,
   ThreadConflict,
@@ -76,7 +89,7 @@ type WorkspacePathEditorProps = {
   onCancel?: () => void;
 };
 
-export type AppRoute = "/overview" | "/sync" | "/sessions" | "/namespaces" | "/settings" | "/advanced";
+export type AppRoute = "/overview" | "/sync" | "/history" | "/sessions" | "/namespaces" | "/settings" | "/advanced";
 
 type ConfirmationRequest = {
   title: string;
@@ -92,6 +105,35 @@ function PageIntro({ title, description, action }: { title: string; description:
 
 function StatusBadge({ tone = "neutral", children }: { tone?: "neutral" | "success" | "warning" | "danger"; children: ReactNode }) {
   return <span className={`status-badge ${tone}`}>{children}</span>;
+}
+
+type VersionRow = {
+  id: string;
+  title: string;
+  createdAt: string;
+  threadCount: number;
+  logicalBytes: number;
+  labels: string[];
+  kind: "local" | "remote";
+};
+
+function VersionGraphTable({ rows, selectedId, onSelect }: {
+  rows: VersionRow[];
+  selectedId: string | null;
+  onSelect: (row: VersionRow) => void;
+}) {
+  return <div className="version-log" role="table" aria-label="版本历史">
+    <div className="version-log-head" role="row"><span>Graph</span><span>说明</span><span>标签</span><span>创建时间</span><span>会话</span><span>逻辑大小</span></div>
+    {rows.map((row, index) => <button type="button" role="row" key={`${row.kind}-${row.id}`} className={`version-log-row ${selectedId === row.id ? "selected" : ""}`} onClick={() => onSelect(row)}>
+      <span className="graph-cell"><i className={`graph-line ${index === rows.length - 1 ? "last" : ""}`} /><i className={`graph-node ${row.kind}`} /></span>
+      <span className="version-description"><strong>{row.title}</strong><code>{shortHead(row.id)}</code></span>
+      <span className="version-labels">{row.labels.map((label) => <b key={label}>{label}</b>)}</span>
+      <span>{new Date(row.createdAt).toLocaleString("zh-CN")}</span>
+      <span>{row.threadCount}</span>
+      <span>{formatBytes(row.logicalBytes)}</span>
+    </button>)}
+    {rows.length === 0 && <div className="version-log-empty">暂无版本记录</div>}
+  </div>;
 }
 
 function CopyCode({ value, compact = false }: { value: string; compact?: boolean }) {
@@ -278,6 +320,16 @@ export default function SessionSyncApp() {
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [report, setReport] = useState<ScanReport | null>(null);
   const [snapshot, setSnapshot] = useState<SnapshotSummary | null>(null);
+  const [localSnapshots, setLocalSnapshots] = useState<LocalSnapshotListItem[]>([]);
+  const [remoteRevisions, setRemoteRevisions] = useState<RevisionSummary[]>([]);
+  const [snapshotTrash, setSnapshotTrash] = useState<SnapshotTrashEntry[]>([]);
+  const [remoteHistoryTrash, setRemoteHistoryTrash] = useState<RemoteHistoryTrashOperation[]>([]);
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
+  const [historySource, setHistorySource] = useState<"local" | "remote" | "recovery" | "trash">("local");
+  const [gcPlan, setGcPlan] = useState<GcPlan | null>(null);
+  const [storageSummary, setStorageSummary] = useState<RepositoryStorageSummary | null>(null);
+  const [recoveryPoints, setRecoveryPoints] = useState<RecoveryPoint[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [validation, setValidation] = useState<SnapshotValidationReport | null>(null);
   const [importReport, setImportReport] = useState<ImportReport | null>(null);
   const [recoveredJournal, setRecoveredJournal] = useState<OperationJournal | null>(null);
@@ -551,6 +603,11 @@ export default function SessionSyncApp() {
   }, [codexHome, repositoryRoot]);
 
   useEffect(() => {
+    if (location.pathname !== "/history" && location.pathname !== "/sync") return;
+    void refreshHistory();
+  }, [location.pathname, repositoryRoot, selectedRemoteId, selectedNamespaceId]);
+
+  useEffect(() => {
     setConflictChoices({});
     setPendingWorkspaceSync(null);
     setWorkspaceSetupMessage(null);
@@ -600,6 +657,7 @@ export default function SessionSyncApp() {
       setSnapshot(summary);
       setManifestPath(summary.manifestPath);
       setValidation(null);
+      await refreshHistory();
     }
     if (completed.kind === "validate") setValidation(result as SnapshotValidationReport);
     if (completed.kind === "import") {
@@ -608,6 +666,27 @@ export default function SessionSyncApp() {
       setJournalPath(imported.journalPath);
     }
     if (completed.kind === "recovery") setRecoveredJournal(result as OperationJournal);
+    if (completed.kind === "restore") {
+      const restored = result as CheckoutReport;
+      setJournalPath(restored.journalPath);
+      await refreshHistory();
+    }
+    if (completed.kind === "revision-download") {
+      const downloaded = result as SnapshotSummary;
+      setSnapshot(downloaded);
+      setManifestPath(downloaded.manifestPath);
+      await refreshHistory();
+    }
+    if (completed.kind === "revision-restore") {
+      const restored = result as CheckoutReport;
+      setJournalPath(restored.journalPath);
+    }
+    if (completed.kind === "revision-publish") {
+      const published = result as SyncReport;
+      setSyncReport(published);
+      await refreshNamespaces();
+      await refreshHistory();
+    }
     if (["push", "pull", "resolve", "switch", "remap"].includes(completed.kind)) {
       const synced = result as SyncReport;
       setSyncReport(synced);
@@ -648,6 +727,79 @@ export default function SessionSyncApp() {
     } catch (reason) {
       setError(String(reason));
     }
+  }
+
+  async function refreshHistory() {
+    if (!isTauriRuntime || !repositoryRoot.trim()) return;
+    setHistoryLoading(true);
+    try {
+      const [local, trash, storage, recovery] = await Promise.all([
+        invoke<LocalSnapshotListItem[]>("list_local_snapshots", { repositoryRoot: repositoryRoot.trim() }),
+        invoke<SnapshotTrashEntry[]>("list_local_snapshot_trash", { repositoryRoot: repositoryRoot.trim() }),
+        invoke<RepositoryStorageSummary>("get_repository_storage_summary", { repositoryRoot: repositoryRoot.trim() }),
+        invoke<RecoveryPoint[]>("list_recovery_points", { repositoryRoot: repositoryRoot.trim() }),
+      ]);
+      setLocalSnapshots(local);
+      setSnapshotTrash(trash);
+      setStorageSummary(storage);
+      setRecoveryPoints(recovery);
+      if (selectedRemoteId && selectedNamespaceId) {
+        const [revisions, remoteTrash] = await Promise.all([
+          invoke<RevisionSummary[]>("list_remote_revisions", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId }),
+          invoke<RemoteHistoryTrashOperation[]>("list_remote_history_trash", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId }),
+        ]);
+        setRemoteRevisions(revisions);
+        setRemoteHistoryTrash(remoteTrash);
+      } else {
+        setRemoteRevisions([]);
+        setRemoteHistoryTrash([]);
+      }
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }
+
+  async function requestSnapshotTrash(item: LocalSnapshotListItem) {
+    try {
+      const plan = await invoke<SnapshotDeletionPlan>("plan_snapshot_deletion", {
+        repositoryRoot: repositoryRoot.trim(), snapshotId: item.snapshotId,
+      });
+      setConfirmation({
+        title: "将快照移入回收站",
+        description: <p>快照清单会进入可恢复回收站。{plan.exclusiveObjectCount} 个独占对象、约 {formatBytes(plan.estimatedReclaimableBytes)} 只有在后续 GC 时才会进入隔离区；共享对象不会删除。</p>,
+        confirmLabel: "移入回收站",
+        tone: "danger",
+        onConfirm: async () => {
+          await invoke("trash_local_snapshot", { repositoryRoot: repositoryRoot.trim(), plan });
+          setSelectedHistoryId(null);
+          await refreshHistory();
+        },
+      });
+    } catch (reason) { setError(String(reason)); }
+  }
+
+  async function restoreTrash(entry: SnapshotTrashEntry) {
+    try {
+      await invoke("restore_trashed_snapshot", { repositoryRoot: repositoryRoot.trim(), operationId: entry.operationId });
+      await refreshHistory();
+    } catch (reason) { setError(String(reason)); }
+  }
+
+  async function inspectGc() {
+    try {
+      setGcPlan(await invoke<GcPlan>("plan_local_gc", { repositoryRoot: repositoryRoot.trim() }));
+    } catch (reason) { setError(String(reason)); }
+  }
+
+  async function quarantineGc() {
+    if (!gcPlan) return;
+    try {
+      await invoke("quarantine_local_gc", { repositoryRoot: repositoryRoot.trim(), plan: gcPlan });
+      setGcPlan(null);
+      await refreshHistory();
+    } catch (reason) { setError(String(reason)); }
   }
 
   async function selectJournalFile() {
@@ -1320,6 +1472,60 @@ export default function SessionSyncApp() {
     {(snapshot || validation || importReport || recoveredJournal) && <div className="result-summary-grid tool-results">{snapshot && <article><span>最新快照</span><strong>{snapshot.threadCount} 个会话</strong><small>{formatBytes(snapshot.totalBytes)} · {snapshot.objectCount} 个对象</small></article>}{validation && <article><span>验证结果</span><strong>{validation.valid ? "完整有效" : "验证失败"}</strong><small>{validation.snapshotId}</small></article>}{importReport && <article><span>导入完成</span><strong>{importReport.importedCount} 新增 / {importReport.skippedCount} 跳过</strong><small title={importReport.backupDir}>已创建备份</small></article>}{recoveredJournal && <article><span>恢复结果</span><strong>{recoveredJournal.status}</strong><small>{recoveredJournal.error ?? recoveredJournal.operationId}</small></article>}</div>}
   </section>;
 
+  const localVersionRows: VersionRow[] = localSnapshots.map((item) => ({
+    id: item.snapshotId,
+    title: item.metadata.description || (item.metadata.automatic ? "自动安全快照" : "本地快照"),
+    createdAt: item.createdAt,
+    threadCount: item.threadCount,
+    logicalBytes: item.logicalBytes,
+    labels: [item.metadata.pinned ? "PINNED" : "SNAPSHOT", ...item.metadata.tags],
+    kind: "local",
+  }));
+  const remoteVersionRows: VersionRow[] = remoteRevisions.map((item, index) => ({
+    id: item.revisionId,
+    title: index === 0 ? "远端最新版本" : "远端版本",
+    createdAt: item.createdAt,
+    threadCount: item.threadCount,
+    logicalBytes: item.logicalBytes,
+    labels: index === 0 ? ["HEAD"] : [],
+    kind: "remote",
+  }));
+  const syncVersionRows: VersionRow[] = [
+    ...localVersionRows.slice(0, 3),
+    ...remoteVersionRows,
+  ].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const selectedLocalSnapshot = localSnapshots.find((item) => item.snapshotId === selectedHistoryId) ?? null;
+  const selectedRemoteRevision = remoteRevisions.find((item) => item.revisionId === selectedHistoryId) ?? null;
+  const historyPage = <div className="page-stack history-page">
+    <PageIntro title="快照与恢复" description="以版本图方式浏览本地快照和远端命名空间历史；删除先进入回收站，对象回收另行确认。" action={<div className="button-row"><button className="button secondary" onClick={() => void refreshHistory()} disabled={historyLoading}><RefreshCw size={15} />刷新</button><button className="button primary" onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建快照</button></div>} />
+    <section className="history-workbench surface">
+      <aside className="history-tree">
+        <strong>来源</strong>
+        <button className={historySource === "local" ? "active" : ""} onClick={() => { setHistorySource("local"); setSelectedHistoryId(null); }}><Database size={15} />本机 <b>{localSnapshots.length}</b></button>
+        <button className={historySource === "remote" ? "active" : ""} onClick={() => { setHistorySource("remote"); setSelectedHistoryId(null); }} disabled={!selectedNamespaceId}><Server size={15} />{selectedNamespace?.displayName ?? "远端命名空间"} <b>{remoteRevisions.length}</b></button>
+        <button className={historySource === "recovery" ? "active" : ""} onClick={() => { setHistorySource("recovery"); setSelectedHistoryId(null); }}><RotateCcw size={15} />操作恢复 <b>{recoveryPoints.filter((point) => point.requiresAttention).length}</b></button>
+        <button className={historySource === "trash" ? "active" : ""} onClick={() => { setHistorySource("trash"); setSelectedHistoryId(null); }}><Trash2 size={15} />回收站 <b>{snapshotTrash.length + remoteHistoryTrash.filter((entry) => entry.state === "active").length}</b></button>
+        <div className="history-tree-divider" />
+        <button onClick={() => void inspectGc()}><ArchiveRestore size={15} />对象 GC</button>
+      </aside>
+      <div className="history-main">
+        <div className="history-toolbar"><strong>{historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : "可恢复删除"}</strong><span>{historyLoading ? "正在读取…" : "按创建时间倒序"}</span></div>
+        {historySource === "local" && <VersionGraphTable rows={localVersionRows} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
+        {historySource === "remote" && <VersionGraphTable rows={remoteVersionRows} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
+        {historySource === "recovery" && <div className="trash-list">{recoveryPoints.map((point) => <article key={point.operationId} className={point.requiresAttention ? "requires-attention" : ""}><div><strong>{point.kind === "checkout" ? "精确切换" : "增量导入"} · {point.status}</strong><span>{point.updatedAt ? new Date(point.updatedAt).toLocaleString("zh-CN") : point.journalPath}</span></div>{point.requiresAttention && <button className="button warning small" onClick={() => { setJournalPath(point.journalPath); setConfirmation({ title: "恢复未完成操作", description: <p>将根据 Journal 和备份重新校验后恢复。Codex 必须完全退出。</p>, confirmLabel: "确认恢复", tone: "warning", onConfirm: () => start("start_recovery_job", { journalPath: point.journalPath, confirmedCodexClosed: true }) }); }} disabled={!canWrite || busy}><RotateCcw size={14} />处理恢复</button>}</article>)}{recoveryPoints.length === 0 && <div className="version-log-empty">没有发现操作恢复点</div>}</div>}
+        {historySource === "trash" && <div className="trash-list">{snapshotTrash.map((entry) => <article key={entry.operationId}><div><strong>本地快照 · {shortHead(entry.snapshotId)}</strong><span>{new Date(entry.trashedAt).toLocaleString("zh-CN")}</span></div><button className="button secondary small" onClick={() => void restoreTrash(entry)}><RotateCcw size={14} />恢复快照</button></article>)}{remoteHistoryTrash.filter((entry) => entry.state === "active").map((entry) => <article key={entry.operationId}><div><strong>远端历史 · {entry.revisionCount} 个版本</strong><span>{shortHead(entry.oldHead)} → {shortHead(entry.newHead)} · 到期 {new Date(entry.expiresAt).toLocaleDateString("zh-CN")}</span></div><button className="button secondary small" onClick={async () => { await invoke("restore_remote_history_trash", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, operationId: entry.operationId }); await refreshNamespaces(); await refreshHistory(); }}><RotateCcw size={14} />恢复远端历史</button></article>)}{snapshotTrash.length === 0 && remoteHistoryTrash.every((entry) => entry.state !== "active") && <div className="version-log-empty">回收站为空</div>}</div>}
+        {(selectedLocalSnapshot || selectedRemoteRevision) && <section className="version-details">
+          <div><span className="overline">选中版本</span><h3>{selectedLocalSnapshot ? (selectedLocalSnapshot.metadata.description || "本地快照") : "远端 Revision"}</h3><CopyCode value={selectedHistoryId ?? ""} /></div>
+          <div className="version-detail-metrics"><span>会话 <b>{selectedLocalSnapshot?.threadCount ?? selectedRemoteRevision?.threadCount}</b></span><span>逻辑大小 <b>{formatBytes(selectedLocalSnapshot?.logicalBytes ?? selectedRemoteRevision?.logicalBytes ?? 0)}</b></span><span>物理引用 <b>{formatBytes(selectedLocalSnapshot?.physicalReferencedBytes ?? selectedRemoteRevision?.physicalReferencedBytes ?? 0)}</b></span></div>
+          {selectedLocalSnapshot && <div className="button-row"><button className="button warning" onClick={() => setConfirmation({ title: "精确恢复本地快照", description: <p>当前 Codex 会话将先完整备份并写入 Journal，再替换为所选快照。失败时会自动回滚。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_snapshot_restore_job", { manifestPath: selectedLocalSnapshot.manifestPath, codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy}>精确恢复</button><button className="button secondary" onClick={async () => { await invoke("update_snapshot_metadata", { repositoryRoot: repositoryRoot.trim(), snapshotId: selectedLocalSnapshot.snapshotId, metadata: { ...selectedLocalSnapshot.metadata, pinned: !selectedLocalSnapshot.metadata.pinned } }); await refreshHistory(); }}>{selectedLocalSnapshot.metadata.pinned ? "取消固定" : "固定快照"}</button><button className="button danger" onClick={() => void requestSnapshotTrash(selectedLocalSnapshot)} disabled={selectedLocalSnapshot.metadata.pinned}><Trash2 size={15} />移入回收站</button></div>}
+          {selectedRemoteRevision && <div className="button-row"><button className="button secondary" onClick={() => void start("start_remote_revision_download_job", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId })} disabled={busy}>下载为本地快照</button><button className="button secondary" onClick={() => setConfirmation({ title: "恢复为本地待推送状态", description: <p>当前会话会先备份并通过 Journal 精确切换到该远端版本；Tracking 仍保留当前远端 Head，之后可普通 Push 发布。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: false, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复为待 Push</button><button className="button warning" onClick={() => setConfirmation({ title: "恢复并发布为新版本", description: <p>先安全恢复所选历史内容，再以当前远端 Head 为父版本发布新的 Revision；不会改写已有历史。</p>, confirmLabel: "恢复并发布", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: true, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复并发布</button>{remoteRevisions[0]?.revisionId !== selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "回退远端 Head", description: <p>该版本之后的远端历史会进入 30 天可恢复回收站，Namespace Epoch 将递增。对象不会立即删除。</p>, confirmLabel: "确认回退 Head", tone: "danger", onConfirm: async () => { await invoke("truncate_remote_history", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, newHead: selectedRemoteRevision.revisionId }); await refreshNamespaces(); await refreshHistory(); } })}>回退 Head 到此处</button>}{remoteRevisions[0]?.revisionId === selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "删除当前远端 Head", description: <p>当前 Head 会进入 30 天可恢复回收站，父版本成为新 Head；共享对象和内容不会立即删除。</p>, confirmLabel: "删除当前 Head", tone: "danger", onConfirm: async () => { await invoke("truncate_remote_history", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, newHead: selectedRemoteRevision.parentRevision }); await refreshNamespaces(); await refreshHistory(); } })}>删除当前 Head</button>}</div>}
+        </section>}
+      </div>
+    </section>
+    {storageSummary && <section className="surface storage-summary" aria-label="仓库存储统计"><div><span>仓库占用</span><strong>{formatBytes(storageSummary.repositoryPhysicalBytes)}</strong></div><div><span>活动可达</span><strong>{formatBytes(storageSummary.activePhysicalBytes)}</strong></div><div><span>共享对象</span><strong>{formatBytes(storageSummary.sharedPhysicalBytes)}</strong></div><div><span>回收站保护</span><strong>{formatBytes(storageSummary.trashBytes)}</strong></div><div><span>可隔离</span><strong>{formatBytes(storageSummary.reclaimableBytes)}</strong></div><div><span>已隔离</span><strong>{formatBytes(storageSummary.gcQuarantineBytes)}</strong></div></section>}
+    {gcPlan && <section className="surface gc-panel"><div><h3>GC 隔离计划</h3><p>{gcPlan.unreachableObjects.length} 个全局不可达对象，可释放约 {formatBytes(gcPlan.reclaimableBytes)}。执行后先移入隔离区，不会永久删除。</p></div><div className="button-row"><button className="button secondary" onClick={() => setGcPlan(null)}>关闭</button><button className="button danger" onClick={() => setConfirmation({ title: "隔离不可达对象", description: <p>计划会在执行前重新计算；仍被任何活动快照、回收站快照或远端 Revision 缓存引用的对象不会移动。</p>, confirmLabel: "确认隔离", tone: "danger", onConfirm: quarantineGc })} disabled={gcPlan.unreachableObjects.length === 0}>隔离对象</button></div></section>}
+  </div>;
+
   return <AppShell processes={processes} busy={busy} onRefreshProcesses={() => void refreshProcesses()}>
     {processes.length > 0 && <div className="global-process-alert" role="status"><AlertTriangle size={18} /><div><strong>检测到 Codex 正在运行</strong><span>扫描和配置仍可使用；同步、导入、恢复和清理暂时禁用。</span><div className="process-chips">{processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}</div></div></div>}
     {error && <div className="global-alert" role="alert"><AlertTriangle size={18} /><div><strong>操作未完成</strong><span>{error}</span></div><button type="button" onClick={() => setError(null)} aria-label="关闭错误"><X size={17} /></button></div>}
@@ -1333,13 +1539,14 @@ export default function SessionSyncApp() {
       <Route path="/sync" element={<div className="page-stack compact-stack">
         <PageIntro title="同步会话" description="明确选择同步方向；写入前会再次检查 Codex 进程和项目路径。" />
         <section className="surface context-selector"><div className="field"><label>Codex Home</label><button className="selector-display" onClick={() => navigate("/settings")} title={codexHome}>{codexHome || "未设置"}<Settings size={15} /></button></div><div className="field"><label htmlFor="sync-remote">远端服务器</label><select id="sync-remote" value={selectedRemoteId} onChange={(event) => setSelectedRemoteId(event.target.value)} disabled={busy}><option value="">请选择远端</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.displayName}</option>)}</select></div><div className="field"><label htmlFor="sync-namespace">命名空间</label><select id="sync-namespace" value={selectedNamespaceId} onChange={(event) => void chooseNamespace(event.target.value)} disabled={busy || !selectedRemoteId}><option value="">请选择命名空间</option>{namespaces.map((namespace) => <option key={namespace.id} value={namespace.id}>{namespace.displayName}</option>)}</select>{mappingState && <small>{selectionSourceLabel(mappingState.selection.source)}</small>}</div></section>
-        {syncStatusPanel}{syncResultPanel}
+        {syncStatusPanel}<section className="surface sync-version-log"><div className="section-title"><div><h3>版本图谱</h3><p>本地快照与当前远端命名空间共享同一种 IDEA 风格版本日志。</p></div><button className="text-button" onClick={() => navigate("/history")}>打开快照与恢复</button></div><VersionGraphTable rows={syncVersionRows} selectedId={selectedHistoryId} onSelect={(row) => { setSelectedHistoryId(row.id); navigate("/history"); setHistorySource(row.kind); }} /></section>{syncResultPanel}
       </div>} />
+      <Route path="/history" element={historyPage} />
       <Route path="/sessions" element={<div className="page-stack"><PageIntro title="本机会话" description="扫描会在后台运行，只读取会话和兼容性信息。" action={<button className="button primary" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}><RefreshCw size={16} />重新扫描</button>} />{sessionReportPanel}</div>} />
       <Route path="/namespaces" element={<div className="page-stack"><PageIntro title="命名空间" description="每个命名空间拥有独立历史，可重命名但稳定 ID 不变。" action={<button className="button secondary" onClick={() => void refreshNamespaces()} disabled={busy || !selectedRemoteId}><RefreshCw size={16} />刷新</button>} />{selectedRemoteId ? <><section className="namespace-list">{namespaces.map((namespace) => { const active = namespaceStatus?.activeNamespaceId === namespace.id; const selected = selectedNamespaceId === namespace.id; return <article key={namespace.id} className={`surface namespace-list-card ${selected ? "selected" : ""}`}><div><div className="namespace-name"><h3>{namespace.displayName}</h3>{active && <StatusBadge tone="success">当前活动</StatusBadge>}</div><CopyCode value={namespace.head ?? "空命名空间"} compact /></div><div className="namespace-card-actions"><button className="button secondary small" onClick={() => void chooseNamespace(namespace.id)} disabled={busy}>{selected ? "已选为目标" : "设为同步目标"}</button></div></article>; })}{namespaces.length === 0 && <section className="surface empty-card"><Database size={28} /><h3>服务器上还没有命名空间</h3><p>创建第一个命名空间后即可推送本机会话。</p></section>}</section><section className="surface namespace-editor-card"><div><h3>{selectedNamespace ? "重命名选中项" : "创建命名空间"}</h3><p>名称可以随时修改，不影响同步身份。</p></div><div className="namespace-editor"><div className="field"><label htmlFor="namespace-name-new">命名空间名称</label><input id="namespace-name-new" value={namespaceName} onChange={(event) => setNamespaceName(event.target.value)} placeholder="例如：工作会话" /></div><div className="button-row"><button className="button primary" onClick={() => void createNamespace()} disabled={busy || !namespaceName.trim()}><Plus size={16} />创建</button><button className="button secondary" onClick={() => void renameNamespace()} disabled={busy || !selectedNamespaceId || !namespaceName.trim()}>保存新名称</button></div></div></section></> : <section className="surface empty-card"><Server size={28} /><h3>请先配置远端服务器</h3><p>命名空间存储在远端服务器中。</p><button className="button primary" onClick={() => navigate("/settings")}>前往设置</button></section>}</div>} />
       <Route path="/settings" element={<div className="page-stack"><PageIntro title="设置" description="配置本机数据位置、远端服务器和界面外观。" /><section className="settings-grid"><article className="surface settings-card"><div className="section-title"><div><h3>本机存储</h3><p>路径变化会刷新对应的远端与同步状态。</p></div><Database size={20} /></div><div className="field"><label htmlFor="codex-home-new">Codex Home</label><input id="codex-home-new" value={codexHome} onChange={(event) => setCodexHome(event.target.value)} disabled={busy} /></div><div className="field"><label htmlFor="repository-root-new">本地同步仓库</label><input id="repository-root-new" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} disabled={busy} /></div></article><article className="surface settings-card"><div className="section-title"><div><h3>外观</h3><p>默认跟随操作系统，也可以固定主题。</p></div>{resolvedTheme === "dark" ? <Moon size={20} /> : <Sun size={20} />}</div><div className="theme-options" role="radiogroup" aria-label="主题"><button role="radio" aria-checked={themePreference === "system"} className={themePreference === "system" ? "selected" : ""} onClick={() => setThemePreference("system")}><RefreshCw size={17} /><span><strong>跟随系统</strong><small>当前为{resolvedTheme === "dark" ? "深色" : "浅色"}</small></span></button><button role="radio" aria-checked={themePreference === "light"} className={themePreference === "light" ? "selected" : ""} onClick={() => setThemePreference("light")}><Sun size={17} /><span><strong>浅色</strong><small>始终使用浅色界面</small></span></button><button role="radio" aria-checked={themePreference === "dark"} className={themePreference === "dark" ? "selected" : ""} onClick={() => setThemePreference("dark")}><Moon size={17} /><span><strong>深色</strong><small>始终使用深色界面</small></span></button></div></article></section><section className="surface settings-card remote-settings"><div className="section-title"><div><h3>远端服务器</h3><p>Bearer Token 只保存到操作系统凭据库，前端不会读回明文。</p></div><StatusBadge>{profiles.length} 个配置</StatusBadge></div><div className="profile-tabs">{profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : ""} onClick={() => setSelectedRemoteId(profile.id)} disabled={busy}>{profile.displayName}</button>)}<button onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); setMappingState(null); setWorkspaceMappingState(null); }} disabled={busy}><Plus size={15} />新建远端</button></div><div className="remote-form"><div className="field"><label htmlFor="remote-name-new">配置名称</label><input id="remote-name-new" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div><div className="field"><label htmlFor="remote-url-new">服务器 URL</label><input id="remote-url-new" value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} /></div><div className="field"><label htmlFor="remote-token-new">Bearer Token</label><input id="remote-token-new" type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder={selectedProfile?.credentialConfigured ? "已保存；留空则不修改" : "至少 16 位可见 ASCII 字符"} /></div></div><div className="button-row"><button className="button primary" onClick={() => void saveRemote()} disabled={busy || !remoteName.trim() || !remoteUrl.trim() || (!selectedRemoteId && !remoteToken.trim())}>保存并验证</button><button className="button secondary" onClick={() => void testConnection()} disabled={busy || !selectedRemoteId}>测试连接</button></div>{(selectedProfile?.insecureHttp || remoteUrl.trim().startsWith("http://")) && <div className="inline-alert warning"><AlertTriangle size={17} /><span>当前连接未使用 HTTPS，仅建议在本机或可信内网使用。</span></div>}{connectionMessage && <div className="inline-alert success"><Check size={17} /><span>{connectionMessage}</span></div>}</section></div>} />
       <Route path="/advanced" element={<Navigate to="/advanced/automatic" replace />} />
-      <Route path="/advanced/*" element={<div className="page-stack"><PageIntro title="高级工具" description="这些工具用于自动化选择、跨电脑路径适配和手动恢复。" /><nav className="subnavigation" aria-label="高级工具分类"><NavLink to="/advanced/automatic">自动选择映射</NavLink><NavLink to="/advanced/projects">项目路径</NavLink><NavLink to="/advanced/snapshots">快照与恢复</NavLink></nav>{location.pathname === "/advanced/projects" ? projectTools : location.pathname === "/advanced/snapshots" ? snapshotTools : automaticTools}</div>} />
+      <Route path="/advanced/*" element={<div className="page-stack"><PageIntro title="高级工具" description="这些工具用于自动化选择、跨电脑路径适配和手动恢复。" /><nav className="subnavigation" aria-label="高级工具分类"><NavLink to="/advanced/automatic">自动选择映射</NavLink><NavLink to="/advanced/projects">项目路径</NavLink><NavLink to="/history">快照与恢复</NavLink></nav>{location.pathname === "/advanced/projects" ? projectTools : location.pathname === "/advanced/snapshots" ? snapshotTools : automaticTools}</div>} />
       <Route path="*" element={<Navigate to="/overview" replace />} />
     </Routes>
 

@@ -125,7 +125,7 @@ const namespaceMappingState: NamespaceMappingState = {
   },
 };
 
-export async function installDevelopmentPreview(preview: "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure") {
+export async function installDevelopmentPreview(preview: "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure" | "history") {
   let automaticEnabled = true;
   let selectedProfileNamespaceId = namespaceId;
   let manualOverrideNamespaceId: string | null = null;
@@ -236,12 +236,14 @@ export async function installDevelopmentPreview(preview: "ready" | "empty" | "pr
       id: namespaceId,
       displayName: "个人会话",
       head: baseHash,
+      namespaceEpoch: 0,
       createdAt: "2026-07-27T00:00:00Z",
       updatedAt: "2026-07-27T00:00:00Z",
     }, {
       id: workNamespaceId,
       displayName: "工作会话",
       head: remoteHead,
+      namespaceEpoch: 0,
       createdAt: "2026-07-27T00:00:00Z",
       updatedAt: "2026-07-27T00:00:00Z",
     }];
@@ -258,6 +260,30 @@ export async function installDevelopmentPreview(preview: "ready" | "empty" | "pr
       generation: 2,
       };
     }
+    if (command === "list_local_snapshots") return [{
+      snapshotId: "019fa1a0-5555-7555-8555-555555555555",
+      createdAt: "2026-07-31T09:40:00Z",
+      manifestPath: "C:/Users/demo/.codex-session-sync/snapshots/019fa1a0-5555-7555-8555-555555555555.json",
+      threadCount: 418, objectCount: 436, logicalBytes: 984811738, physicalReferencedBytes: 612340000,
+      warningCount: 0, metadata: { description: "升级存储协议前", tags: ["manual"], pinned: true, automatic: false },
+    }, {
+      snapshotId: "019fa1a0-6666-7666-8666-666666666666",
+      createdAt: "2026-07-30T18:20:00Z",
+      manifestPath: "C:/Users/demo/.codex-session-sync/snapshots/019fa1a0-6666-7666-8666-666666666666.json",
+      threadCount: 412, objectCount: 429, logicalBytes: 951000000, physicalReferencedBytes: 590000000,
+      warningCount: 0, metadata: { description: "自动安全快照", tags: [], pinned: false, automatic: true },
+    }];
+    if (command === "list_local_snapshot_trash") return [{ operationId: "019fa1a0-7777-7777-8777-777777777777", snapshotId: "019fa1a0-8888-7888-8888-888888888888", trashedAt: "2026-07-29T12:00:00Z", originalManifestPath: "C:/snapshot.json", trashManifestPath: "C:/trash/snapshot.json" }];
+    if (command === "get_repository_storage_summary") return { logicalBytes: 984811738, repositoryPhysicalBytes: 642000000, activePhysicalBytes: 620000000, sharedPhysicalBytes: 470000000, exclusivePhysicalBytes: 150000000, trashBytes: 12000000, gcQuarantineBytes: 0, reclaimableBytes: 10000000, protectedByJournalBytes: 0 };
+    if (command === "list_recovery_points") return [{ operationId: "019fa1a0-9999-7999-8999-999999999999", kind: "checkout", status: "recovery_required", journalPath: "C:/Users/demo/.codex-session-sync/journal/checkout-019fa1a0.json", targetCodexHome: "C:/Users/demo/.codex", startedAt: "2026-07-31T09:10:00Z", updatedAt: "2026-07-31T09:12:00Z", requiresAttention: true }];
+    if (command === "list_remote_revisions") return [0, 1, 2].map((index) => ({
+      revisionId: `sha256:${String.fromCharCode(99 - index).repeat(64)}`,
+      namespaceId, parentRevision: index === 2 ? null : `sha256:${String.fromCharCode(98 - index).repeat(64)}`,
+      createdAt: `2026-07-${31 - index}T08:10:00Z`, threadCount: 418 - index * 4,
+      objectCount: 440 - index * 5, logicalBytes: 984811738 - index * 20000000,
+      physicalReferencedBytes: 620000000 - index * 10000000, state: "active",
+    }));
+    if (command === "list_remote_history_trash") return [];
     if (command === "get_namespace_mapping_state") return currentMappingState();
     if (command === "get_workspace_mapping_state") return {
       remoteId,

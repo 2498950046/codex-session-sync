@@ -35,3 +35,16 @@ test("runtime status reports active Codex processes", () => {
 
   expect(screen.getByRole("button", { name: /Codex 运行中/ })).toBeInTheDocument();
 });
+
+test("snapshot and recovery is a top-level navigation destination", async () => {
+  const user = userEvent.setup();
+  render(<MemoryRouter initialEntries={["/overview"]}>
+    <AppShell busy={false} onRefreshProcesses={() => undefined} processes={[]}>
+      <Routes><Route path="/history" element={<div>历史工作台</div>} /></Routes>
+    </AppShell>
+  </MemoryRouter>);
+
+  await user.click(screen.getByRole("link", { name: "快照与恢复" }));
+  expect(screen.getByRole("heading", { name: "快照与恢复" })).toBeInTheDocument();
+  expect(screen.getByText("历史工作台")).toBeInTheDocument();
+});

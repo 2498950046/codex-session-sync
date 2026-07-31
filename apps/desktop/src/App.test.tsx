@@ -26,6 +26,15 @@ function response(command: string) {
   if (command === "get_namespace_mapping_state") return { remoteId, automaticEnabled: false, context: { codexHomeKey: "c:/users/test/.codex", provider: "openai", apiKeyAvailable: false, apiKeyFingerprintHint: null, apiKeySource: null, warnings: [] }, mappings: [], selection: { selectedNamespaceId: namespaceId, source: "profile_default", matchedMappingId: null, ambiguousMappingIds: [] } };
   if (command === "get_remote_namespace_status") return { remoteId, namespaceId, active: true, activeRemoteId: remoteId, activeNamespaceId: namespaceId, integratedHead: "sha256:remote", remoteHead: "sha256:remote", generation: 2 };
   if (command === "get_workspace_mapping_state") return { remoteId, namespaceId, codexHomeKey: "c:/users/test/.codex", mappings: [] };
+  if (command === "list_local_snapshots") return [{ snapshotId: "01900000-0000-7000-8000-000000000001", createdAt: "2026-07-31T10:00:00Z", manifestPath: "C:/Users/test/.codex-session-sync/snapshots/01900000-0000-7000-8000-000000000001.json", threadCount: 12, objectCount: 20, logicalBytes: 2048, physicalReferencedBytes: 1024, warningCount: 0, metadata: { description: "发布前", tags: ["manual"], pinned: false, automatic: false } }];
+  if (command === "list_local_snapshot_trash") return [];
+  if (command === "get_repository_storage_summary") return { logicalBytes: 2048, repositoryPhysicalBytes: 1024, activePhysicalBytes: 1024, sharedPhysicalBytes: 512, exclusivePhysicalBytes: 512, trashBytes: 0, gcQuarantineBytes: 0, reclaimableBytes: 0, protectedByJournalBytes: 0 };
+  if (command === "list_recovery_points") return [];
+  if (command === "list_remote_revisions") return [{ revisionId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", namespaceId, parentRevision: null, createdAt: "2026-07-31T09:00:00Z", threadCount: 10, objectCount: 18, logicalBytes: 1800, physicalReferencedBytes: 900, state: "active" }];
+  if (command === "list_remote_history_trash") return [];
+  if (command === "update_snapshot_metadata") return { description: "发布前", tags: ["manual"], pinned: true, automatic: false };
+  if (command === "plan_snapshot_deletion") return { snapshotId: "01900000-0000-7000-8000-000000000001", manifestPath: "C:/Users/test/.codex-session-sync/snapshots/01900000-0000-7000-8000-000000000001.json", pinned: false, sharedObjectCount: 10, exclusiveObjectCount: 10, estimatedReclaimableBytes: 512, planFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+  if (command === "trash_local_snapshot") return { operationId: "01900000-0000-7000-8000-000000000002", snapshotId: "01900000-0000-7000-8000-000000000001", trashedAt: "2026-07-31T11:00:00Z", originalManifestPath: "snapshot.json", trashManifestPath: "trash.json" };
   throw new Error(`Unexpected command in test: ${command}`);
 }
 
@@ -51,5 +60,24 @@ test("ready sync context exposes both directions and process detection gates wri
     expect(screen.getByRole("button", { name: /Codex 运行中/ })).toBeInTheDocument();
     expect(push).toBeDisabled();
     expect(pull).toBeDisabled();
+  });
+});
+
+test("history graph selects snapshots and exposes recoverable local deletion", async () => {
+  const user = userEvent.setup();
+  render(<ThemeProvider><MemoryRouter initialEntries={["/history"]}><App /></MemoryRouter></ThemeProvider>);
+
+  expect(await screen.findByRole("heading", { level: 2, name: "快照与恢复" })).toBeInTheDocument();
+  expect(await screen.findByText("发布前")).toBeInTheDocument();
+  expect(screen.getByLabelText("仓库存储统计")).toHaveTextContent("仓库占用");
+
+  await user.click(screen.getByText("发布前"));
+  expect(await screen.findByRole("button", { name: "精确恢复" })).toBeInTheDocument();
+  await user.click(screen.getAllByRole("button", { name: /移入回收站/ }).at(-1)!);
+  expect(await screen.findByText("将快照移入回收站")).toBeInTheDocument();
+  await user.click(screen.getAllByRole("button", { name: /移入回收站/ }).at(-1)!);
+
+  await waitFor(() => {
+    expect(invokeMock).toHaveBeenCalledWith("trash_local_snapshot", expect.any(Object));
   });
 });

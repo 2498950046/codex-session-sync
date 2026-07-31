@@ -9,15 +9,16 @@ async function bootstrap() {
   const preview = new URLSearchParams(window.location.search).get("preview");
   if (!window.location.hash) {
     const lastRoute = window.localStorage.getItem("codex-session-sync.last-route");
-    const previewRoute = preview === "mapping" ? "/advanced/automatic"
+    const previewRoute = preview === "history" ? "/history"
+      : preview === "mapping" ? "/advanced/automatic"
       : preview === "conflict" || preview === "job" || preview === "failure" ? "/sync"
         : preview === "empty" || preview === "process-running" || preview === "ready" ? "/overview"
           : null;
     window.location.hash = previewRoute ?? (lastRoute?.startsWith("/") ? lastRoute : "/overview");
   }
-  if (import.meta.env.DEV && ["ready", "empty", "process-running", "job", "mapping", "conflict", "failure"].includes(preview ?? "")) {
+  if (import.meta.env.DEV && ["ready", "empty", "process-running", "job", "mapping", "conflict", "failure", "history"].includes(preview ?? "")) {
     const { installDevelopmentPreview } = await import("./dev-conflict-preview");
-    await installDevelopmentPreview(preview as "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure");
+    await installDevelopmentPreview(preview as "ready" | "empty" | "process-running" | "job" | "mapping" | "conflict" | "failure" | "history");
   }
   createRoot(document.getElementById("root")!).render(
     <StrictMode>
