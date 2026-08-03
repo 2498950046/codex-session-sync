@@ -83,7 +83,7 @@ test("history graph selects snapshots and exposes recoverable local deletion", a
   });
 });
 
-test("provider preview hides stale write action while a new preview is pending", async () => {
+test("provider preview disables the always-visible write action while a new preview is pending", async () => {
   const user = userEvent.setup();
   let previewCalls = 0;
   let finishPreview: ((value: ReturnType<typeof response>) => void) | undefined;
@@ -102,10 +102,38 @@ test("provider preview hides stale write action while a new preview is pending",
 
   await user.click(screen.getByRole("button", { name: "预览" }));
   expect(screen.getByRole("button", { name: "预览中…" })).toBeDisabled();
-  expect(screen.queryByRole("button", { name: "备份并同步" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "备份并同步" })).toBeDisabled();
 
   finishPreview?.(response("preview_local_provider_sync"));
   expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
+});
+
+test("provider sync remains available when preview reports zero changes", async () => {
+  const user = userEvent.setup();
+  invokeMock.mockImplementation((command: string) => command === "preview_local_provider_sync"
+    ? Promise.resolve({ provider: "openai", rolloutCount: 0, rolloutBytes: 0, databaseRowCount: 0, noChanges: true, warnings: [] })
+    : Promise.resolve(response(command)));
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+
+  const preview = await screen.findByRole("button", { name: "预览" });
+  await waitFor(() => expect(preview).toBeEnabled());
+  await user.click(preview);
+  expect(await screen.findByText("当前 provider 为 openai，无需同步")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "备份并同步" }));
+  expect(await screen.findByText(/任务将以 0 条改变完成/)).toBeInTheDocument();
+});
+
+test("provider sync is available before running an optional preview", async () => {
+  const user = userEvent.setup();
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+
+  const sync = await screen.findByRole("button", { name: "备份并同步" });
+  await waitFor(() => expect(sync).toBeEnabled());
+  expect(invokeMock).not.toHaveBeenCalledWith("preview_local_provider_sync", expect.anything());
+
+  await user.click(sync);
+  expect(await screen.findByText(/执行阶段会先扫描本机会话/)).toBeInTheDocument();
 });
 
 test("button operation failures open a focused error dialog", async () => {

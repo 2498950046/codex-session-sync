@@ -156,6 +156,7 @@ pub fn synchronize_local_provider(
             targets.push((thread.thread_id.clone(), path));
         }
     }
+    let planned_database_row_count = count_database_rows(&scan.database_paths, &provider)?;
 
     let operation_id = Uuid::now_v7().to_string();
     let backup_dir = repository_root
@@ -190,6 +191,17 @@ pub fn synchronize_local_provider(
     write_journal(&journal_path, &journal)?;
 
     let result = (|| -> Result<(usize, usize)> {
+        if targets.is_empty() && planned_database_row_count == 0 {
+            control.report(OperationProgress {
+                phase: "provider_sync_no_changes".to_string(),
+                message: format!("all sessions already use provider {provider}"),
+                completed: 1,
+                total: Some(1),
+                unit: "checks".to_string(),
+                cancellable: true,
+            });
+            return Ok((0, 0));
+        }
         for (index, (thread_id, target)) in targets.iter().enumerate() {
             control.check_cancelled()?;
             control.report(OperationProgress {
@@ -690,6 +702,17 @@ mod tests {
             preview_provider_sync(&home, &OperationControl::default())
                 .unwrap()
                 .no_changes
+        );
+        let unchanged =
+            synchronize_local_provider(&home, &repository, true, &OperationControl::default())
+                .unwrap();
+        assert_eq!(unchanged.rollout_count, 0);
+        assert_eq!(unchanged.database_row_count, 0);
+        assert_eq!(
+            std::fs::read_dir(unchanged.backup_dir.join("databases"))
+                .unwrap()
+                .count(),
+            0
         );
     }
 
