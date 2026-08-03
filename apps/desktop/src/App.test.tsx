@@ -32,6 +32,7 @@ function response(command: string) {
   if (command === "list_recovery_points") return [];
   if (command === "list_remote_revisions") return [{ revisionId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", namespaceId, parentRevision: null, createdAt: "2026-07-31T09:00:00Z", threadCount: 10, objectCount: 18, logicalBytes: 1800, physicalReferencedBytes: 900, state: "active" }];
   if (command === "list_remote_history_trash") return [];
+  if (command === "preview_local_provider_sync") return { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
   if (command === "update_snapshot_metadata") return { description: "发布前", tags: ["manual"], pinned: true, automatic: false };
   if (command === "plan_snapshot_deletion") return { snapshotId: "01900000-0000-7000-8000-000000000001", manifestPath: "C:/Users/test/.codex-session-sync/snapshots/01900000-0000-7000-8000-000000000001.json", pinned: false, sharedObjectCount: 10, exclusiveObjectCount: 10, estimatedReclaimableBytes: 512, planFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
   if (command === "trash_local_snapshot") return { operationId: "01900000-0000-7000-8000-000000000002", snapshotId: "01900000-0000-7000-8000-000000000001", trashedAt: "2026-07-31T11:00:00Z", originalManifestPath: "snapshot.json", trashManifestPath: "trash.json" };
@@ -80,4 +81,48 @@ test("history graph selects snapshots and exposes recoverable local deletion", a
   await waitFor(() => {
     expect(invokeMock).toHaveBeenCalledWith("trash_local_snapshot", expect.any(Object));
   });
+});
+
+test("provider preview hides stale write action while a new preview is pending", async () => {
+  const user = userEvent.setup();
+  let previewCalls = 0;
+  let finishPreview: ((value: ReturnType<typeof response>) => void) | undefined;
+  invokeMock.mockImplementation((command: string) => {
+    if (command === "preview_local_provider_sync" && previewCalls++ > 0) {
+      return new Promise((resolve) => { finishPreview = resolve; });
+    }
+    return Promise.resolve(response(command));
+  });
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+
+  const preview = await screen.findByRole("button", { name: "预览" });
+  await waitFor(() => expect(preview).toBeEnabled());
+  await user.click(preview);
+  expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
+
+  await user.click(screen.getByRole("button", { name: "预览" }));
+  expect(screen.getByRole("button", { name: "预览中…" })).toBeDisabled();
+  expect(screen.queryByRole("button", { name: "备份并同步" })).not.toBeInTheDocument();
+
+  finishPreview?.(response("preview_local_provider_sync"));
+  expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
+});
+
+test("button operation failures open a focused error dialog", async () => {
+  const user = userEvent.setup();
+  invokeMock.mockImplementation((command: string) => command === "preview_local_provider_sync"
+    ? Promise.reject(new Error("repository is busy"))
+    : Promise.resolve(response(command)));
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+
+  const preview = await screen.findByRole("button", { name: "预览" });
+  await waitFor(() => expect(preview).toBeEnabled());
+  await user.click(preview);
+
+  const dialog = await screen.findByRole("alertdialog", { name: "操作未完成" });
+  expect(dialog).toHaveTextContent("repository is busy");
+  expect(screen.getByRole("button", { name: "知道了" })).toHaveFocus();
+  await user.click(screen.getByRole("button", { name: "知道了" }));
+  expect(screen.queryByRole("alertdialog", { name: "操作未完成" })).not.toBeInTheDocument();
+  expect(preview).toHaveFocus();
 });

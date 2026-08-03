@@ -203,6 +203,38 @@ function ConfirmDialog({ request, onClose }: { request: ConfirmationRequest | nu
   </div>;
 }
 
+function ErrorDialog({ message, onClose }: { message: string | null; onClose: () => void }) {
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!message) return;
+    previousFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+      if (event.key === "Tab") {
+        event.preventDefault();
+        closeRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previousFocus.current?.focus();
+    };
+  }, [message]);
+
+  if (!message) return null;
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="error-dialog" role="alertdialog" aria-modal="true" aria-labelledby="error-dialog-title" aria-describedby="error-dialog-message">
+      <div className="dialog-icon danger"><AlertTriangle size={22} /></div>
+      <div className="dialog-copy"><h2 id="error-dialog-title">操作未完成</h2><p id="error-dialog-message">{message}</p></div>
+      <div className="dialog-actions"><button ref={closeRef} type="button" className="button primary" onClick={onClose}>知道了</button></div>
+    </section>
+  </div>;
+}
+
 function WorkspacePathEditor({
   parentDirectory,
   drafts,
@@ -336,6 +368,7 @@ export default function SessionSyncApp() {
   const [validation, setValidation] = useState<SnapshotValidationReport | null>(null);
   const [importReport, setImportReport] = useState<ImportReport | null>(null);
   const [providerSyncPreview, setProviderSyncPreview] = useState<ProviderSyncPreview | null>(null);
+  const [providerPreviewLoading, setProviderPreviewLoading] = useState(false);
   const [providerSyncReport, setProviderSyncReport] = useState<ProviderSyncReport | null>(null);
   const [recoveredJournal, setRecoveredJournal] = useState<OperationJournal | null>(null);
   const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
@@ -377,8 +410,9 @@ export default function SessionSyncApp() {
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
+  const providerPreviewInFlight = useRef(false);
 
-  const busy = isActive(job) || remoteLoading;
+  const busy = isActive(job) || remoteLoading || providerPreviewLoading;
   const canWrite = processes.length === 0 && isTauriRuntime;
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
   const allWorkspacePathEntries = useMemo<WorkspacePathEntry[]>(() => {
@@ -766,7 +800,7 @@ export default function SessionSyncApp() {
   }
 
   async function start(command: string, payload: Record<string, unknown>, allowWhilePreparing = false) {
-    if (busy && !allowWhilePreparing) return;
+    if ((busy || providerPreviewInFlight.current) && !allowWhilePreparing) return;
     if (command === "start_namespace_switch_job") setConfirmedReplaceTarget(null);
     setError(null);
     try {
@@ -792,7 +826,10 @@ export default function SessionSyncApp() {
   }
 
   async function previewProviderSync() {
-    if (!isTauriRuntime || busy) return;
+    if (!isTauriRuntime || busy || providerPreviewInFlight.current) return;
+    providerPreviewInFlight.current = true;
+    setProviderPreviewLoading(true);
+    setProviderSyncPreview(null);
     setError(null);
     try {
       setProviderSyncPreview(await invoke<ProviderSyncPreview>("preview_local_provider_sync", {
@@ -801,6 +838,9 @@ export default function SessionSyncApp() {
       }));
     } catch (reason) {
       setError(String(reason));
+    } finally {
+      providerPreviewInFlight.current = false;
+      setProviderPreviewLoading(false);
     }
   }
 
@@ -1529,7 +1569,7 @@ export default function SessionSyncApp() {
   const providerSyncSettings = <section className="surface settings-card provider-sync-settings">
     <div className="section-title"><div><h3>会话 Provider</h3><p>将现有本机会话切换到 config.toml 当前配置的 provider，不访问服务器。</p></div><KeyRound size={20} /></div>
     <div className="button-row">
-      <button className="button secondary" onClick={() => void previewProviderSync()} disabled={busy || !codexHome.trim() || !repositoryRoot.trim()}><RefreshCw size={16} />预览</button>
+      <button className="button secondary" onClick={() => void previewProviderSync()} disabled={busy || !codexHome.trim() || !repositoryRoot.trim()}><RefreshCw size={16} />{providerPreviewLoading ? "预览中…" : "预览"}</button>
       {providerSyncPreview && !providerSyncPreview.noChanges && <button className="button warning" onClick={() => setConfirmation({ title: "同步本机会话 Provider", description: <p>将修改 {providerSyncPreview.rolloutCount} 个 rollout 和 {providerSyncPreview.databaseRowCount} 条数据库记录。操作会先创建备份；请确认 Codex 已完全退出。</p>, confirmLabel: "备份并同步", tone: "warning", onConfirm: () => start("start_provider_sync_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy}>备份并同步</button>}
     </div>
     {providerSyncPreview && <div className={`inline-alert ${providerSyncPreview.noChanges ? "success" : "warning"}`}>{providerSyncPreview.noChanges ? <Check size={17} /> : <AlertTriangle size={17} />}<span>{providerSyncPreview.noChanges ? `当前 provider 为 ${providerSyncPreview.provider}，无需同步` : `目标 ${providerSyncPreview.provider} · ${providerSyncPreview.rolloutCount} 个 rollout（${formatBytes(providerSyncPreview.rolloutBytes)}）· ${providerSyncPreview.databaseRowCount} 条 SQLite 记录`}</span></div>}
@@ -1615,7 +1655,6 @@ export default function SessionSyncApp() {
 
   return <AppShell processes={processes} busy={busy} onRefreshProcesses={() => void refreshProcesses()}>
     {processes.length > 0 && <div className="global-process-alert" role="status"><AlertTriangle size={18} /><div><strong>检测到 Codex 正在运行</strong><span>扫描和配置仍可使用；同步、导入、恢复和清理暂时禁用。</span><div className="process-chips">{processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}</div></div></div>}
-    {error && <div className="global-alert" role="alert"><AlertTriangle size={18} /><div><strong>操作未完成</strong><span>{error}</span></div><button type="button" onClick={() => setError(null)} aria-label="关闭错误"><X size={17} /></button></div>}
     <Routes>
       <Route path="/" element={<Navigate to="/overview" replace />} />
       <Route path="/overview" element={<div className="page-stack">
@@ -1639,6 +1678,7 @@ export default function SessionSyncApp() {
 
     {pendingWorkspaceSync && <div className="dialog-backdrop" role="presentation"><section className="workspace-path-modal" role="dialog" aria-modal="true" aria-label="设置本机项目路径"><div className="workspace-modal-heading"><div><span className="overline">同步前路径检查</span><h2>设置本机项目路径</h2></div><button type="button" className="icon-button" onClick={() => setPendingWorkspaceSync(null)} disabled={busy} aria-label="关闭"><X size={19} /></button></div><p>远端会话引用了当前电脑尚不可用的项目路径。选择统一父目录后仍可逐项修改。</p><div className="migration-summary"><strong>{pendingWorkspaceSync.plan.unmappedPaths.length} 项待设置</strong><span>{pendingWorkspaceSync.plan.mappedPathCount} 项已有映射 · {pendingWorkspaceSync.plan.existingPathCount} 项原路径可用</span></div><WorkspacePathEditor parentDirectory={workspaceEditorParent} drafts={workspaceDrafts} busy={busy} submitLabel="保存路径并继续" onParentChange={(value) => changeEditorParent("sync", value)} onTargetChange={(index, value) => setWorkspaceDrafts((current) => current.map((draft, candidate) => candidate === index ? { ...draft, localPath: value } : draft))} onChooseParent={() => void chooseEditorParent("sync")} onChooseTarget={(index) => void chooseEditorTarget("sync", index)} onSubmit={() => void saveWorkspaceDraftsAndContinue()} onCancel={() => setPendingWorkspaceSync(null)} /></section></div>}
     <ConfirmDialog request={confirmation} onClose={() => setConfirmation(null)} />
+    <ErrorDialog message={error} onClose={() => setError(null)} />
     {job && <aside className={`task-center ${jobFailure ? "failed" : ""}`} aria-live="polite"><div className="task-center-heading"><div><span className="overline">{job.kind} · {job.state}</span><strong>{jobFailure ? "任务失败" : job.progress.phase.replaceAll("_", " ")}</strong></div>{!isActive(job) && <button className="icon-button" onClick={() => setJob(null)} aria-label="关闭任务"><X size={17} /></button>}</div><p>{jobFailure ?? job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><div className="task-center-footer"><small>{progressPercent === null ? `${job.progress.completed} ${job.progress.unit}` : `${progressPercent}% · ${job.progress.completed}/${job.progress.total} ${job.progress.unit}`}</small>{isActive(job) && <button className="button danger small" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button>}</div></aside>}
   </AppShell>;
 
