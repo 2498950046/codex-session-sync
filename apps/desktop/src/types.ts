@@ -106,7 +106,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "pull" | "resolve" | "switch" | "remap";
+  kind: "scan" | "snapshot" | "validate" | "import" | "provider_sync_preview" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "pull" | "resolve" | "switch" | "remap";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;

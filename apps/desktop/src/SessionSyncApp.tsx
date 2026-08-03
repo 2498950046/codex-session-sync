@@ -413,6 +413,8 @@ export default function SessionSyncApp() {
   const providerPreviewInFlight = useRef(false);
 
   const busy = isActive(job) || remoteLoading || providerPreviewLoading;
+  const providerPreviewActive = providerPreviewLoading
+    || (job?.kind === "provider_sync_preview" && isActive(job));
   const canWrite = processes.length === 0 && isTauriRuntime;
   const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
   const allWorkspacePathEntries = useMemo<WorkspacePathEntry[]>(() => {
@@ -748,6 +750,7 @@ export default function SessionSyncApp() {
       await refreshHistory();
     }
     if (completed.kind === "validate") setValidation(result as SnapshotValidationReport);
+    if (completed.kind === "provider_sync_preview") setProviderSyncPreview(result as ProviderSyncPreview);
     if (completed.kind === "import") {
       const imported = result as ImportReport;
       setImportReport(imported);
@@ -832,7 +835,7 @@ export default function SessionSyncApp() {
     setProviderSyncPreview(null);
     setError(null);
     try {
-      setProviderSyncPreview(await invoke<ProviderSyncPreview>("preview_local_provider_sync", {
+      setJob(await invoke<JobSnapshot>("start_provider_sync_preview_job", {
         codexHome: codexHome.trim(),
         repositoryRoot: repositoryRoot.trim(),
       }));
@@ -1566,16 +1569,17 @@ export default function SessionSyncApp() {
     <div className="mapping-list">{mappingState.mappings.map((mapping) => { const target = namespaces.find((namespace) => namespace.id === mapping.namespaceId); return <article className="mapping-card" key={mapping.id}><div><strong>{mapping.label}</strong><span>→ {target?.displayName ?? mapping.namespaceId}</span></div><div className="mapping-tags">{mapping.matchesApiKey && <code>KEY {mapping.apiKeyFingerprintHint}</code>}{mapping.provider && <code>PROVIDER {mapping.provider}</code>}{mapping.codexHomeKey && <code>HOME {mapping.codexHomeKey}</code>}</div><button className="button danger small" onClick={() => void deleteMapping(mapping.id)} disabled={busy}>删除</button></article>; })}{mappingState.mappings.length === 0 && <p className="muted-copy">尚未创建本机映射规则。</p>}</div>
   </section> : <section className="surface empty-card"><KeyRound size={28} /><h3>请先选择远端服务器</h3><p>自动选择规则按远端分别保存。</p></section>;
 
-  const providerSyncSettings = <section className="surface settings-card provider-sync-settings">
-    <div className="section-title"><div><h3>会话 Provider</h3><p>将现有本机会话切换到 config.toml 当前配置的 provider，不访问服务器。</p></div><KeyRound size={20} /></div>
+  const providerSyncSettings = location.pathname === "/sync" ? <section className="surface settings-card provider-sync-settings">
+    <div className="section-title"><div><h3>本地会话同步</h3><p>将现有本机会话切换到 config.toml 当前配置的 provider，不访问服务器。</p></div><KeyRound size={20} /></div>
+    <div className="provider-sync-scope" aria-label="Provider 同步范围"><span>同步范围：</span><b>活动会话</b><b>归档会话</b></div>
     <div className="button-row">
-      <button className="button secondary" onClick={() => void previewProviderSync()} disabled={busy || !codexHome.trim() || !repositoryRoot.trim()}><RefreshCw size={16} />{providerPreviewLoading ? "预览中…" : "预览"}</button>
+      <button className="button secondary" onClick={() => void previewProviderSync()} disabled={busy || !codexHome.trim() || !repositoryRoot.trim()}><RefreshCw size={16} />{providerPreviewActive ? "预览中…" : "预览"}</button>
       <button className="button warning" onClick={() => setConfirmation({ title: "同步本机会话 Provider", description: !providerSyncPreview ? <p>执行阶段会先扫描本机会话，再将需要修改的记录同步到 config.toml 当前配置的 Provider；如果已经一致，任务将以 0 条改变完成。请确认 Codex 已完全退出。</p> : providerSyncPreview.noChanges ? <p>当前预览没有发现需要修改的记录。执行时会重新扫描；如果 Provider 仍然一致，任务将以 0 条改变完成。请确认 Codex 已完全退出。</p> : <p>当前预览发现 {providerSyncPreview.rolloutCount} 个 rollout 和 {providerSyncPreview.databaseRowCount} 条数据库记录需要修改。执行时会重新扫描并先创建备份；请确认 Codex 已完全退出。</p>, confirmLabel: "备份并同步", tone: "warning", onConfirm: () => start("start_provider_sync_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy || !codexHome.trim() || !repositoryRoot.trim()}>备份并同步</button>
     </div>
     {providerSyncPreview && <div className={`inline-alert ${providerSyncPreview.noChanges ? "success" : "warning"}`}>{providerSyncPreview.noChanges ? <Check size={17} /> : <AlertTriangle size={17} />}<span>{providerSyncPreview.noChanges ? `当前 provider 为 ${providerSyncPreview.provider}，无需同步` : `目标 ${providerSyncPreview.provider} · ${providerSyncPreview.rolloutCount} 个 rollout（${formatBytes(providerSyncPreview.rolloutBytes)}）· ${providerSyncPreview.databaseRowCount} 条 SQLite 记录`}</span></div>}
     {providerSyncPreview && providerSyncPreview.warnings.length > 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><span>扫描发现 {providerSyncPreview.warnings.length} 条警告；对应文件会保持原样并跳过。</span></div>}
     {providerSyncReport && <div className="inline-alert success"><Check size={17} /><span>{providerSyncReport.rolloutCount === 0 && providerSyncReport.databaseRowCount === 0 ? `检查完成：Provider 已是 ${providerSyncReport.provider}，0 条改变` : `已同步到 ${providerSyncReport.provider}：${providerSyncReport.rolloutCount} 个 rollout、${providerSyncReport.databaseRowCount} 条 SQLite 记录发生改变；备份保存在 ${providerSyncReport.backupDir}`}</span></div>}
-  </section>;
+  </section> : null;
 
   const projectTools = selectedNamespace && workspaceMappingState ? <>
     {workspacePathFilterPanel}
@@ -1664,6 +1668,7 @@ export default function SessionSyncApp() {
       </div>} />
       <Route path="/sync" element={<div className="page-stack compact-stack">
         <PageIntro title="同步会话" description="明确选择同步方向；写入前会再次检查 Codex 进程和项目路径。" />
+        {providerSyncSettings}
         <section className="surface context-selector"><div className="field"><label>Codex Home</label><button className="selector-display" onClick={() => navigate("/settings")} title={codexHome}>{codexHome || "未设置"}<Settings size={15} /></button></div><div className="field"><label htmlFor="sync-remote">远端服务器</label><select id="sync-remote" value={selectedRemoteId} onChange={(event) => setSelectedRemoteId(event.target.value)} disabled={busy}><option value="">请选择远端</option>{profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.displayName}</option>)}</select></div><div className="field"><label htmlFor="sync-namespace">命名空间</label><select id="sync-namespace" value={selectedNamespaceId} onChange={(event) => void chooseNamespace(event.target.value)} disabled={busy || !selectedRemoteId}><option value="">请选择命名空间</option>{namespaces.map((namespace) => <option key={namespace.id} value={namespace.id}>{namespace.displayName}</option>)}</select>{mappingState && <small>{selectionSourceLabel(mappingState.selection.source)}</small>}</div></section>
         {syncStatusPanel}<section className="surface sync-version-log"><div className="section-title"><div><h3>版本图谱</h3><p>本地快照与当前远端命名空间共享同一种 IDEA 风格版本日志。</p></div><button className="text-button" onClick={() => navigate("/history")}>打开快照与恢复</button></div><VersionGraphTable rows={syncVersionRows} selectedId={selectedHistoryId} onSelect={(row) => { setSelectedHistoryId(row.id); navigate("/history"); setHistorySource(row.kind); }} /></section>{syncResultPanel}
       </div>} />

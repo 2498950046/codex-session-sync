@@ -16,6 +16,21 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 const remoteId = "remote-1";
 const namespaceId = "namespace-1";
 let runningProcesses = false;
+let providerPreviewResult = { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
+
+function providerPreviewJob(state: "running" | "completed") {
+  return {
+    jobId: "provider-preview-1",
+    kind: "provider_sync_preview",
+    state,
+    progress: state === "running"
+      ? { phase: "scan_rollouts", message: "正在扫描活动与归档会话", completed: 120, total: 418, unit: "rollouts", cancellable: true }
+      : { phase: "completed", message: "任务已完成", completed: 1, total: 1, unit: "tasks", cancellable: false },
+    cancellable: state === "running",
+    resultReady: state === "completed",
+    error: null,
+  };
+}
 
 function response(command: string) {
   if (command === "get_default_codex_home") return "C:/Users/test/.codex";
@@ -32,7 +47,9 @@ function response(command: string) {
   if (command === "list_recovery_points") return [];
   if (command === "list_remote_revisions") return [{ revisionId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", namespaceId, parentRevision: null, createdAt: "2026-07-31T09:00:00Z", threadCount: 10, objectCount: 18, logicalBytes: 1800, physicalReferencedBytes: 900, state: "active" }];
   if (command === "list_remote_history_trash") return [];
-  if (command === "preview_local_provider_sync") return { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
+  if (command === "start_provider_sync_preview_job") return providerPreviewJob("running");
+  if (command === "get_job") return providerPreviewJob("completed");
+  if (command === "take_job_result") return providerPreviewResult;
   if (command === "update_snapshot_metadata") return { description: "发布前", tags: ["manual"], pinned: true, automatic: false };
   if (command === "plan_snapshot_deletion") return { snapshotId: "01900000-0000-7000-8000-000000000001", manifestPath: "C:/Users/test/.codex-session-sync/snapshots/01900000-0000-7000-8000-000000000001.json", pinned: false, sharedObjectCount: 10, exclusiveObjectCount: 10, estimatedReclaimableBytes: 512, planFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
   if (command === "trash_local_snapshot") return { operationId: "01900000-0000-7000-8000-000000000002", snapshotId: "01900000-0000-7000-8000-000000000001", trashedAt: "2026-07-31T11:00:00Z", originalManifestPath: "snapshot.json", trashManifestPath: "trash.json" };
@@ -41,6 +58,7 @@ function response(command: string) {
 
 beforeEach(() => {
   runningProcesses = false;
+  providerPreviewResult = { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
   invokeMock.mockImplementation((command: string) => Promise.resolve(response(command)));
   Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
 });
@@ -83,37 +101,32 @@ test("history graph selects snapshots and exposes recoverable local deletion", a
   });
 });
 
-test("provider preview disables the always-visible write action while a new preview is pending", async () => {
+test("provider preview runs as a progress job and disables the write action", async () => {
   const user = userEvent.setup();
-  let previewCalls = 0;
-  let finishPreview: ((value: ReturnType<typeof response>) => void) | undefined;
-  invokeMock.mockImplementation((command: string) => {
-    if (command === "preview_local_provider_sync" && previewCalls++ > 0) {
-      return new Promise((resolve) => { finishPreview = resolve; });
-    }
-    return Promise.resolve(response(command));
-  });
-  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
 
   const preview = await screen.findByRole("button", { name: "预览" });
+  expect(screen.getByLabelText("Provider 同步范围")).toHaveTextContent("同步范围：活动会话归档会话");
   await waitFor(() => expect(preview).toBeEnabled());
   await user.click(preview);
-  expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
-
-  await user.click(screen.getByRole("button", { name: "预览" }));
-  expect(screen.getByRole("button", { name: "预览中…" })).toBeDisabled();
+  expect(await screen.findByText("provider_sync_preview · running")).toBeInTheDocument();
+  expect(screen.getByText("正在扫描活动与归档会话")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "备份并同步" })).toBeDisabled();
-
-  finishPreview?.(response("preview_local_provider_sync"));
+  expect(await screen.findByText(/目标 openai/)).toBeInTheDocument();
   expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
+});
+
+test("provider sync panel is no longer rendered in settings", async () => {
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+
+  expect(await screen.findByRole("heading", { level: 2, name: "设置" })).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { level: 3, name: "会话 Provider" })).not.toBeInTheDocument();
 });
 
 test("provider sync remains available when preview reports zero changes", async () => {
   const user = userEvent.setup();
-  invokeMock.mockImplementation((command: string) => command === "preview_local_provider_sync"
-    ? Promise.resolve({ provider: "openai", rolloutCount: 0, rolloutBytes: 0, databaseRowCount: 0, noChanges: true, warnings: [] })
-    : Promise.resolve(response(command)));
-  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+  providerPreviewResult = { provider: "openai", rolloutCount: 0, rolloutBytes: 0, databaseRowCount: 0, noChanges: true, warnings: [] };
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
 
   const preview = await screen.findByRole("button", { name: "预览" });
   await waitFor(() => expect(preview).toBeEnabled());
@@ -126,11 +139,11 @@ test("provider sync remains available when preview reports zero changes", async 
 
 test("provider sync is available before running an optional preview", async () => {
   const user = userEvent.setup();
-  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
 
   const sync = await screen.findByRole("button", { name: "备份并同步" });
   await waitFor(() => expect(sync).toBeEnabled());
-  expect(invokeMock).not.toHaveBeenCalledWith("preview_local_provider_sync", expect.anything());
+  expect(invokeMock).not.toHaveBeenCalledWith("start_provider_sync_preview_job", expect.anything());
 
   await user.click(sync);
   expect(await screen.findByText(/执行阶段会先扫描本机会话/)).toBeInTheDocument();
@@ -138,10 +151,10 @@ test("provider sync is available before running an optional preview", async () =
 
 test("button operation failures open a focused error dialog", async () => {
   const user = userEvent.setup();
-  invokeMock.mockImplementation((command: string) => command === "preview_local_provider_sync"
+  invokeMock.mockImplementation((command: string) => command === "start_provider_sync_preview_job"
     ? Promise.reject(new Error("repository is busy"))
     : Promise.resolve(response(command)));
-  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
 
   const preview = await screen.findByRole("button", { name: "预览" });
   await waitFor(() => expect(preview).toBeEnabled());

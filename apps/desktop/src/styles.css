@@ -397,6 +397,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .settings-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 14px; }
 .settings-card { display: grid; gap: 14px; }
 .settings-card > .section-title { margin-bottom: 0; }
+.provider-sync-scope { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; color: var(--text-muted); font-size: 10px; }
+.provider-sync-scope b { padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-secondary); background: var(--surface-subtle); font-size: 9px; }
 .theme-options { display: grid; gap: 7px; }
 .theme-options button { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-secondary); background: var(--surface-subtle); text-align: left; }
 .theme-options button.selected { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }

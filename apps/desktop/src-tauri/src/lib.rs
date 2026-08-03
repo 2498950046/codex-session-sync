@@ -28,15 +28,15 @@ use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
     CheckoutJournal, GcPlan, ImportReport, LocalSnapshotListItem, OperationJournal,
-    ProviderSyncJournal, ProviderSyncPreview, QuarantinedRollout, RepositoryStorageSummary,
-    ScanDashboardReport, SnapshotDeletionPlan, SnapshotDiff, SnapshotMetadata, SnapshotSummary,
-    SnapshotTrashEntry, SnapshotValidationReport, ThreadConflictResolution, TrackingStore,
-    create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
-    default_repository_root, detect_codex_processes, import_local_snapshot,
-    import_local_snapshot_with_control, preview_provider_sync, quarantine_empty_rollout,
-    recover_checkout_operation, recover_incomplete_operation, recover_provider_sync,
-    scan_codex_home_dashboard, scan_codex_home_dashboard_with_control, synchronize_local_provider,
-    validate_local_snapshot, validate_local_snapshot_with_control,
+    ProviderSyncJournal, QuarantinedRollout, RepositoryStorageSummary, ScanDashboardReport,
+    SnapshotDeletionPlan, SnapshotDiff, SnapshotMetadata, SnapshotSummary, SnapshotTrashEntry,
+    SnapshotValidationReport, ThreadConflictResolution, TrackingStore, create_local_snapshot,
+    create_local_snapshot_with_control, default_codex_home, default_repository_root,
+    detect_codex_processes, import_local_snapshot, import_local_snapshot_with_control,
+    preview_provider_sync, quarantine_empty_rollout, recover_checkout_operation,
+    recover_incomplete_operation, recover_provider_sync, scan_codex_home_dashboard,
+    scan_codex_home_dashboard_with_control, synchronize_local_provider, validate_local_snapshot,
+    validate_local_snapshot_with_control,
 };
 use tauri::State;
 use uuid::Uuid;
@@ -714,21 +714,19 @@ fn start_scan_job(jobs: State<'_, JobManager>, codex_home: Option<String>) -> Jo
 }
 
 #[tauri::command]
-async fn preview_local_provider_sync(
+fn start_provider_sync_preview_job(
     jobs: State<'_, JobManager>,
     codex_home: Option<String>,
     repository_root: Option<String>,
-) -> Result<ProviderSyncPreview, String> {
+) -> Result<JobSnapshot, String> {
     let home = resolve_codex_home(codex_home);
     let repository = resolve_repository_root(repository_root);
-    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let _repository_lease = repository_lease;
-        preview_provider_sync(home, &sync_core::OperationControl::default())
-    })
-    .await
-    .map_err(|error| error.to_string())?
-    .map_err(|error| error.to_string())
+    jobs.start_repository_shared(
+        &repository.clone(),
+        "provider_sync_preview",
+        true,
+        move |control| preview_provider_sync(home, &control),
+    )
 }
 
 #[tauri::command]
@@ -1909,7 +1907,7 @@ pub fn run() {
             recover_operation,
             list_codex_processes,
             start_scan_job,
-            preview_local_provider_sync,
+            start_provider_sync_preview_job,
             start_provider_sync_job,
             start_snapshot_job,
             start_validation_job,
