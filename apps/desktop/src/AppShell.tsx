@@ -77,7 +77,7 @@ export function AppShell({ children, processes, busy, onRefreshProcesses }: AppS
       </nav>
       <div className="sidebar-footer">
         <SlidersHorizontal size={17} aria-hidden="true" />
-        <span>本地优先 · 自托管</span>
+        <span>酱鱼2498950046@qq.com</span>
       </div>
     </aside>
 

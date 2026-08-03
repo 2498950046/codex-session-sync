@@ -1086,7 +1086,7 @@ pub fn collect_snapshot_graph(
             sha256: thread_ref.descriptor_sha256.clone(),
             byte_length: descriptor_length,
         });
-        let descriptor: ThreadDescriptorV3 = store.read_json(
+        let descriptor: LocalThreadDescriptorV3 = store.read_json(
             StorageObjectKind::Thread,
             &thread_ref.descriptor_sha256,
             MAX_STRUCTURED_OBJECT_BYTES,
@@ -1363,7 +1363,7 @@ pub fn list_local_snapshots(repository_root: &Path) -> Result<Vec<LocalSnapshotL
         let graph = collect_snapshot_graph(&root, &store)?;
         let mut logical_bytes = 0_u64;
         for reference in &root.threads {
-            let descriptor: ThreadDescriptorV3 = store.read_json(
+            let descriptor: LocalThreadDescriptorV3 = store.read_json(
                 StorageObjectKind::Thread,
                 &reference.descriptor_sha256,
                 MAX_STRUCTURED_OBJECT_BYTES,
@@ -2374,6 +2374,60 @@ mod tests {
                 .join(orphan_ref.sha256.strip_prefix("sha256:").unwrap())
                 .exists()
         );
+    }
+
+    #[test]
+    fn local_snapshot_graph_accepts_local_provider_metadata() {
+        let temp = tempdir().unwrap();
+        let store = FilesystemContentStore::open(temp.path()).unwrap();
+        let source = temp.path().join("provider-rollout");
+        fs::write(&source, b"provider-local").unwrap();
+        let content = store.ingest(&source, &OperationControl::default()).unwrap();
+        let bundle = ThreadBundle {
+            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+            thread_id: "provider-thread".to_string(),
+            title: "Provider thread".to_string(),
+            archived: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            model_provider: Some("custom".to_string()),
+            workspace: WorkspaceRef::default(),
+            rollout: ContentObject {
+                sha256: content.logical_sha256.clone(),
+                byte_length: content.byte_length,
+                media_type: "application/x-ndjson".to_string(),
+                logical_path: Some("sessions/rollout-provider-thread.jsonl".to_string()),
+                source_path: None,
+                storage: Some(content.storage.clone()),
+            },
+            related_records: RelatedRecords {
+                source_database: None,
+                tables: BTreeMap::from([(
+                    "threads".to_string(),
+                    vec![serde_json::json!({
+                        "id": "provider-thread",
+                        "model_provider": "custom"
+                    })],
+                )]),
+            },
+            attachments: Vec::new(),
+        };
+        let snapshot = LocalSnapshot {
+            schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: Uuid::now_v7().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            threads: vec![bundle],
+            warning_count: 0,
+        };
+        write_v3_snapshot(
+            &snapshot,
+            &BTreeMap::from([("provider-thread".to_string(), content)]),
+            temp.path(),
+        )
+        .unwrap();
+
+        assert_eq!(list_local_snapshots(temp.path()).unwrap().len(), 1);
+        assert_eq!(plan_local_gc(temp.path()).unwrap().unreachable_objects, []);
     }
 
     #[test]

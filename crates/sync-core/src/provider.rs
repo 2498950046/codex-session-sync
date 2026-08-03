@@ -248,7 +248,8 @@ pub(crate) fn transform_rollout_file(
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        let transformed = transform_jsonl_line(&line, thread_id, target_provider)?;
+        let transformed =
+            transform_jsonl_line(&line, thread_id, target_provider, !found_session_meta)?;
         found_session_meta |= transformed.is_some();
         let bytes = transformed.as_deref().unwrap_or(&line);
         writer.write_all(bytes)?;
@@ -273,6 +274,7 @@ fn transform_jsonl_line(
     line: &[u8],
     thread_id: &str,
     target_provider: &str,
+    require_thread_id_match: bool,
 ) -> Result<Option<Vec<u8>>> {
     let (body, ending) = if let Some(body) = line.strip_suffix(b"\r\n") {
         (body, b"\r\n".as_slice())
@@ -291,9 +293,7 @@ fn transform_jsonl_line(
         .get_mut("payload")
         .and_then(Value::as_object_mut)
         .context("rollout session_meta payload is not an object")?;
-    if let Some(id) = payload.get("id").and_then(Value::as_str)
-        && id != thread_id
-    {
+    if require_thread_id_match && payload.get("id").and_then(Value::as_str) != Some(thread_id) {
         bail!("rollout session_meta thread ID does not match {thread_id}");
     }
     payload.insert(
@@ -320,6 +320,7 @@ mod tests {
                 .unwrap(),
             "thread",
             REMOTE_PROVIDER_PLACEHOLDER,
+            true,
         )
         .unwrap()
         .unwrap();
@@ -330,6 +331,7 @@ mod tests {
                 .unwrap(),
             "thread",
             REMOTE_PROVIDER_PLACEHOLDER,
+            true,
         )
         .unwrap()
         .unwrap();
@@ -340,8 +342,75 @@ mod tests {
     fn non_session_meta_bytes_are_unchanged() {
         let line = b"  {not valid json}\r\n";
         assert_eq!(
-            transform_jsonl_line(line, "thread", "custom").unwrap(),
+            transform_jsonl_line(line, "thread", "custom", true).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn provider_transform_allows_embedded_session_metadata_from_another_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        let destination = directory.path().join("destination.jsonl");
+        fs::write(
+            &source,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"current\",\"model_provider\":\"custom\"}}\n",
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"source\",\"model_provider\":\"custom\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        transform_rollout_file(
+            &source,
+            &destination,
+            "current",
+            REMOTE_PROVIDER_PLACEHOLDER,
+            &OperationControl::default(),
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(destination).unwrap();
+        let records = output
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records[0]["payload"]["id"], "current");
+        assert_eq!(records[1]["payload"]["id"], "source");
+        assert_eq!(
+            records[0]["payload"]["model_provider"],
+            REMOTE_PROVIDER_PLACEHOLDER
+        );
+        assert_eq!(
+            records[1]["payload"]["model_provider"],
+            REMOTE_PROVIDER_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn provider_transform_rejects_a_mismatched_primary_session_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        let destination = directory.path().join("destination.jsonl");
+        fs::write(
+            &source,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\",\"model_provider\":\"custom\"}}\n",
+        )
+        .unwrap();
+
+        let error = transform_rollout_file(
+            &source,
+            &destination,
+            "current",
+            REMOTE_PROVIDER_PLACEHOLDER,
+            &OperationControl::default(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("rollout session_meta thread ID does not match current")
         );
     }
 }
