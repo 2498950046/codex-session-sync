@@ -439,6 +439,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .workspace-path-summary { display: flex; align-items: center; gap: 7px; padding: 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-subtle); }
 .workspace-path-summary > span { padding: 3px 7px; border-radius: 999px; color: var(--text-secondary); background: var(--surface); font-size: 9px; font-weight: 750; }
 .workspace-path-summary > .button { margin-left: auto; }
+.workspace-path-filter { display: grid; grid-template-columns: auto minmax(130px, .45fr) auto minmax(160px, .8fr) auto; gap: 7px 9px; align-items: center; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
+.workspace-path-filter label { color: var(--text-muted); font-size: 9px; font-weight: 800; }
+.workspace-path-filter select, .workspace-path-filter input { min-width: 0; height: 32px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 7px; color: var(--text); background: var(--surface-subtle); font-size: 10px; }
+.workspace-path-filter-count { color: var(--text-secondary); font-size: 9px; font-weight: 750; white-space: nowrap; }
+.workspace-path-filter small { grid-column: 1 / -1; color: var(--text-muted); font-size: 8px; }
 .workspace-path-list { display: grid; gap: 7px; }
 .workspace-path-list > article { min-width: 0; display: grid; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-subtle); }
 .workspace-path-list > article.workspace-path-cleanable { border-color: color-mix(in srgb, var(--warning) 30%, var(--border)); background: var(--warning-soft); }
@@ -573,6 +578,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .subnavigation { overflow-x: auto; }
   .subnavigation a { flex: 0 0 auto; }
   .workspace-path-summary > .button { margin-left: 0; }
+  .workspace-path-filter { grid-template-columns: auto minmax(0, 1fr); }
+  .workspace-path-filter-count, .workspace-path-filter small { grid-column: 1 / -1; }
   .workspace-path-badges { justify-content: flex-start; }
   .path-picker-row { grid-template-columns: 1fr; }
   .history-workbench { grid-template-columns: 1fr; }

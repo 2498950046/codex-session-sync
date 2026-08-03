@@ -58,6 +58,25 @@ export type ImportReport = {
   journalPath: string;
 };
 
+export type ProviderSyncPreview = {
+  provider: string;
+  rolloutCount: number;
+  rolloutBytes: number;
+  databaseRowCount: number;
+  catalogDatabaseCount: number;
+  warnings: ScanWarning[];
+  noChanges: boolean;
+};
+
+export type ProviderSyncReport = {
+  operationId: string;
+  provider: string;
+  rolloutCount: number;
+  databaseRowCount: number;
+  backupDir: string;
+  journalPath: string;
+};
+
 export type OperationJournal = {
   operationId: string;
   snapshotId: string;
@@ -87,7 +106,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "pull" | "resolve" | "switch" | "remap";
+  kind: "scan" | "snapshot" | "validate" | "import" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "pull" | "resolve" | "switch" | "remap";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
@@ -266,7 +285,7 @@ export type RepositoryStorageSummary = {
 
 export type RecoveryPoint = {
   operationId: string;
-  kind: "import" | "checkout";
+  kind: "import" | "checkout" | "provider_sync";
   status: string;
   journalPath: string;
   targetCodexHome: string;
@@ -294,6 +313,8 @@ export type WorkspaceMappingState = {
 };
 
 export type WorkspaceDirectoryState = "unknown" | "missing" | "empty" | "nonEmpty" | "notDirectory";
+
+export type WorkspacePathFilter = "all" | "active" | "archived" | "codexProject" | "mapped" | "cleanup";
 
 export type WorkspacePathEntry = {
   path: string;

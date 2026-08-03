@@ -22,8 +22,8 @@ use crate::models::{
 };
 use crate::operation::{OperationControl, OperationProgress};
 use crate::protocol::{ObjectDescriptor, validate_sha256};
-use crate::storage_v2::{
-    ContentStore, FilesystemContentStore, StorageRef, load_v2_snapshot, write_v2_snapshot,
+use crate::storage_v3::{
+    ContentStore, FilesystemContentStore, StorageRef, load_v3_snapshot, write_v3_snapshot,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,7 +38,7 @@ struct BackupManifest {
 #[derive(Debug)]
 struct PreparedThread {
     bundle: ThreadBundle,
-    content: crate::storage_v2::ContentRef,
+    content: crate::storage_v3::ContentRef,
     repository_root: PathBuf,
     target_path: PathBuf,
     temporary_path: PathBuf,
@@ -87,7 +87,7 @@ pub fn default_repository_root() -> PathBuf {
 pub fn load_local_snapshot(manifest_path: impl AsRef<Path>) -> Result<LocalSnapshot> {
     let manifest_path = manifest_path.as_ref();
     let repository_root = snapshot_repository_root(manifest_path)?;
-    let snapshot = load_v2_snapshot(manifest_path, &repository_root)?.0;
+    let snapshot = load_v3_snapshot(manifest_path, &repository_root)?.0;
     validate_snapshot_structure(&snapshot)?;
     Ok(snapshot)
 }
@@ -109,7 +109,7 @@ pub fn store_local_snapshot(
             ))
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
-    write_v2_snapshot(snapshot, &contents, repository_root)
+    write_v3_snapshot(snapshot, &contents, repository_root)
 }
 
 pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<ObjectDescriptor>> {
@@ -140,9 +140,9 @@ pub fn collect_object_descriptors(threads: &[ThreadBundle]) -> Result<Vec<Object
 }
 
 pub fn repository_object_path(repository_root: impl AsRef<Path>, sha256: &str) -> Result<PathBuf> {
-    crate::storage_v2::typed_object_path(
+    crate::storage_v3::typed_object_path(
         repository_root.as_ref(),
-        crate::storage_v2::StorageObjectKind::Whole,
+        crate::storage_v3::StorageObjectKind::Whole,
         sha256,
     )
 }
@@ -165,9 +165,9 @@ pub fn install_repository_object<R: Read>(
         .map_err(|_| anyhow::anyhow!("invalid content object hash {}", descriptor.sha256))?;
     let repository_root = repository_root.as_ref();
     ensure_repository_layout(repository_root)?;
-    let destination = crate::storage_v2::typed_object_path(
+    let destination = crate::storage_v3::typed_object_path(
         repository_root,
-        crate::storage_v2::StorageObjectKind::Whole,
+        crate::storage_v3::StorageObjectKind::Whole,
         &descriptor.sha256,
     )?;
     if destination.exists() {
@@ -270,9 +270,9 @@ pub(crate) fn install_prepared_repository_object(
             metadata.len()
         );
     }
-    let destination = crate::storage_v2::typed_object_path(
+    let destination = crate::storage_v3::typed_object_path(
         repository_root,
-        crate::storage_v2::StorageObjectKind::Whole,
+        crate::storage_v3::StorageObjectKind::Whole,
         &descriptor.sha256,
     )?;
     if destination.exists() {
@@ -365,14 +365,14 @@ pub fn create_local_snapshot_with_control(
         .map(|thread| {
             Ok((
                 thread.thread_id.clone(),
-                crate::storage_v2::ContentRef {
+                crate::storage_v3::ContentRef {
                     logical_sha256: thread.rollout.sha256.clone(),
                     byte_length: thread.rollout.byte_length,
                     storage: thread
                         .rollout
                         .storage
                         .clone()
-                        .context("snapshot rollout has no v2 storage reference")?,
+                        .context("snapshot rollout has no v3 storage reference")?,
                     media_type: Some(thread.rollout.media_type.clone()),
                     logical_path: thread.rollout.logical_path.clone(),
                 },
@@ -385,7 +385,7 @@ pub fn create_local_snapshot_with_control(
         "正在写入快照清单",
     ));
     atomic_write_json(&index_path, &source_index)?;
-    let manifest_path = write_v2_snapshot(&snapshot, &contents, repository_root)?;
+    let manifest_path = write_v3_snapshot(&snapshot, &contents, repository_root)?;
 
     Ok(SnapshotSummary {
         snapshot_id,
@@ -441,7 +441,7 @@ pub fn validate_local_snapshot_with_control(
             .and_then(|thread| thread.rollout.storage.clone())
         {
             FilesystemContentStore::open(repository_root.to_path_buf())?.validate(
-                &crate::storage_v2::ContentRef {
+                &crate::storage_v3::ContentRef {
                     logical_sha256: descriptor.sha256.clone(),
                     byte_length: descriptor.byte_length,
                     storage,
@@ -1192,7 +1192,15 @@ pub(crate) fn ensure_repository_layout(root: &Path) -> Result<()> {
 }
 
 fn source_object_index_path(root: &Path) -> PathBuf {
-    root.join("index").join("source-objects-v2.json")
+    root.join("index").join("source-objects-v3.json")
+}
+
+pub(crate) fn invalidate_source_object_index(root: &Path) -> Result<()> {
+    let path = source_object_index_path(root);
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn load_source_object_index(path: &Path) -> SourceObjectIndex {
@@ -1255,7 +1263,7 @@ fn store_snapshot_object(
         && entry.modified_unix_nanos == before.modified_unix_nanos
         && let Some(storage) = entry.storage.clone()
     {
-        let content = crate::storage_v2::ContentRef {
+        let content = crate::storage_v3::ContentRef {
             logical_sha256: entry.sha256.clone(),
             byte_length: entry.byte_length,
             storage: storage.clone(),
@@ -1293,14 +1301,14 @@ fn store_snapshot_object(
     Ok((sha256, storage))
 }
 
-fn content_ref_from_object(object: &crate::ContentObject) -> Result<crate::storage_v2::ContentRef> {
-    Ok(crate::storage_v2::ContentRef {
+fn content_ref_from_object(object: &crate::ContentObject) -> Result<crate::storage_v3::ContentRef> {
+    Ok(crate::storage_v3::ContentRef {
         logical_sha256: object.sha256.clone(),
         byte_length: object.byte_length,
         storage: object
             .storage
             .clone()
-            .context("v2 content object has no physical storage reference")?,
+            .context("v3 content object has no physical storage reference")?,
         media_type: Some(object.media_type.clone()),
         logical_path: object.logical_path.clone(),
     })
@@ -1310,7 +1318,7 @@ fn snapshot_repository_root(path: &Path) -> Result<PathBuf> {
     path.parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .context("v2 snapshot is not below the repository snapshots directory")
+        .context("v3 snapshot is not below the repository snapshots directory")
 }
 
 pub(crate) fn copy_verified_object(

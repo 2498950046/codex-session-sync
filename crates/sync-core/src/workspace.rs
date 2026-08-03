@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::local::{
     install_prepared_repository_object, repository_object_path, validate_repository_object,
 };
-use crate::storage_v2::ContentStore;
+use crate::storage_v3::ContentStore;
 use crate::{LocalSnapshot, ObjectDescriptor, OperationControl, OperationProgress, ThreadBundle};
 
 const MAX_SESSION_META_BYTES: u64 = 1024 * 1024;
@@ -334,7 +334,7 @@ fn rewrite_rollout_session_meta_cwd(
     object.sha256 = descriptor.sha256;
     object.byte_length = descriptor.byte_length;
     object.source_path = None;
-    let content = crate::storage_v2::FilesystemContentStore::open(repository_root.to_path_buf())?
+    let content = crate::storage_v3::FilesystemContentStore::open(repository_root.to_path_buf())?
         .ingest(
         &repository_object_path(repository_root, &object.sha256)?,
         control,

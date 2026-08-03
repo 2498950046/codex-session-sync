@@ -18,8 +18,8 @@ use sync_core::{
     CreateNamespaceRequest, HistoryTrashListResponse, NamespaceHeadResponse, NamespaceListResponse,
     ProtocolCapabilities, ProtocolInfoResponse, ProtocolLimits, PutObjectResponse,
     REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RestoreHistoryRequest, RevisionListResponse,
-    RevisionRootV2, ServerGcPlan, ServerGcQuarantineRequest, ServerGcQuarantineResponse,
-    ServerStorageSummary, StorageObjectKind, StorageObjectRef, StorageRef, ThreadDescriptor,
+    RevisionRootV3, ServerGcPlan, ServerGcQuarantineRequest, ServerGcQuarantineResponse,
+    ServerStorageSummary, StorageObjectKind, StorageObjectRef, StorageRef, ThreadDescriptorV3,
     TruncateHistoryRequest, TypedMissingObjectsRequest, TypedMissingObjectsResponse,
     canonical_json, digest_bytes, validate_sha256,
 };
@@ -146,7 +146,7 @@ pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
             .saturating_add(REQUEST_ENVELOPE_OVERHEAD_BYTES),
     )
     .unwrap_or(usize::MAX);
-    let protected_v2 = Router::new()
+    let protected_v3 = Router::new()
         .route("/namespaces", get(list_namespaces).post(create_namespace))
         .route("/namespaces/{namespace_id}", patch(rename_namespace))
         .route("/namespaces/{namespace_id}/head", get(namespace_head))
@@ -181,8 +181,8 @@ pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
 
     Router::new()
         .route("/health", get(health))
-        .route("/api/v2/info", get(info))
-        .nest("/api/v2", protected_v2)
+        .route("/api/v3/info", get(info))
+        .nest("/api/v3", protected_v3)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -202,7 +202,7 @@ async fn info() -> Json<ProtocolInfoResponse> {
         capabilities: ProtocolCapabilities {
             chunked_objects: true,
             thread_descriptors: true,
-            revision_roots_v2: true,
+            revision_roots_v3: true,
             garbage_collection: true,
         },
         limits: ProtocolLimits::default(),
@@ -576,9 +576,9 @@ async fn commit_revision_root(
 async fn validate_revision_graph(
     state: &AppState,
     revision_id: &str,
-) -> Result<(RevisionRootV2, Vec<StorageObjectRef>), HttpError> {
+) -> Result<(RevisionRootV3, Vec<StorageObjectRef>), HttpError> {
     let (root, root_object) =
-        read_typed_json::<RevisionRootV2>(state, StorageObjectKind::RevisionRoot, revision_id)
+        read_typed_json::<RevisionRootV3>(state, StorageObjectKind::RevisionRoot, revision_id)
             .await?;
     root.validate()
         .map_err(|error| HttpError::invalid_request(error.to_string()))?;
@@ -597,7 +597,7 @@ async fn validate_revision_graph(
     )]);
     let mut root_targets = Vec::new();
     for thread_ref in &root.threads {
-        let (descriptor, descriptor_object) = read_typed_json::<ThreadDescriptor>(
+        let (descriptor, descriptor_object) = read_typed_json::<ThreadDescriptorV3>(
             state,
             StorageObjectKind::Thread,
             &thread_ref.descriptor_sha256,

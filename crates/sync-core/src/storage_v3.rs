@@ -18,11 +18,11 @@ use crate::models::{
 use crate::operation::OperationControl;
 use crate::protocol::validate_sha256;
 
-pub const STORAGE_PROTOCOL_VERSION: u32 = 2;
+pub const STORAGE_PROTOCOL_VERSION: u32 = 3;
 pub const CHUNK_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const THREAD_DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
-pub const SNAPSHOT_ROOT_V2_SCHEMA_VERSION: u32 = 2;
-pub const REVISION_ROOT_V2_SCHEMA_VERSION: u32 = 2;
+pub const THREAD_DESCRIPTOR_SCHEMA_VERSION: u32 = 3;
+pub const SNAPSHOT_ROOT_V3_SCHEMA_VERSION: u32 = 3;
+pub const REVISION_ROOT_V3_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 pub const DEFAULT_CHUNK_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
@@ -71,18 +71,33 @@ pub struct ChunkDescriptor {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ThreadDescriptor {
+pub struct ThreadDescriptorV3 {
     pub schema_version: u32,
     pub thread_id: String,
     pub title: String,
     pub archived: bool,
     pub created_at_ms: Option<i64>,
     pub updated_at_ms: Option<i64>,
-    pub model_provider: Option<String>,
     pub workspace: WorkspaceRef,
     pub rollout: ContentRef,
     pub related_records: RelatedRecords,
     pub attachments: Vec<ContentRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct LocalThreadDescriptorV3 {
+    schema_version: u32,
+    thread_id: String,
+    title: String,
+    archived: bool,
+    created_at_ms: Option<i64>,
+    updated_at_ms: Option<i64>,
+    model_provider: Option<String>,
+    workspace: WorkspaceRef,
+    rollout: ContentRef,
+    related_records: RelatedRecords,
+    attachments: Vec<ContentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -94,7 +109,7 @@ pub struct ThreadRef {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SnapshotRootV2 {
+pub struct SnapshotRootV3 {
     pub schema_version: u32,
     pub snapshot_id: String,
     pub created_at: String,
@@ -104,7 +119,7 @@ pub struct SnapshotRootV2 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct RevisionRootV2 {
+pub struct RevisionRootV3 {
     pub schema_version: u32,
     pub namespace_id: Uuid,
     pub parent_revision: Option<String>,
@@ -317,7 +332,7 @@ impl FilesystemContentStore {
     }
 
     pub fn store_thread(&self, bundle: &ThreadBundle, rollout: ContentRef) -> Result<ThreadRef> {
-        let descriptor = ThreadDescriptor::from_bundle(bundle, rollout)?;
+        let descriptor = LocalThreadDescriptorV3::from_bundle(bundle, rollout)?;
         let object = self.store_json(StorageObjectKind::Thread, &descriptor)?;
         Ok(ThreadRef {
             thread_id: bundle.thread_id.clone(),
@@ -325,13 +340,26 @@ impl FilesystemContentStore {
         })
     }
 
-    pub fn store_revision_root(&self, root: &RevisionRootV2) -> Result<StorageObjectRef> {
+    pub fn store_remote_thread(
+        &self,
+        bundle: &ThreadBundle,
+        rollout: ContentRef,
+    ) -> Result<ThreadRef> {
+        let descriptor = ThreadDescriptorV3::from_bundle(bundle, rollout)?;
+        let object = self.store_json(StorageObjectKind::Thread, &descriptor)?;
+        Ok(ThreadRef {
+            thread_id: bundle.thread_id.clone(),
+            descriptor_sha256: object.sha256,
+        })
+    }
+
+    pub fn store_revision_root(&self, root: &RevisionRootV3) -> Result<StorageObjectRef> {
         root.validate()?;
         self.store_json(StorageObjectKind::RevisionRoot, root)
     }
 
-    pub fn load_revision_root(&self, revision_id: &str) -> Result<RevisionRootV2> {
-        let root: RevisionRootV2 = self.read_json(
+    pub fn load_revision_root(&self, revision_id: &str) -> Result<RevisionRootV3> {
+        let root: RevisionRootV3 = self.read_json(
             StorageObjectKind::RevisionRoot,
             revision_id,
             MAX_STRUCTURED_OBJECT_BYTES,
@@ -346,7 +374,23 @@ impl FilesystemContentStore {
     pub fn load_thread(&self, reference: &ThreadRef) -> Result<(ThreadBundle, ContentRef)> {
         validate_sha256(&reference.descriptor_sha256)
             .map_err(|_| anyhow::anyhow!("invalid thread descriptor hash"))?;
-        let descriptor: ThreadDescriptor = self.read_json(
+        let descriptor: LocalThreadDescriptorV3 = self.read_json(
+            StorageObjectKind::Thread,
+            &reference.descriptor_sha256,
+            MAX_STRUCTURED_OBJECT_BYTES,
+        )?;
+        descriptor.validate()?;
+        if descriptor.thread_id != reference.thread_id {
+            bail!("thread reference ID does not match its descriptor");
+        }
+        let content = descriptor.rollout.clone();
+        Ok((descriptor.into_bundle(), content))
+    }
+
+    pub fn load_remote_thread(&self, reference: &ThreadRef) -> Result<(ThreadBundle, ContentRef)> {
+        validate_sha256(&reference.descriptor_sha256)
+            .map_err(|_| anyhow::anyhow!("invalid thread descriptor hash"))?;
+        let descriptor: ThreadDescriptorV3 = self.read_json(
             StorageObjectKind::Thread,
             &reference.descriptor_sha256,
             MAX_STRUCTURED_OBJECT_BYTES,
@@ -699,32 +743,9 @@ impl ChunkManifest {
     }
 }
 
-impl ThreadDescriptor {
+impl ThreadDescriptorV3 {
     pub fn from_bundle(bundle: &ThreadBundle, rollout: ContentRef) -> Result<Self> {
-        if rollout.logical_sha256 != bundle.rollout.sha256
-            || rollout.byte_length != bundle.rollout.byte_length
-        {
-            bail!("rollout content reference does not match thread bundle");
-        }
-        let attachments = bundle
-            .attachments
-            .iter()
-            .map(|object| {
-                Ok(ContentRef {
-                    logical_sha256: object.sha256.clone(),
-                    byte_length: object.byte_length,
-                    storage: object
-                        .storage
-                        .clone()
-                        .context("v2 attachment has no physical storage reference")?,
-                    media_type: Some(object.media_type.clone()),
-                    logical_path: object.logical_path.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut rollout = rollout;
-        rollout.media_type = Some(bundle.rollout.media_type.clone());
-        rollout.logical_path = bundle.rollout.logical_path.clone();
+        let (rollout, attachments) = descriptor_content(bundle, rollout)?;
         let descriptor = Self {
             schema_version: THREAD_DESCRIPTOR_SCHEMA_VERSION,
             thread_id: bundle.thread_id.clone(),
@@ -732,7 +753,6 @@ impl ThreadDescriptor {
             archived: bundle.archived,
             created_at_ms: bundle.created_at_ms,
             updated_at_ms: bundle.updated_at_ms,
-            model_provider: bundle.model_provider.clone(),
             workspace: bundle.workspace.clone(),
             rollout,
             related_records: bundle.related_records.clone(),
@@ -752,6 +772,9 @@ impl ThreadDescriptor {
         if self.thread_id.trim().is_empty() {
             bail!("thread descriptor has an empty thread ID");
         }
+        if related_records_contain_provider(&self.related_records) {
+            bail!("v3 remote thread descriptor contains provider metadata");
+        }
         validate_content_ref(&self.rollout)?;
         for attachment in &self.attachments {
             validate_content_ref(attachment)?;
@@ -760,6 +783,60 @@ impl ThreadDescriptor {
     }
 
     pub fn into_bundle(self) -> ThreadBundle {
+        ThreadBundle {
+            schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
+            thread_id: self.thread_id,
+            title: self.title,
+            archived: self.archived,
+            created_at_ms: self.created_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            model_provider: None,
+            workspace: self.workspace,
+            rollout: content_object(&self.rollout),
+            related_records: self.related_records,
+            attachments: self.attachments.iter().map(content_object).collect(),
+        }
+    }
+}
+
+impl LocalThreadDescriptorV3 {
+    fn from_bundle(bundle: &ThreadBundle, rollout: ContentRef) -> Result<Self> {
+        let (rollout, attachments) = descriptor_content(bundle, rollout)?;
+        let descriptor = Self {
+            schema_version: THREAD_DESCRIPTOR_SCHEMA_VERSION,
+            thread_id: bundle.thread_id.clone(),
+            title: bundle.title.clone(),
+            archived: bundle.archived,
+            created_at_ms: bundle.created_at_ms,
+            updated_at_ms: bundle.updated_at_ms,
+            model_provider: bundle.model_provider.clone(),
+            workspace: bundle.workspace.clone(),
+            rollout,
+            related_records: bundle.related_records.clone(),
+            attachments,
+        };
+        descriptor.validate()?;
+        Ok(descriptor)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != THREAD_DESCRIPTOR_SCHEMA_VERSION {
+            bail!(
+                "unsupported local thread descriptor schema version {}",
+                self.schema_version
+            );
+        }
+        if self.thread_id.trim().is_empty() {
+            bail!("local thread descriptor has an empty thread ID");
+        }
+        validate_content_ref(&self.rollout)?;
+        for attachment in &self.attachments {
+            validate_content_ref(attachment)?;
+        }
+        Ok(())
+    }
+
+    fn into_bundle(self) -> ThreadBundle {
         ThreadBundle {
             schema_version: THREAD_BUNDLE_SCHEMA_VERSION,
             thread_id: self.thread_id,
@@ -776,11 +853,59 @@ impl ThreadDescriptor {
     }
 }
 
-impl SnapshotRootV2 {
+fn descriptor_content(
+    bundle: &ThreadBundle,
+    mut rollout: ContentRef,
+) -> Result<(ContentRef, Vec<ContentRef>)> {
+    if rollout.logical_sha256 != bundle.rollout.sha256
+        || rollout.byte_length != bundle.rollout.byte_length
+    {
+        bail!("rollout content reference does not match thread bundle");
+    }
+    let attachments = bundle
+        .attachments
+        .iter()
+        .map(|object| {
+            Ok(ContentRef {
+                logical_sha256: object.sha256.clone(),
+                byte_length: object.byte_length,
+                storage: object
+                    .storage
+                    .clone()
+                    .context("v3 attachment has no physical storage reference")?,
+                media_type: Some(object.media_type.clone()),
+                logical_path: object.logical_path.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    rollout.media_type = Some(bundle.rollout.media_type.clone());
+    rollout.logical_path = bundle.rollout.logical_path.clone();
+    Ok((rollout, attachments))
+}
+
+fn related_records_contain_provider(records: &RelatedRecords) -> bool {
+    records
+        .tables
+        .values()
+        .flatten()
+        .any(value_contains_provider)
+}
+
+fn value_contains_provider(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.contains_key("model_provider") || object.values().any(value_contains_provider)
+        }
+        Value::Array(values) => values.iter().any(value_contains_provider),
+        _ => false,
+    }
+}
+
+impl SnapshotRootV3 {
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != SNAPSHOT_ROOT_V2_SCHEMA_VERSION {
+        if self.schema_version != SNAPSHOT_ROOT_V3_SCHEMA_VERSION {
             bail!(
-                "unsupported v2 snapshot schema version {}",
+                "unsupported v3 snapshot schema version {}",
                 self.schema_version
             );
         }
@@ -788,16 +913,16 @@ impl SnapshotRootV2 {
     }
 }
 
-impl RevisionRootV2 {
+impl RevisionRootV3 {
     pub fn revision_id(&self) -> Result<String> {
         self.validate()?;
         Ok(digest_bytes(&canonical_json(self)?))
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != REVISION_ROOT_V2_SCHEMA_VERSION {
+        if self.schema_version != REVISION_ROOT_V3_SCHEMA_VERSION {
             bail!(
-                "unsupported v2 revision schema version {}",
+                "unsupported v3 revision schema version {}",
                 self.schema_version
             );
         }
@@ -816,16 +941,16 @@ pub fn snapshot_to_revision_root(
     namespace_id: Uuid,
     parent_revision: Option<String>,
     repository_root: &Path,
-) -> Result<(RevisionRootV2, StorageObjectRef)> {
+) -> Result<(RevisionRootV3, StorageObjectRef)> {
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut threads = Vec::with_capacity(snapshot.threads.len());
     for thread in &snapshot.threads {
         let rollout = content_ref_from_object(&thread.rollout)?;
-        threads.push(store.store_thread(thread, rollout)?);
+        threads.push(store.store_remote_thread(thread, rollout)?);
     }
     threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
-    let root = RevisionRootV2 {
-        schema_version: REVISION_ROOT_V2_SCHEMA_VERSION,
+    let root = RevisionRootV3 {
+        schema_version: REVISION_ROOT_V3_SCHEMA_VERSION,
         namespace_id,
         parent_revision,
         created_at: snapshot.created_at.clone(),
@@ -838,14 +963,14 @@ pub fn snapshot_to_revision_root(
 }
 
 pub fn revision_root_to_snapshot(
-    root: &RevisionRootV2,
+    root: &RevisionRootV3,
     repository_root: &Path,
 ) -> Result<LocalSnapshot> {
     root.validate()?;
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut threads = Vec::with_capacity(root.threads.len());
     for reference in &root.threads {
-        threads.push(store.load_thread(reference)?.0);
+        threads.push(store.load_remote_thread(reference)?.0);
     }
     Ok(LocalSnapshot {
         schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
@@ -882,11 +1007,11 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
-pub fn load_v2_snapshot(
+pub fn load_v3_snapshot(
     root_path: &Path,
     repository_root: &Path,
 ) -> Result<(LocalSnapshot, BTreeMap<String, ContentRef>)> {
-    let root: SnapshotRootV2 = read_bounded_json(root_path, MAX_STRUCTURED_OBJECT_BYTES)?;
+    let root: SnapshotRootV3 = read_bounded_json(root_path, MAX_STRUCTURED_OBJECT_BYTES)?;
     root.validate()?;
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut threads = Vec::with_capacity(root.threads.len());
@@ -912,7 +1037,7 @@ pub fn load_v2_snapshot(
     ))
 }
 
-pub fn write_v2_snapshot(
+pub fn write_v3_snapshot(
     snapshot: &LocalSnapshot,
     contents: &BTreeMap<String, ContentRef>,
     repository_root: &Path,
@@ -926,8 +1051,8 @@ pub fn write_v2_snapshot(
         references.push(store.store_thread(thread, content.clone())?);
     }
     references.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
-    let root = SnapshotRootV2 {
-        schema_version: SNAPSHOT_ROOT_V2_SCHEMA_VERSION,
+    let root = SnapshotRootV3 {
+        schema_version: SNAPSHOT_ROOT_V3_SCHEMA_VERSION,
         snapshot_id: snapshot.snapshot_id.clone(),
         created_at: snapshot.created_at.clone(),
         threads: references,
@@ -942,7 +1067,7 @@ pub fn write_v2_snapshot(
 }
 
 pub fn collect_snapshot_graph(
-    root: &SnapshotRootV2,
+    root: &SnapshotRootV3,
     store: &FilesystemContentStore,
 ) -> Result<BTreeSet<StorageObjectRef>> {
     root.validate()?;
@@ -961,7 +1086,7 @@ pub fn collect_snapshot_graph(
             sha256: thread_ref.descriptor_sha256.clone(),
             byte_length: descriptor_length,
         });
-        let descriptor: ThreadDescriptor = store.read_json(
+        let descriptor: ThreadDescriptorV3 = store.read_json(
             StorageObjectKind::Thread,
             &thread_ref.descriptor_sha256,
             MAX_STRUCTURED_OBJECT_BYTES,
@@ -984,7 +1109,7 @@ pub fn collect_snapshot_graph(
 }
 
 pub fn collect_revision_graph(
-    root: &RevisionRootV2,
+    root: &RevisionRootV3,
     store: &FilesystemContentStore,
 ) -> Result<BTreeSet<StorageObjectRef>> {
     root.validate()?;
@@ -1012,7 +1137,7 @@ pub fn collect_revision_graph(
             sha256: thread_ref.descriptor_sha256.clone(),
             byte_length: descriptor_length,
         });
-        let descriptor: ThreadDescriptor = store.read_json(
+        let descriptor: ThreadDescriptorV3 = store.read_json(
             StorageObjectKind::Thread,
             &thread_ref.descriptor_sha256,
             MAX_STRUCTURED_OBJECT_BYTES,
@@ -1041,7 +1166,7 @@ fn content_ref_from_object(object: &ContentObject) -> Result<ContentRef> {
         storage: object
             .storage
             .clone()
-            .context("v2 content object has no physical storage reference")?,
+            .context("v3 content object has no physical storage reference")?,
         media_type: Some(object.media_type.clone()),
         logical_path: object.logical_path.clone(),
     })
@@ -1233,12 +1358,12 @@ pub fn list_local_snapshots(repository_root: &Path) -> Result<Vec<LocalSnapshotL
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let root: SnapshotRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+        let root: SnapshotRootV3 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
         root.validate()?;
         let graph = collect_snapshot_graph(&root, &store)?;
         let mut logical_bytes = 0_u64;
         for reference in &root.threads {
-            let descriptor: ThreadDescriptor = store.read_json(
+            let descriptor: ThreadDescriptorV3 = store.read_json(
                 StorageObjectKind::Thread,
                 &reference.descriptor_sha256,
                 MAX_STRUCTURED_OBJECT_BYTES,
@@ -1308,7 +1433,7 @@ pub fn plan_snapshot_deletion(
     snapshot_id: &str,
 ) -> Result<SnapshotDeletionPlan> {
     let manifest_path = snapshot_manifest_path(repository_root, snapshot_id)?;
-    let root: SnapshotRootV2 = read_bounded_json(&manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
+    let root: SnapshotRootV3 = read_bounded_json(&manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
     if root.snapshot_id != snapshot_id {
         bail!("snapshot ID does not match its manifest name");
     }
@@ -1320,7 +1445,7 @@ pub fn plan_snapshot_deletion(
         if item.snapshot_id == snapshot_id {
             continue;
         }
-        let other_root: SnapshotRootV2 =
+        let other_root: SnapshotRootV3 =
             read_bounded_json(&item.manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
         other.extend(collect_snapshot_graph(&other_root, &store)?);
     }
@@ -1499,7 +1624,7 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let root: SnapshotRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+            let root: SnapshotRootV3 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
             reachable.extend(collect_snapshot_graph(&root, &store)?);
         }
     }
@@ -1510,7 +1635,7 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
             if !path.is_file() {
                 continue;
             }
-            let root: SnapshotRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+            let root: SnapshotRootV3 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
             reachable.extend(collect_snapshot_graph(&root, &store)?);
         }
     }
@@ -1529,7 +1654,7 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
                 if !path.is_file() {
                     continue;
                 }
-                let root: RevisionRootV2 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
+                let root: RevisionRootV3 = read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
                 reachable.extend(collect_revision_graph(&root, &store)?);
             }
         }
@@ -1597,7 +1722,7 @@ pub fn repository_storage_summary(repository_root: &Path) -> Result<RepositorySt
     })?;
     let mut active_counts = BTreeMap::<StorageObjectRef, usize>::new();
     for snapshot in &snapshots {
-        let root: SnapshotRootV2 =
+        let root: SnapshotRootV3 =
             read_bounded_json(&snapshot.manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
         for object in collect_snapshot_graph(&root, &store)? {
             *active_counts.entry(object).or_default() += 1;
@@ -1606,7 +1731,7 @@ pub fn repository_storage_summary(repository_root: &Path) -> Result<RepositorySt
     let mut trash_objects = BTreeSet::new();
     for entry in list_local_snapshot_trash(repository_root)? {
         if entry.trash_manifest_path.is_file() {
-            let root: SnapshotRootV2 =
+            let root: SnapshotRootV3 =
                 read_bounded_json(&entry.trash_manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
             trash_objects.extend(collect_snapshot_graph(&root, &store)?);
         }
@@ -1624,7 +1749,7 @@ pub fn repository_storage_summary(repository_root: &Path) -> Result<RepositorySt
             for entry in fs::read_dir(prefix.path())? {
                 let path = entry?.path();
                 if path.is_file() {
-                    let root: RevisionRootV2 =
+                    let root: RevisionRootV3 =
                         read_bounded_json(&path, MAX_STRUCTURED_OBJECT_BYTES)?;
                     for object in collect_revision_graph(&root, &store)? {
                         *active_counts.entry(object).or_default() += 1;
@@ -2220,7 +2345,7 @@ mod tests {
             threads: vec![bundle],
             warning_count: 0,
         };
-        write_v2_snapshot(
+        write_v3_snapshot(
             &snapshot,
             &BTreeMap::from([("thread".to_string(), content)]),
             temp.path(),
@@ -2285,7 +2410,7 @@ mod tests {
             threads: vec![bundle],
             warning_count: 0,
         };
-        write_v2_snapshot(
+        write_v3_snapshot(
             &snapshot,
             &BTreeMap::from([("history-thread".to_string(), content)]),
             temp.path(),

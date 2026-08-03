@@ -7,13 +7,13 @@ storage.
 
 ## Current implementation
 
-The development target is storage/protocol v2-only. v1 synchronization
+The development target is storage/protocol v3-only. Earlier synchronization
 endpoints, untyped remote object transfer, and the old server Revision store
 are not part of the build. Codex compatibility is still separate: both modern
 `sqlite/*.db` and legacy `state_5.sqlite` homes are scanned, and active plus
 archived rollout directories are supported.
 
-v2 stores an immutable typed object graph:
+v3 stores a provider-neutral immutable typed object graph:
 
 ```text
 Revision Root
@@ -36,7 +36,10 @@ rollback.
 - Remote namespace and Revision history with download, local restore, restore
   and publish, explicit Head rewind, current-Head deletion, and trash restore.
 - Operation Recovery Points that automatically surface incomplete import and
-  checkout journals, with incomplete points pinned above terminal records.
+  checkout/provider-sync journals, with incomplete points pinned above terminal records.
+- Offline local Provider Sync rewrites rollout and SQLite provider metadata
+  with preview, backups, rollback, and restart recovery. Provider identity is
+  materialized per machine and does not create remote revisions.
 - Repository shared/exclusive leases in the Tauri backend. Read-only history,
   validation, and sync operations can share a repository; trash and GC use an
   exclusive lease. The React busy flag is not the synchronization boundary.
@@ -46,25 +49,25 @@ rollback.
 - Repository storage statistics: logical bytes, physical bytes, shared and
   exclusive references, trash protection, quarantine, and reclaimable bytes.
 
-## v2 HTTP API
+## v3 HTTP API
 
-Public endpoints are `GET /health` and `GET /api/v2/info`. All data endpoints
+Public endpoints are `GET /health` and `GET /api/v3/info`. All data endpoints
 require the configured Bearer token.
 
 ```text
-GET/POST  /api/v2/namespaces
-PATCH     /api/v2/namespaces/{id}
-GET       /api/v2/namespaces/{id}/head
-GET       /api/v2/namespaces/{id}/revisions
-POST      /api/v2/namespaces/{id}/revisions/commit
-POST      /api/v2/objects/missing
-PUT/GET   /api/v2/objects/{kind}/{sha256}
-POST      /api/v2/namespaces/{id}/history/truncations
-GET       /api/v2/namespaces/{id}/trash
-POST      /api/v2/namespaces/{id}/trash/{operation}/restore
-GET       /api/v2/storage
-GET       /api/v2/gc/plan
-POST      /api/v2/gc/quarantine
+GET/POST  /api/v3/namespaces
+PATCH     /api/v3/namespaces/{id}
+GET       /api/v3/namespaces/{id}/head
+GET       /api/v3/namespaces/{id}/revisions
+POST      /api/v3/namespaces/{id}/revisions/commit
+POST      /api/v3/objects/missing
+PUT/GET   /api/v3/objects/{kind}/{sha256}
+POST      /api/v3/namespaces/{id}/history/truncations
+GET       /api/v3/namespaces/{id}/trash
+POST      /api/v3/namespaces/{id}/trash/{operation}/restore
+GET       /api/v3/storage
+GET       /api/v3/gc/plan
+POST      /api/v3/gc/quarantine
 ```
 
 Revision commits use `expectedHead` and `expectedNamespaceEpoch`. The server
@@ -88,7 +91,7 @@ excluded from plans for a short safety grace period.
 ├─ trash/snapshots/
 ├─ trash/gc/
 ├─ quarantine/
-└─ index/source-objects-v2.json
+└─ index/source-objects-v3.json
 ```
 
 The default repository is `~/.codex-session-sync`. It is independent from the
@@ -112,9 +115,9 @@ selection stores only a local HMAC fingerprint bound to the server URL.
 Desktop development:
 
 ```powershell
-cd apps/desktop
+`cd apps/desktop
 npm install
-npm run tauri -- dev
+npm run tauri -- dev`
 ```
 
 Server development:

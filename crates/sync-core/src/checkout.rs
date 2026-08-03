@@ -23,7 +23,7 @@ use crate::local::{
 use crate::models::{LocalSnapshot, ThreadBundle};
 use crate::operation::{OperationControl, OperationProgress};
 use crate::protocol::validate_sha256;
-use crate::storage_v2::{ContentRef, ContentStore, FilesystemContentStore};
+use crate::storage_v3::{ContentRef, ContentStore, FilesystemContentStore};
 use crate::sync::{TrackingStore, semantic_thread_hash};
 
 pub const CHECKOUT_JOURNAL_SCHEMA_VERSION: u32 = 1;
@@ -1066,7 +1066,7 @@ fn replace_databases(
     Ok(())
 }
 
-fn discover_local_thread_catalog_databases(codex_home: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover_local_thread_catalog_databases(codex_home: &Path) -> Result<Vec<PathBuf>> {
     let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
@@ -1101,7 +1101,7 @@ fn discover_local_thread_catalog_databases(codex_home: &Path) -> Result<Vec<Path
     Ok(databases)
 }
 
-fn invalidate_local_thread_catalogs(databases: &[PathBuf]) -> Result<()> {
+pub(crate) fn invalidate_local_thread_catalogs(databases: &[PathBuf]) -> Result<()> {
     for database in databases {
         let mut connection = Connection::open(database).with_context(|| {
             format!("failed to open Codex thread catalog {}", database.display())

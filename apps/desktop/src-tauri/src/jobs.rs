@@ -193,6 +193,27 @@ impl JobManager {
         }))
     }
 
+    pub(crate) fn start_home_repository_exclusive<R, F>(
+        &self,
+        codex_home: &Path,
+        repository: &Path,
+        kind: impl Into<String>,
+        cancellable: bool,
+        operation: F,
+    ) -> Result<JobSnapshot, String>
+    where
+        R: Serialize + Send + 'static,
+        F: FnOnce(OperationControl) -> anyhow::Result<R> + Send + 'static,
+    {
+        let home_lease = self.try_acquire_codex_home(codex_home)?;
+        let repository_lease = self.try_acquire_repository_exclusive(repository)?;
+        Ok(self.start(kind, cancellable, move |control| {
+            let _home_lease = home_lease;
+            let _repository_lease = repository_lease;
+            operation(control)
+        }))
+    }
+
     pub(crate) fn start_repository_shared<R, F>(
         &self,
         repository: &Path,
@@ -207,24 +228,6 @@ impl JobManager {
         let repository_lease = self.try_acquire_repository_shared(repository)?;
         Ok(self.start(kind, cancellable, move |control| {
             let _repository_lease = repository_lease;
-            operation(control)
-        }))
-    }
-
-    pub(crate) fn start_exclusive<R, F>(
-        &self,
-        codex_home: &Path,
-        kind: impl Into<String>,
-        cancellable: bool,
-        operation: F,
-    ) -> Result<JobSnapshot, String>
-    where
-        R: Serialize + Send + 'static,
-        F: FnOnce(OperationControl) -> anyhow::Result<R> + Send + 'static,
-    {
-        let lease = self.try_acquire_codex_home(codex_home)?;
-        Ok(self.start(kind, cancellable, move |control| {
-            let _lease = lease;
             operation(control)
         }))
     }

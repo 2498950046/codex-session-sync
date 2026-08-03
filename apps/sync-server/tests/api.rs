@@ -10,9 +10,9 @@ use serde::de::DeserializeOwned;
 use sync_core::{
     CommitRevisionResponse, CommitRevisionRootRequest, ContentRef, CreateNamespaceRequest,
     HistoryTrashListResponse, Namespace, ProtocolInfoResponse, RelatedRecords,
-    RestoreHistoryRequest, RevisionListResponse, RevisionRootV2, ServerGcPlan,
+    RestoreHistoryRequest, RevisionListResponse, RevisionRootV3, ServerGcPlan,
     ServerGcQuarantineRequest, ServerGcQuarantineResponse, StorageObjectKind, StorageRef,
-    THREAD_DESCRIPTOR_SCHEMA_VERSION, ThreadDescriptor, ThreadRef, TruncateHistoryRequest,
+    THREAD_DESCRIPTOR_SCHEMA_VERSION, ThreadDescriptorV3, ThreadRef, TruncateHistoryRequest,
     WorkspaceRef, canonical_json, digest_bytes,
 };
 use sync_server::{AppState, ServerConfig, build_router};
@@ -60,7 +60,7 @@ impl TestApp {
         let response = self
             .send(json_request(
                 Method::POST,
-                "/api/v2/namespaces",
+                "/api/v3/namespaces",
                 &CreateNamespaceRequest {
                     display_name: name.to_string(),
                 },
@@ -77,7 +77,7 @@ impl TestApp {
             .send(
                 Request::builder()
                     .method(Method::PUT)
-                    .uri(format!("/api/v2/objects/{}/{digest}", kind.wire_name()))
+                    .uri(format!("/api/v3/objects/{}/{digest}", kind.wire_name()))
                     .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
                     .header(CONTENT_LENGTH, bytes.len())
                     .header(CONTENT_TYPE, "application/octet-stream")
@@ -98,16 +98,15 @@ impl TestApp {
         parent_revision: Option<String>,
         content: &[u8],
         thread_id: &str,
-    ) -> RevisionRootV2 {
+    ) -> RevisionRootV3 {
         let whole_sha256 = self.upload(StorageObjectKind::Whole, content).await;
-        let descriptor = ThreadDescriptor {
+        let descriptor = ThreadDescriptorV3 {
             schema_version: THREAD_DESCRIPTOR_SCHEMA_VERSION,
             thread_id: thread_id.to_string(),
             title: format!("Thread {thread_id}"),
             archived: false,
             created_at_ms: Some(1_700_000_000_000),
             updated_at_ms: Some(1_700_000_100_000),
-            model_provider: Some("openai".to_string()),
             workspace: WorkspaceRef::default(),
             rollout: ContentRef {
                 logical_sha256: whole_sha256.clone(),
@@ -128,8 +127,8 @@ impl TestApp {
         let descriptor_sha256 = self
             .upload(StorageObjectKind::Thread, &descriptor_bytes)
             .await;
-        let root = RevisionRootV2 {
-            schema_version: sync_core::REVISION_ROOT_V2_SCHEMA_VERSION,
+        let root = RevisionRootV3 {
+            schema_version: sync_core::REVISION_ROOT_V3_SCHEMA_VERSION,
             namespace_id,
             parent_revision,
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -152,11 +151,11 @@ impl TestApp {
         namespace_id: Uuid,
         expected_head: Option<String>,
         expected_epoch: u64,
-        root: &RevisionRootV2,
+        root: &RevisionRootV3,
     ) -> Response<Body> {
         self.send(json_request(
             Method::POST,
-            &format!("/api/v2/namespaces/{namespace_id}/revisions/commit"),
+            &format!("/api/v3/namespaces/{namespace_id}/revisions/commit"),
             &CommitRevisionRootRequest {
                 expected_head,
                 expected_namespace_epoch: expected_epoch,
@@ -179,7 +178,7 @@ impl TestApp {
 }
 
 #[tokio::test]
-async fn exposes_only_v2_and_requires_auth_for_data_routes() {
+async fn exposes_only_v3_and_requires_auth_for_data_routes() {
     let app = TestApp::new().await;
     assert_eq!(
         app.send(
@@ -195,13 +194,13 @@ async fn exposes_only_v2_and_requires_auth_for_data_routes() {
     let info = app
         .send(
             Request::builder()
-                .uri("/api/v2/info")
+                .uri("/api/v3/info")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
     let info: ProtocolInfoResponse = response_json(info).await;
-    assert_eq!(info.protocol_version, 2);
+    assert_eq!(info.protocol_version, 3);
     assert!(info.capabilities.garbage_collection);
     assert_eq!(
         app.send(
@@ -217,7 +216,18 @@ async fn exposes_only_v2_and_requires_auth_for_data_routes() {
     assert_eq!(
         app.send(
             Request::builder()
-                .uri("/api/v2/namespaces")
+                .uri("/api/v2/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.send(
+            Request::builder()
+                .uri("/api/v3/namespaces")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -265,7 +275,7 @@ async fn compact_revision_commit_is_idempotent_and_rejects_stale_head_and_epoch(
     let revisions = app
         .send(auth_request(
             Method::GET,
-            &format!("/api/v2/namespaces/{}/revisions", namespace.id),
+            &format!("/api/v3/namespaces/{}/revisions", namespace.id),
             Body::empty(),
         ))
         .await;
@@ -298,7 +308,7 @@ async fn history_truncation_is_recoverable_and_epoch_cas_protected() {
     let truncated = app
         .send(json_request(
             Method::POST,
-            &format!("/api/v2/namespaces/{}/history/truncations", namespace.id),
+            &format!("/api/v3/namespaces/{}/history/truncations", namespace.id),
             &TruncateHistoryRequest {
                 expected_head: Some(second_id),
                 expected_namespace_epoch: 0,
@@ -312,7 +322,7 @@ async fn history_truncation_is_recoverable_and_epoch_cas_protected() {
     let trash = app
         .send(auth_request(
             Method::GET,
-            &format!("/api/v2/namespaces/{}/trash", namespace.id),
+            &format!("/api/v3/namespaces/{}/trash", namespace.id),
             Body::empty(),
         ))
         .await;
@@ -322,7 +332,7 @@ async fn history_truncation_is_recoverable_and_epoch_cas_protected() {
         .send(json_request(
             Method::POST,
             &format!(
-                "/api/v2/namespaces/{}/trash/{}/restore",
+                "/api/v3/namespaces/{}/trash/{}/restore",
                 namespace.id, operation.operation_id
             ),
             &RestoreHistoryRequest {
@@ -351,7 +361,7 @@ async fn gc_quarantines_only_globally_unreachable_objects_and_resumes_after_rest
     app.backdate_all_objects();
 
     let plan = app
-        .send(auth_request(Method::GET, "/api/v2/gc/plan", Body::empty()))
+        .send(auth_request(Method::GET, "/api/v3/gc/plan", Body::empty()))
         .await;
     let plan: ServerGcPlan = response_json(plan).await;
     assert_eq!(plan.candidates.len(), 1);
@@ -359,7 +369,7 @@ async fn gc_quarantines_only_globally_unreachable_objects_and_resumes_after_rest
     let quarantined = app
         .send(json_request(
             Method::POST,
-            "/api/v2/gc/quarantine",
+            "/api/v3/gc/quarantine",
             &ServerGcQuarantineRequest {
                 plan_fingerprint: plan.plan_fingerprint,
             },
@@ -371,7 +381,7 @@ async fn gc_quarantines_only_globally_unreachable_objects_and_resumes_after_rest
     assert_eq!(
         app.send(auth_request(
             Method::GET,
-            &format!("/api/v2/objects/whole/{orphan_digest}"),
+            &format!("/api/v3/objects/whole/{orphan_digest}"),
             Body::empty(),
         ))
         .await
@@ -383,7 +393,7 @@ async fn gc_quarantines_only_globally_unreachable_objects_and_resumes_after_rest
         app.send(auth_request(
             Method::GET,
             &format!(
-                "/api/v2/objects/thread/{}",
+                "/api/v3/objects/thread/{}",
                 descriptor.strip_prefix("sha256:").unwrap()
             ),
             Body::empty(),

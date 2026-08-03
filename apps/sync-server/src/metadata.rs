@@ -6,7 +6,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sync_core::{
-    HistoryTrashOperation, Namespace, ObjectDescriptor, RevisionManifest, RevisionRootV2,
+    HistoryTrashOperation, Namespace, ObjectDescriptor, RevisionManifest, RevisionRootV3,
     RevisionState, RevisionSummary, RevisionValidationError, ServerGcPlan, StorageObjectKind,
     StorageObjectRef, digest_bytes, validate_sha256,
 };
@@ -93,7 +93,7 @@ impl NewRevisionMetadata {
     }
 
     pub fn from_revision_root(
-        root: &RevisionRootV2,
+        root: &RevisionRootV3,
         root_byte_length: u64,
         graph: &[StorageObjectRef],
     ) -> Result<Self, MetadataError> {
@@ -709,7 +709,7 @@ impl MetadataStore {
             transaction.execute(
                 "INSERT INTO revision_roots (revision_id, root_sha256, root_schema_version)
                  VALUES (?1, ?1, ?2)",
-                params![revision.id, sync_core::REVISION_ROOT_V2_SCHEMA_VERSION],
+                params![revision.id, sync_core::REVISION_ROOT_V3_SCHEMA_VERSION],
             )?;
             transaction.commit()?;
             Ok((CommitRevisionOutcome::Created, current_epoch as u64))

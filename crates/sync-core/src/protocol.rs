@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::models::{ContentObject, THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle};
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
 pub const REVISION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub struct ProtocolInfoResponse {
 pub struct ProtocolCapabilities {
     pub chunked_objects: bool,
     pub thread_descriptors: bool,
-    pub revision_roots_v2: bool,
+    pub revision_roots_v3: bool,
     pub garbage_collection: bool,
 }
 
@@ -45,10 +45,10 @@ pub struct ProtocolLimits {
 impl Default for ProtocolLimits {
     fn default() -> Self {
         Self {
-            max_chunk_bytes: crate::storage_v2::MAX_CHUNK_BYTES,
-            max_chunks_per_content: crate::storage_v2::MAX_CHUNKS_PER_CONTENT,
-            max_objects_per_revision: crate::storage_v2::MAX_OBJECT_REFERENCES,
-            max_threads_per_revision: crate::storage_v2::MAX_THREADS_PER_REVISION,
+            max_chunk_bytes: crate::storage_v3::MAX_CHUNK_BYTES,
+            max_chunks_per_content: crate::storage_v3::MAX_CHUNKS_PER_CONTENT,
+            max_objects_per_revision: crate::storage_v3::MAX_OBJECT_REFERENCES,
+            max_threads_per_revision: crate::storage_v3::MAX_THREADS_PER_REVISION,
         }
     }
 }
@@ -56,13 +56,13 @@ impl Default for ProtocolLimits {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TypedMissingObjectsRequest {
-    pub objects: Vec<crate::storage_v2::StorageObjectRef>,
+    pub objects: Vec<crate::storage_v3::StorageObjectRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TypedMissingObjectsResponse {
-    pub missing: Vec<crate::storage_v2::StorageObjectRef>,
+    pub missing: Vec<crate::storage_v3::StorageObjectRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,7 +342,7 @@ pub struct HistoryTrashListResponse {
 pub struct ServerGcPlan {
     pub created_at: String,
     pub reachable_object_count: usize,
-    pub candidates: Vec<crate::storage_v2::StorageObjectRef>,
+    pub candidates: Vec<crate::storage_v3::StorageObjectRef>,
     pub reclaimable_bytes: u64,
     pub plan_fingerprint: String,
 }

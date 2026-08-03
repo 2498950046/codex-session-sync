@@ -372,6 +372,16 @@ export async function installDevelopmentPreview(preview: "ready" | "empty" | "pr
       mappings = mappings.filter((mapping) => mapping.id !== mappingId);
       return currentMappingState();
     }
+    if (command === "preview_local_provider_sync") return {
+      provider: "custom",
+      rolloutCount: 418,
+      rolloutBytes: 984811738,
+      databaseRowCount: 418,
+      catalogDatabaseCount: 1,
+      warnings: [],
+      noChanges: false,
+    };
+    if (command === "start_provider_sync_job") return job("preview-provider-sync", "provider_sync", "running");
     if (command === "start_pull_job") return job("preview-pull", "pull", "running");
     if (command === "start_workspace_remap_job") return job("preview-remap", "remap", "running");
     if (command === "start_scan_job") return job("preview-scan", "scan", "running");
@@ -382,11 +392,11 @@ export async function installDevelopmentPreview(preview: "ready" | "empty" | "pr
         ...job(jobId, jobId === "preview-scan" ? "scan" : "pull", "failed"),
         error: "预览任务失败：服务器返回的对象未通过哈希校验。",
       };
-      return job(jobId, jobId === "preview-scan" ? "scan" : jobId === "preview-remap" ? "remap" : "pull", "completed");
+      return job(jobId, jobId === "preview-scan" ? "scan" : jobId === "preview-remap" ? "remap" : jobId === "preview-provider-sync" ? "provider_sync" : "pull", "completed");
     }
     if (command === "take_job_result") {
       const jobId = (args as { jobId?: string } | undefined)?.jobId;
-      return jobId === "preview-scan" ? scanReport : jobId === "preview-remap" ? remapReport : conflictReport;
+      return jobId === "preview-scan" ? scanReport : jobId === "preview-remap" ? remapReport : jobId === "preview-provider-sync" ? { operationId: "preview-provider-sync", provider: "custom", rolloutCount: 418, databaseRowCount: 418, backupDir: "C:/Users/demo/.codex-session-sync/backups/provider-sync/preview", journalPath: "C:/Users/demo/.codex-session-sync/journal/provider-sync-preview.json" } : conflictReport;
     }
     if (command === "select_remote_namespace") {
       const selected = String((args as { namespaceId?: string } | undefined)?.namespaceId);

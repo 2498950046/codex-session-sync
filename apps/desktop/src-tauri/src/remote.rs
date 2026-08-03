@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use reqwest::StatusCode;
 use reqwest::blocking::{Body, Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
@@ -15,7 +16,7 @@ use sync_core::{
     HistoryTrashListResponse, HistoryTrashOperation, Namespace, NamespaceHeadResponse,
     NamespaceListResponse, OperationControl, ProtocolInfoResponse, PutObjectResponse,
     REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RestoreHistoryRequest, RevisionListResponse,
-    RevisionRootV2, RevisionSummary, StorageObjectRef, TruncateHistoryRequest,
+    RevisionRootV3, RevisionSummary, StorageObjectRef, TruncateHistoryRequest,
     TypedMissingObjectsRequest, TypedMissingObjectsResponse, digest_bytes,
 };
 use url::Url;
@@ -91,10 +92,28 @@ impl RemoteClient {
     pub fn info(&self) -> Result<ProtocolInfoResponse> {
         let response = self
             .client
-            .get(self.endpoint("api/v2/info")?)
+            .get(self.endpoint("api/v3/info")?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to connect to synchronization server")?;
+        if response.status() == StatusCode::NOT_FOUND {
+            let legacy = self
+                .client
+                .get(self.endpoint("api/v2/info")?)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .context("failed to probe the synchronization server protocol")?;
+            if legacy.status().is_success() {
+                let legacy: ProtocolInfoResponse = parse_json_response(legacy)?;
+                if legacy.service == "codex-session-sync" {
+                    bail!(
+                        "incompatible synchronization protocol: server {}, client {}; deploy or reset the server for v3",
+                        legacy.protocol_version,
+                        REMOTE_PROTOCOL_VERSION
+                    );
+                }
+            }
+        }
         let info: ProtocolInfoResponse = parse_json_response(response)?;
         if info.service != "codex-session-sync" {
             bail!("server returned an unexpected service identifier");
@@ -112,7 +131,7 @@ impl RemoteClient {
     pub fn list_namespaces(&self) -> Result<Vec<Namespace>> {
         let response = self
             .client
-            .get(self.endpoint("api/v2/namespaces")?)
+            .get(self.endpoint("api/v3/namespaces")?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to list remote namespaces")?;
@@ -121,7 +140,7 @@ impl RemoteClient {
 
     pub fn create_namespace(&self, display_name: String) -> Result<Namespace> {
         self.send_json(
-            self.client.post(self.endpoint("api/v2/namespaces")?),
+            self.client.post(self.endpoint("api/v3/namespaces")?),
             &CreateNamespaceRequest { display_name },
         )
     }
@@ -129,7 +148,7 @@ impl RemoteClient {
     pub fn rename_namespace(&self, namespace_id: Uuid, display_name: String) -> Result<Namespace> {
         self.send_json(
             self.client
-                .patch(self.endpoint(&format!("api/v2/namespaces/{namespace_id}"))?),
+                .patch(self.endpoint(&format!("api/v3/namespaces/{namespace_id}"))?),
             &RenameNamespaceRequest { display_name },
         )
     }
@@ -137,7 +156,7 @@ impl RemoteClient {
     pub fn namespace_head(&self, namespace_id: Uuid) -> Result<Option<String>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/head"))?)
+            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/head"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to read namespace head")?;
@@ -151,7 +170,7 @@ impl RemoteClient {
     pub fn namespace_head_state(&self, namespace_id: Uuid) -> Result<NamespaceHeadResponse> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/head"))?)
+            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/head"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to read namespace head")?;
@@ -165,7 +184,7 @@ impl RemoteClient {
     pub fn list_revisions(&self, namespace_id: Uuid) -> Result<Vec<RevisionSummary>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/revisions"))?)
+            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/revisions"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to list remote revisions")?;
@@ -179,7 +198,7 @@ impl RemoteClient {
     ) -> Result<HistoryTrashOperation> {
         self.send_json(
             self.client.post(self.endpoint(&format!(
-                "api/v2/namespaces/{namespace_id}/history/truncations"
+                "api/v3/namespaces/{namespace_id}/history/truncations"
             ))?),
             request,
         )
@@ -188,7 +207,7 @@ impl RemoteClient {
     pub fn list_history_trash(&self, namespace_id: Uuid) -> Result<Vec<HistoryTrashOperation>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v2/namespaces/{namespace_id}/trash"))?)
+            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/trash"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()?;
         Ok(parse_json_response::<HistoryTrashListResponse>(response)?.operations)
@@ -202,7 +221,7 @@ impl RemoteClient {
     ) -> Result<HistoryTrashOperation> {
         self.send_json(
             self.client.post(self.endpoint(&format!(
-                "api/v2/namespaces/{namespace_id}/trash/{operation_id}/restore"
+                "api/v3/namespaces/{namespace_id}/trash/{operation_id}/restore"
             ))?),
             request,
         )
@@ -213,7 +232,7 @@ impl RemoteClient {
         objects: Vec<StorageObjectRef>,
     ) -> Result<Vec<StorageObjectRef>> {
         let response: TypedMissingObjectsResponse = self.send_json(
-            self.client.post(self.endpoint("api/v2/objects/missing")?),
+            self.client.post(self.endpoint("api/v3/objects/missing")?),
             &TypedMissingObjectsRequest { objects },
         )?;
         Ok(response.missing)
@@ -233,7 +252,7 @@ impl RemoteClient {
         let response = self
             .client
             .put(self.endpoint(&format!(
-                "api/v2/objects/{}/{digest}",
+                "api/v3/objects/{}/{digest}",
                 object.kind.wire_name()
             ))?)
             .header(CONTENT_LENGTH, object.byte_length)
@@ -257,14 +276,14 @@ impl RemoteClient {
         ensure_success(
             self.client
                 .get(self.endpoint(&format!(
-                    "api/v2/objects/{}/{digest}",
+                    "api/v3/objects/{}/{digest}",
                     object.kind.wire_name()
                 ))?)
                 .send()?,
         )
     }
 
-    pub fn revision_root(&self, revision_id: &str) -> Result<RevisionRootV2> {
+    pub fn revision_root(&self, revision_id: &str) -> Result<RevisionRootV3> {
         let object = StorageObjectRef {
             kind: sync_core::StorageObjectKind::RevisionRoot,
             sha256: revision_id.to_string(),
@@ -274,7 +293,7 @@ impl RemoteClient {
         if digest_bytes(&bytes) != revision_id {
             bail!("server returned a corrupt revision root");
         }
-        let root: RevisionRootV2 = serde_json::from_slice(&bytes)?;
+        let root: RevisionRootV3 = serde_json::from_slice(&bytes)?;
         root.validate()?;
         if root.revision_id()? != revision_id {
             bail!("server returned a non-canonical revision root");
@@ -289,7 +308,7 @@ impl RemoteClient {
     ) -> Result<CommitRevisionResponse> {
         self.send_json(
             self.client.post(self.endpoint(&format!(
-                "api/v2/namespaces/{namespace_id}/revisions/commit"
+                "api/v3/namespaces/{namespace_id}/revisions/commit"
             ))?),
             request,
         )
@@ -483,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn client_runs_the_authenticated_v2_namespace_and_typed_object_flow() {
+    fn client_runs_the_authenticated_v3_namespace_and_typed_object_flow() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

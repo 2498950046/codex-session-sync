@@ -28,14 +28,15 @@ use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
     CheckoutJournal, GcPlan, ImportReport, LocalSnapshotListItem, OperationJournal,
-    QuarantinedRollout, RepositoryStorageSummary, ScanDashboardReport, SnapshotDeletionPlan,
-    SnapshotDiff, SnapshotMetadata, SnapshotSummary, SnapshotTrashEntry, SnapshotValidationReport,
-    ThreadConflictResolution, TrackingStore, create_local_snapshot,
-    create_local_snapshot_with_control, default_codex_home, default_repository_root,
-    detect_codex_processes, import_local_snapshot, import_local_snapshot_with_control,
-    quarantine_empty_rollout, recover_checkout_operation, recover_incomplete_operation,
-    scan_codex_home_dashboard, scan_codex_home_dashboard_with_control, validate_local_snapshot,
-    validate_local_snapshot_with_control,
+    ProviderSyncJournal, ProviderSyncPreview, QuarantinedRollout, RepositoryStorageSummary,
+    ScanDashboardReport, SnapshotDeletionPlan, SnapshotDiff, SnapshotMetadata, SnapshotSummary,
+    SnapshotTrashEntry, SnapshotValidationReport, ThreadConflictResolution, TrackingStore,
+    create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
+    default_repository_root, detect_codex_processes, import_local_snapshot,
+    import_local_snapshot_with_control, preview_provider_sync, quarantine_empty_rollout,
+    recover_checkout_operation, recover_incomplete_operation, recover_provider_sync,
+    scan_codex_home_dashboard, scan_codex_home_dashboard_with_control, synchronize_local_provider,
+    validate_local_snapshot, validate_local_snapshot_with_control,
 };
 use tauri::State;
 use uuid::Uuid;
@@ -108,18 +109,21 @@ struct CleanupWorkspaceDirectoriesRequest {
 enum RecoveredOperationJournal {
     Import(OperationJournal),
     Checkout(CheckoutJournal),
+    ProviderSync(ProviderSyncJournal),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryJournalKind {
     Import,
     Checkout,
+    ProviderSync,
 }
 
 #[derive(Debug, Clone)]
 struct RecoveryJournalDescriptor {
     kind: RecoveryJournalKind,
     target_codex_home: PathBuf,
+    repository_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -710,6 +714,47 @@ fn start_scan_job(jobs: State<'_, JobManager>, codex_home: Option<String>) -> Jo
 }
 
 #[tauri::command]
+async fn preview_local_provider_sync(
+    jobs: State<'_, JobManager>,
+    codex_home: Option<String>,
+    repository_root: Option<String>,
+) -> Result<ProviderSyncPreview, String> {
+    let home = resolve_codex_home(codex_home);
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        preview_provider_sync(home, &sync_core::OperationControl::default())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn start_provider_sync_job(
+    jobs: State<'_, JobManager>,
+    codex_home: Option<String>,
+    repository_root: Option<String>,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let home = resolve_codex_home(codex_home);
+    let repository = resolve_repository_root(repository_root);
+    let lock_home = home.clone();
+    jobs.start_home_repository_exclusive(
+        &lock_home,
+        &repository.clone(),
+        "provider_sync",
+        true,
+        move |control| {
+            synchronize_local_provider(home, repository, confirmed_codex_closed, &control)
+        },
+    )
+}
+
+#[tauri::command]
 fn start_snapshot_job(
     jobs: State<'_, JobManager>,
     codex_home: Option<String>,
@@ -782,8 +827,9 @@ fn start_recovery_job(
     let journal_path = PathBuf::from(journal_path);
     let descriptor = inspect_recovery_journal(&journal_path).map_err(|error| error.to_string())?;
     let recovery_kind = descriptor.kind;
-    jobs.start_exclusive(
+    jobs.start_home_repository_exclusive(
         &descriptor.target_codex_home,
+        &descriptor.repository_root,
         "recovery",
         false,
         move |_control| {
@@ -1574,14 +1620,24 @@ fn inspect_recovery_journal(journal_path: &Path) -> anyhow::Result<RecoveryJourn
         "directorySwaps",
         "expectedThreadHashes",
     ];
+    let provider_markers = ["targetProvider", "files", "databaseBackups"];
     let has_import_marker = import_markers
         .iter()
         .any(|field| object.contains_key(*field));
     let has_checkout_marker = checkout_markers
         .iter()
         .any(|field| object.contains_key(*field));
-    if has_import_marker && has_checkout_marker {
-        bail!("ambiguous recovery journal contains both import and checkout fields");
+    let has_provider_marker = provider_markers
+        .iter()
+        .all(|field| object.contains_key(*field));
+    let has_checkout_marker = has_checkout_marker && !has_provider_marker;
+    if [has_import_marker, has_checkout_marker, has_provider_marker]
+        .into_iter()
+        .filter(|marker| *marker)
+        .count()
+        > 1
+    {
+        bail!("ambiguous recovery journal contains markers for multiple operation types");
     }
 
     if has_import_marker {
@@ -1590,6 +1646,11 @@ fn inspect_recovery_journal(journal_path: &Path) -> anyhow::Result<RecoveryJourn
         return Ok(RecoveryJournalDescriptor {
             kind: RecoveryJournalKind::Import,
             target_codex_home: journal.target_codex_home,
+            repository_root: journal_path
+                .parent()
+                .and_then(Path::parent)
+                .context("import journal is not inside a repository journal directory")?
+                .to_path_buf(),
         });
     }
     if has_checkout_marker {
@@ -1598,6 +1659,16 @@ fn inspect_recovery_journal(journal_path: &Path) -> anyhow::Result<RecoveryJourn
         return Ok(RecoveryJournalDescriptor {
             kind: RecoveryJournalKind::Checkout,
             target_codex_home: journal.target_codex_home,
+            repository_root: journal.repository_root,
+        });
+    }
+    if has_provider_marker {
+        let journal: ProviderSyncJournal = serde_json::from_value(value)
+            .context("invalid provider synchronization recovery journal")?;
+        return Ok(RecoveryJournalDescriptor {
+            kind: RecoveryJournalKind::ProviderSync,
+            target_codex_home: journal.target_codex_home,
+            repository_root: journal.repository_root,
         });
     }
     bail!("unsupported recovery journal type")
@@ -1622,7 +1693,9 @@ fn discover_recovery_points(repository_root: &Path) -> anyhow::Result<Vec<Recove
         let Some(object) = value.as_object() else {
             continue;
         };
-        let kind = if ["backupDir", "plannedRollouts", "importedThreadIds"]
+        let kind = if object.contains_key("targetProvider") && object.contains_key("files") {
+            "provider_sync"
+        } else if ["backupDir", "plannedRollouts", "importedThreadIds"]
             .iter()
             .any(|field| object.contains_key(*field))
         {
@@ -1703,6 +1776,9 @@ fn recover_local_operation_as(
         )),
         RecoveryJournalKind::Checkout => Ok(RecoveredOperationJournal::Checkout(
             recover_checkout_operation(journal_path, confirmed_codex_closed)?,
+        )),
+        RecoveryJournalKind::ProviderSync => Ok(RecoveredOperationJournal::ProviderSync(
+            recover_provider_sync(journal_path, confirmed_codex_closed)?,
         )),
     }
 }
@@ -1833,6 +1909,8 @@ pub fn run() {
             recover_operation,
             list_codex_processes,
             start_scan_job,
+            preview_local_provider_sync,
+            start_provider_sync_job,
             start_snapshot_job,
             start_validation_job,
             start_import_job,
@@ -1876,7 +1954,8 @@ mod tests {
 
     use sync_core::{
         CHECKOUT_JOURNAL_SCHEMA_VERSION, CheckoutJournal, CheckoutStatus,
-        OPERATION_JOURNAL_SCHEMA_VERSION, OperationStatus,
+        OPERATION_JOURNAL_SCHEMA_VERSION, OperationStatus, PROVIDER_SYNC_JOURNAL_SCHEMA_VERSION,
+        ProviderSyncStatus,
     };
     use tempfile::tempdir;
 
@@ -1944,6 +2023,38 @@ mod tests {
             recovered,
             RecoveredOperationJournal::Import(recovered)
                 if recovered.status == OperationStatus::Completed
+                    && recovered.target_codex_home == codex_home
+        ));
+    }
+
+    #[test]
+    fn provider_sync_journal_is_dispatched_to_provider_recovery() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let repository = directory.path().join("repository");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let journal_path = directory.path().join("provider-operation.json");
+        let journal = ProviderSyncJournal {
+            schema_version: PROVIDER_SYNC_JOURNAL_SCHEMA_VERSION,
+            operation_id: Uuid::now_v7().to_string(),
+            target_codex_home: codex_home.clone(),
+            repository_root: repository,
+            target_provider: "custom".to_string(),
+            status: ProviderSyncStatus::Completed,
+            started_at: "2026-08-03T10:00:00Z".to_string(),
+            updated_at: "2026-08-03T10:00:01Z".to_string(),
+            files: Vec::new(),
+            database_backups: Vec::new(),
+            error: None,
+        };
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let recovered = recover_local_operation(&journal_path, true).unwrap();
+
+        assert!(matches!(
+            recovered,
+            RecoveredOperationJournal::ProviderSync(recovered)
+                if recovered.status == ProviderSyncStatus::Completed
                     && recovered.target_codex_home == codex_home
         ));
     }

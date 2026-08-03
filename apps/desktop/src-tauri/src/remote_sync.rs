@@ -12,9 +12,11 @@ use sync_core::{
     CheckoutReport, CheckoutTrackingUpdate, ContentStore, FilesystemContentStore, LocalSnapshot,
     OperationControl, OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution,
     ThreadMergeOutcome, TrackingRecord, TrackingStore, WorkspacePathMapper,
+    canonicalize_snapshot_provider_objects,
     checkout_local_snapshot_with_tracking_and_projects_control, create_local_snapshot_with_control,
-    load_local_snapshot, merge_thread_sets, remote_thread_view, resolve_thread_sets,
-    semantic_thread_hash, store_local_snapshot,
+    detect_configured_provider, load_local_snapshot, materialize_snapshot_provider_objects,
+    merge_thread_sets, remote_thread_view, resolve_thread_sets, semantic_thread_hash,
+    store_local_snapshot,
 };
 use uuid::Uuid;
 
@@ -133,7 +135,7 @@ pub fn restore_remote_revision_locally(
     if root.warning_count > 0 {
         bail!("incomplete remote revisions cannot be restored");
     }
-    let snapshot = workspace_mapper.materialize_snapshot_objects(
+    let snapshot = materialize_snapshot_provider_objects(
         &LocalSnapshot {
             schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id: Uuid::now_v7().to_string(),
@@ -141,9 +143,12 @@ pub fn restore_remote_revision_locally(
             threads,
             warning_count: 0,
         },
+        &detect_configured_provider(codex_home)?,
         repository_root,
         control,
     )?;
+    let snapshot =
+        workspace_mapper.materialize_snapshot_objects(&snapshot, repository_root, control)?;
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     sync_core::checkout_local_snapshot_with_control(
         manifest,
@@ -318,6 +323,7 @@ pub fn push_namespace(
         repository_root,
         control,
     )?;
+    let snapshot = canonicalize_snapshot_provider_objects(&snapshot, repository_root, control)?;
     let (revision_root, _) = sync_core::snapshot_to_revision_root(
         &snapshot,
         namespace_id,
@@ -695,6 +701,7 @@ fn prepare_pull(
         repository_root,
         control,
     )?;
+    let local = canonicalize_snapshot_provider_objects(&local, repository_root, control)?;
     let base = match previous_head.as_deref() {
         Some(head) => {
             let (root, threads, _) =
@@ -729,7 +736,7 @@ fn apply_prepared_pull(
         workspace_mapper,
         control,
     } = context;
-    let snapshot = workspace_mapper.materialize_snapshot_objects(
+    let snapshot = materialize_snapshot_provider_objects(
         &LocalSnapshot {
             schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id: Uuid::now_v7().to_string(),
@@ -737,9 +744,12 @@ fn apply_prepared_pull(
             threads,
             warning_count: 0,
         },
+        &detect_configured_provider(codex_home)?,
         repository_root,
         control,
     )?;
+    let snapshot =
+        workspace_mapper.materialize_snapshot_objects(&snapshot, repository_root, control)?;
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     let project_roots = workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
@@ -829,6 +839,12 @@ pub fn switch_namespace(
             0,
         ),
     };
+    let snapshot = materialize_snapshot_provider_objects(
+        &snapshot,
+        &detect_configured_provider(codex_home)?,
+        repository_root,
+        control,
+    )?;
     let snapshot = target_workspace_mapper.materialize_snapshot_objects(
         &snapshot,
         repository_root,
@@ -899,6 +915,7 @@ fn ensure_active_namespace_clean(
         repository_root,
         control,
     )?;
+    let local = canonicalize_snapshot_provider_objects(&local, repository_root, control)?;
     let base = match record.integrated_head.as_deref() {
         Some(head) => {
             let (root, threads, _) =
@@ -919,7 +936,7 @@ pub(crate) fn download_revision_graph(
     revision_id: &str,
     repository_root: &Path,
     control: &OperationControl,
-) -> Result<(sync_core::RevisionRootV2, Vec<ThreadBundle>, usize)> {
+) -> Result<(sync_core::RevisionRootV3, Vec<ThreadBundle>, usize)> {
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut downloaded = 0;
     let root_path =
@@ -956,7 +973,7 @@ pub(crate) fn download_revision_graph(
                 control,
             )? as usize;
         }
-        let descriptor: sync_core::ThreadDescriptor = store.read_json(
+        let descriptor: sync_core::ThreadDescriptorV3 = store.read_json(
             sync_core::StorageObjectKind::Thread,
             &thread_ref.descriptor_sha256,
             sync_core::MAX_STRUCTURED_OBJECT_BYTES,
@@ -1066,7 +1083,7 @@ fn ensure_ancestor(
 }
 
 fn validate_revision_root_namespace(
-    revision: &sync_core::RevisionRootV2,
+    revision: &sync_core::RevisionRootV3,
     namespace_id: Uuid,
 ) -> Result<()> {
     revision.validate()?;
@@ -1360,6 +1377,7 @@ mod tests {
         .unwrap();
         initialize_home(&home_a);
         initialize_home(&home_b);
+        fs::write(home_b.join("config.toml"), "model_provider = \"custom\"\n").unwrap();
         insert_fixture_thread(&home_a, "thread-a");
 
         let pushed_a = push_namespace(
@@ -1418,6 +1436,26 @@ mod tests {
                 .as_deref(),
             Some("C:/work")
         );
+        assert_eq!(
+            sync_core::scan_codex_home(&home_b).unwrap().threads[0]
+                .model_provider
+                .as_deref(),
+            Some("custom")
+        );
+        let provider_only_push = push_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &workspace_mapper_a,
+                &OperationControl::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(provider_only_push.kind, SyncOutcomeKind::NoChanges);
+        assert_eq!(provider_only_push.head.as_deref(), Some(pushed_a_head));
         insert_fixture_thread_at(&home_b, "thread-b", "C:/work/new");
 
         let remapped_b = reapply_workspace_mappings(
