@@ -887,6 +887,114 @@ pub fn repository_storage_summary_v4(
     })
 }
 
+pub fn list_local_snapshots_v4(
+    repository_root: &Path,
+) -> Result<Vec<crate::storage_v3::LocalSnapshotListItem>> {
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let directory = repository_root.join("snapshots");
+    let mut items = Vec::new();
+    if !directory.exists() {
+        return Ok(items);
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let root: SnapshotRootV4 = serde_json::from_slice(&fs::read(&path)?)?;
+        root.validate()?;
+        let mut objects = BTreeSet::<StorageObjectRefV4>::new();
+        let mut logical_bytes = 0_u64;
+        for reference in &root.threads {
+            let descriptor = store.load_descriptor(reference)?;
+            let descriptor_path = store
+                .object_path_by_id(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
+            objects.insert(StorageObjectRefV4 {
+                kind: StorageObjectKindV4::Thread,
+                sha256: reference.descriptor_sha256.clone(),
+                byte_length: fs::metadata(descriptor_path)?.len(),
+            });
+            logical_bytes = logical_bytes
+                .checked_add(descriptor.rollout.byte_length)
+                .context("snapshot logical byte count overflow")?;
+            for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter())
+            {
+                for object in store.content_objects(content)? {
+                    objects.insert(object);
+                }
+            }
+        }
+        let overlay_path =
+            store.object_path_by_id(StorageObjectKindV4::SnapshotOverlay, &root.overlay_sha256)?;
+        let overlay_bytes = fs::metadata(overlay_path)?.len();
+        let physical_referenced_bytes =
+            objects.iter().try_fold(overlay_bytes, |total, object| {
+                total
+                    .checked_add(object.byte_length)
+                    .context("snapshot physical byte count overflow")
+            })?;
+        let metadata_path = repository_root
+            .join("metadata/snapshots")
+            .join(format!("{}.json", root.snapshot_id));
+        let metadata = if metadata_path.is_file() {
+            serde_json::from_slice(&fs::read(metadata_path)?)?
+        } else {
+            crate::storage_v3::SnapshotMetadata::default()
+        };
+        items.push(crate::storage_v3::LocalSnapshotListItem {
+            snapshot_id: root.snapshot_id,
+            created_at: root.created_at,
+            manifest_path: path,
+            thread_count: root.threads.len(),
+            object_count: objects.len() + 1,
+            logical_bytes,
+            physical_referenced_bytes,
+            warning_count: root.warning_count,
+            metadata,
+        });
+    }
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
+    });
+    Ok(items)
+}
+
+pub fn plan_snapshot_deletion_v4(
+    repository_root: &Path,
+    snapshot_id: &str,
+) -> Result<crate::storage_v3::SnapshotDeletionPlan> {
+    let manifest_path = repository_root
+        .join("snapshots")
+        .join(format!("{snapshot_id}.json"));
+    if !manifest_path.is_file() {
+        bail!("snapshot not found: {snapshot_id}");
+    }
+    let snapshots = list_local_snapshots_v4(repository_root)?;
+    let target = snapshots
+        .iter()
+        .find(|item| item.snapshot_id == snapshot_id)
+        .context("snapshot not found")?;
+    let protected_by_operations = Vec::new();
+    let fingerprint = digest_bytes_v4(&canonical_json_v4(&(
+        snapshot_id,
+        target.physical_referenced_bytes,
+        &protected_by_operations,
+    ))?);
+    Ok(crate::storage_v3::SnapshotDeletionPlan {
+        snapshot_id: snapshot_id.to_string(),
+        manifest_path,
+        pinned: target.metadata.pinned,
+        protected_by_operations,
+        shared_object_count: 0,
+        exclusive_object_count: target.object_count,
+        estimated_reclaimable_bytes: target.physical_referenced_bytes,
+        plan_fingerprint: fingerprint,
+    })
+}
+
 fn directory_bytes_v4(root: &Path) -> Result<u64> {
     if !root.exists() {
         return Ok(0);

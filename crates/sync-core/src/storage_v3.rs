@@ -1347,6 +1347,9 @@ pub fn compare_local_snapshots(
 }
 
 pub fn list_local_snapshots(repository_root: &Path) -> Result<Vec<LocalSnapshotListItem>> {
+    if repository_root.join("format.json").is_file() {
+        return crate::storage_v4::list_local_snapshots_v4(repository_root);
+    }
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let directory = repository_root.join("snapshots");
     let mut items = Vec::new();
@@ -1432,6 +1435,9 @@ pub fn plan_snapshot_deletion(
     repository_root: &Path,
     snapshot_id: &str,
 ) -> Result<SnapshotDeletionPlan> {
+    if repository_root.join("format.json").is_file() {
+        return crate::storage_v4::plan_snapshot_deletion_v4(repository_root, snapshot_id);
+    }
     let manifest_path = snapshot_manifest_path(repository_root, snapshot_id)?;
     let root: SnapshotRootV3 = read_bounded_json(&manifest_path, MAX_STRUCTURED_OBJECT_BYTES)?;
     if root.snapshot_id != snapshot_id {
