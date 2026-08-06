@@ -21,8 +21,9 @@ use remote_config::{
 };
 use remote_sync::{
     LocalSyncContext, download_remote_revision_as_snapshot, download_revision_graph,
-    pull_namespace, push_namespace, reapply_workspace_mappings, resolve_pull_conflicts,
-    restore_remote_revision_and_publish, restore_remote_revision_locally, switch_namespace,
+    pull_namespace, push_latest_snapshot_namespace, push_namespace, reapply_workspace_mappings,
+    resolve_pull_conflicts, restore_remote_revision_and_publish, restore_remote_revision_locally,
+    switch_namespace,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -1418,6 +1419,50 @@ fn start_push_job(
 }
 
 #[tauri::command]
+fn start_latest_snapshot_push_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let latest_manifest = sync_core::list_local_snapshots(&repository)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .map(|item| item.manifest_path)
+        .ok_or_else(|| "没有可推送的本地快照，请先创建 Snapshot".to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "push_latest_snapshot",
+        true,
+        move |control| {
+            push_latest_snapshot_namespace(
+                remote_id,
+                namespace_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+                &latest_manifest,
+            )
+        },
+    )
+}
+
+#[tauri::command]
 fn start_pull_job(
     jobs: State<'_, JobManager>,
     repository_root: Option<String>,
@@ -1937,6 +1982,7 @@ pub fn run() {
             delete_workspace_mapping,
             get_remote_namespace_status,
             start_push_job,
+            start_latest_snapshot_push_job,
             start_pull_job,
             start_conflict_resolution_job,
             start_namespace_switch_job,

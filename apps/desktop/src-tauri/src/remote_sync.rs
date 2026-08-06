@@ -274,6 +274,32 @@ pub fn push_namespace(
     client: &RemoteClient,
     context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
+    push_namespace_with_snapshot(remote_id, namespace_id, client, context, None)
+}
+
+pub fn push_latest_snapshot_namespace(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+    manifest_path: &Path,
+) -> Result<SyncReport> {
+    push_namespace_with_snapshot(
+        remote_id,
+        namespace_id,
+        client,
+        context,
+        Some(manifest_path),
+    )
+}
+
+fn push_namespace_with_snapshot(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+    selected_manifest: Option<&Path>,
+) -> Result<SyncReport> {
     let LocalSyncContext {
         codex_home,
         repository_root,
@@ -304,15 +330,26 @@ pub fn push_namespace(
         );
     }
     let remote_head = remote_state.head.clone();
-    let summary = create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
-    if summary.warning_count > 0 {
+    let manifest_path = if let Some(path) = selected_manifest {
+        path.to_path_buf()
+    } else {
+        let summary =
+            create_local_snapshot_with_control(codex_home, repository_root, true, control)?;
+        if summary.warning_count > 0 {
+            bail!(
+                "push is blocked because the local snapshot contains {} warning(s)",
+                summary.warning_count
+            );
+        }
+        summary.manifest_path
+    };
+    let (snapshot, contents) = sync_core::load_v4_snapshot(&manifest_path, repository_root)?;
+    if snapshot.warning_count > 0 {
         bail!(
-            "push is blocked because the local snapshot contains {} warning(s)",
-            summary.warning_count
+            "push is blocked because the selected snapshot contains {} warning(s)",
+            snapshot.warning_count
         );
     }
-    let (snapshot, contents) =
-        sync_core::load_v4_snapshot(&summary.manifest_path, repository_root)?;
     let mut snapshot = workspace_mapper.canonicalize_snapshot(&snapshot);
     project_workspace_identities(&mut snapshot);
     let (revision_root, _) = sync_core::snapshot_to_revision_root_v4(

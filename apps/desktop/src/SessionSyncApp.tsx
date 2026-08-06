@@ -1503,7 +1503,7 @@ export default function SessionSyncApp() {
         <button className="button primary action-button" onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />推送</button>
         <button className="button primary action-button" onClick={() => void prepareWorkspacePathsAndStart("start_pull_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowDownToLine size={18} />拉取</button>
       </> : !namespaceStatus.activeNamespaceId && !namespaceStatus.remoteHead ?
-        <button className="button primary action-button wide" onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />用本机会话初始化并推送</button> :
+        <div className="button-row sync-initial-push-actions"><button className="button primary action-button" onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />用本机会话初始化并推送</button><button className="button secondary action-button" onClick={() => void start("start_latest_snapshot_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArchiveRestore size={18} />推送最近一次</button></div> :
         <button className="button warning action-button wide" onClick={() => setConfirmation({
           title: `切换到“${selectedNamespace.displayName}”`,
           description: <><p>应用会先创建备份，再用目标命名空间完整替换本机会话。</p><dl className="confirmation-details"><div><dt>目标</dt><dd>{selectedNamespace.displayName}</dd></div><div><dt>Codex Home</dt><dd>{codexHome}</dd></div></dl></>,
