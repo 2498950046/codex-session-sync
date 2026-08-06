@@ -50,7 +50,7 @@ use workspace_mapping::{
 #[serde(rename_all = "camelCase")]
 struct RemoteConnectionStatus {
     profile: RemoteProfileSummary,
-    protocol: sync_core::ProtocolInfoResponse,
+    protocol: sync_core::ProtocolInfoResponseV4,
     namespaces: Vec<sync_core::Namespace>,
 }
 

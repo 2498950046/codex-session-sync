@@ -9,12 +9,12 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sync_core::repository_object_path;
 use sync_core::{
-    CheckoutReport, CheckoutTrackingUpdate, ContentStore, FilesystemContentStore, LocalSnapshot,
-    OperationControl, OperationProgress, ThreadBundle, ThreadConflict, ThreadConflictResolution,
-    ThreadMergeOutcome, TrackingRecord, TrackingStore, WorkspacePathMapper,
-    canonicalize_snapshot_provider_objects,
+    CheckoutReport, CheckoutTrackingUpdate, FilesystemContentStoreV4, LocalSnapshot,
+    OperationControl, OperationProgress, RevisionCommitRequestV4, StorageObjectKindV4,
+    ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome, TrackingRecord,
+    TrackingStore, WorkspacePathMapper, canonicalize_snapshot_provider_metadata,
     checkout_local_snapshot_with_tracking_and_projects_control, create_local_snapshot_with_control,
-    detect_configured_provider, load_local_snapshot, materialize_snapshot_provider_objects,
+    detect_configured_provider, load_local_snapshot, materialize_snapshot_provider_metadata,
     merge_thread_sets, remote_thread_view, resolve_thread_sets, semantic_thread_hash,
     store_local_snapshot,
 };
@@ -135,7 +135,7 @@ pub fn restore_remote_revision_locally(
     if root.warning_count > 0 {
         bail!("incomplete remote revisions cannot be restored");
     }
-    let snapshot = materialize_snapshot_provider_objects(
+    let snapshot = materialize_snapshot_provider_metadata(
         &LocalSnapshot {
             schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id: Uuid::now_v7().to_string(),
@@ -144,11 +144,8 @@ pub fn restore_remote_revision_locally(
             warning_count: 0,
         },
         &detect_configured_provider(codex_home)?,
-        repository_root,
-        control,
     )?;
-    let snapshot =
-        workspace_mapper.materialize_snapshot_objects(&snapshot, repository_root, control)?;
+    let snapshot = workspace_mapper.materialize_snapshot(&snapshot);
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     sync_core::checkout_local_snapshot_with_control(
         manifest,
@@ -221,12 +218,8 @@ pub fn reapply_workspace_mappings(
         bail!("workspace remap is blocked because the local scan contains warnings");
     }
     let local = load_local_snapshot(local_summary.manifest_path)?;
-    let snapshot = workspace_mapper.materialize_snapshot_objects_with_reference(
-        &local,
-        &reference_threads,
-        repository_root,
-        control,
-    )?;
+    let snapshot =
+        workspace_mapper.materialize_snapshot_with_reference(&local, &reference_threads)?;
     let thread_count = snapshot.threads.len();
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     let project_roots = workspace_mapper.local_prefixes();
@@ -318,17 +311,16 @@ pub fn push_namespace(
             summary.warning_count
         );
     }
-    let snapshot = workspace_mapper.canonicalize_snapshot_objects(
-        &load_local_snapshot(&summary.manifest_path)?,
-        repository_root,
-        control,
-    )?;
-    let snapshot = canonicalize_snapshot_provider_objects(&snapshot, repository_root, control)?;
-    let (revision_root, _) = sync_core::snapshot_to_revision_root(
+    let (snapshot, contents) =
+        sync_core::load_v4_snapshot(&summary.manifest_path, repository_root)?;
+    let mut snapshot = workspace_mapper.canonicalize_snapshot(&snapshot);
+    project_workspace_identities(&mut snapshot);
+    let (revision_root, _) = sync_core::snapshot_to_revision_root_v4(
         &snapshot,
         namespace_id,
         remote_head.clone(),
         repository_root,
+        &contents,
     )?;
     let revision_id = revision_root.revision_id()?;
     if let Some(head) = remote_head.as_deref() {
@@ -381,31 +373,31 @@ pub fn push_namespace(
         );
     }
 
-    let typed_store = FilesystemContentStore::open(repository_root.to_path_buf())?;
-    let typed_objects = sync_core::collect_revision_graph(&revision_root, &typed_store)?;
-    let missing_typed = client.missing_typed_objects(typed_objects.into_iter().collect())?;
+    let typed_store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let typed_objects = sync_core::collect_revision_graph_v4(&revision_root, &typed_store)?;
+    let missing_typed = client.missing_v4_objects(typed_objects.into_iter().collect())?;
     let mut uploaded = 0;
     for (index, object) in missing_typed.iter().enumerate() {
         control.check_cancelled()?;
         control.report(OperationProgress {
             phase: "push_typed_objects".to_string(),
-            message: format!("{} {}", object.kind, object.sha256),
+            message: format!("{} {}", object.kind.wire_name(), object.sha256),
             completed: index as u64,
             total: Some(missing_typed.len() as u64),
             unit: "objects".to_string(),
             cancellable: true,
         });
         let path = typed_store.object_path(object)?;
-        if client.upload_typed_object(object, &path, control)? {
+        if client.upload_v4_object(object, &path, control)? {
             uploaded += 1;
         }
     }
 
     control.check_cancelled()?;
-    let request = sync_core::CommitRevisionRootRequest {
+    let request = RevisionCommitRequestV4 {
         expected_head: remote_head.clone(),
         expected_namespace_epoch: remote_state.namespace_epoch,
-        revision_root_sha256: revision_id.clone(),
+        revision: revision_root.clone(),
     };
     control.report(OperationProgress {
         phase: "push_commit".to_string(),
@@ -415,11 +407,11 @@ pub fn push_namespace(
         unit: "steps".to_string(),
         cancellable: false,
     });
-    let commit = match client.commit_root(namespace_id, &request) {
+    let commit = match client.commit_revision_v4(namespace_id, &request) {
         Ok(commit) => commit,
         Err(error) => {
             if client.namespace_head(namespace_id)?.as_deref() == Some(revision_id.as_str()) {
-                sync_core::CommitRevisionResponse {
+                sync_core::RevisionCommitResponseV4 {
                     namespace_id,
                     head: revision_id.clone(),
                     created: true,
@@ -696,12 +688,10 @@ fn prepare_pull(
     if local_summary.warning_count > 0 {
         bail!("pull is blocked because the local scan contains warnings");
     }
-    let local = workspace_mapper.canonicalize_snapshot_objects(
-        &load_local_snapshot(local_summary.manifest_path)?,
-        repository_root,
-        control,
-    )?;
-    let local = canonicalize_snapshot_provider_objects(&local, repository_root, control)?;
+    let mut local =
+        workspace_mapper.canonicalize_snapshot(&load_local_snapshot(local_summary.manifest_path)?);
+    project_workspace_identities(&mut local);
+    let local = canonicalize_snapshot_provider_metadata(&local);
     let base = match previous_head.as_deref() {
         Some(head) => {
             let (root, threads, _) =
@@ -736,7 +726,7 @@ fn apply_prepared_pull(
         workspace_mapper,
         control,
     } = context;
-    let snapshot = materialize_snapshot_provider_objects(
+    let snapshot = materialize_snapshot_provider_metadata(
         &LocalSnapshot {
             schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
             snapshot_id: Uuid::now_v7().to_string(),
@@ -745,11 +735,8 @@ fn apply_prepared_pull(
             warning_count: 0,
         },
         &detect_configured_provider(codex_home)?,
-        repository_root,
-        control,
     )?;
-    let snapshot =
-        workspace_mapper.materialize_snapshot_objects(&snapshot, repository_root, control)?;
+    let snapshot = workspace_mapper.materialize_snapshot(&snapshot);
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     let project_roots = workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
@@ -839,17 +826,11 @@ pub fn switch_namespace(
             0,
         ),
     };
-    let snapshot = materialize_snapshot_provider_objects(
+    let snapshot = materialize_snapshot_provider_metadata(
         &snapshot,
         &detect_configured_provider(codex_home)?,
-        repository_root,
-        control,
     )?;
-    let snapshot = target_workspace_mapper.materialize_snapshot_objects(
-        &snapshot,
-        repository_root,
-        control,
-    )?;
+    let snapshot = target_workspace_mapper.materialize_snapshot(&snapshot);
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     let project_roots = target_workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
@@ -910,12 +891,10 @@ fn ensure_active_namespace_clean(
     if local_summary.warning_count > 0 {
         bail!("namespace switch is blocked because the local scan contains warnings");
     }
-    let local = workspace_mapper.canonicalize_snapshot_objects(
-        &load_local_snapshot(local_summary.manifest_path)?,
-        repository_root,
-        control,
-    )?;
-    let local = canonicalize_snapshot_provider_objects(&local, repository_root, control)?;
+    let mut local =
+        workspace_mapper.canonicalize_snapshot(&load_local_snapshot(local_summary.manifest_path)?);
+    project_workspace_identities(&mut local);
+    let local = canonicalize_snapshot_provider_metadata(&local);
     let base = match record.integrated_head.as_deref() {
         Some(head) => {
             let (root, threads, _) =
@@ -936,15 +915,17 @@ pub(crate) fn download_revision_graph(
     revision_id: &str,
     repository_root: &Path,
     control: &OperationControl,
-) -> Result<(sync_core::RevisionRootV3, Vec<ThreadBundle>, usize)> {
-    let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
+) -> Result<(sync_core::RevisionRootV4, Vec<ThreadBundle>, usize)> {
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
     let mut downloaded = 0;
-    let root_path =
-        store.object_path_by_id(sync_core::StorageObjectKind::RevisionRoot, revision_id)?;
+    let root_path = store.object_path_by_id(StorageObjectKindV4::RevisionRoot, revision_id)?;
     let root = if root_path.exists() {
-        store.load_revision_root(revision_id)?
+        let root: sync_core::RevisionRootV4 =
+            store.read_json(StorageObjectKindV4::RevisionRoot, revision_id)?;
+        root.validate()?;
+        root
     } else {
-        let root = client.revision_root(revision_id)?;
+        let root = client.revision_root_v4(revision_id)?;
         store.store_revision_root(&root)?;
         downloaded += 1;
         root
@@ -960,105 +941,120 @@ pub(crate) fn download_revision_graph(
             unit: "threads".to_string(),
             cancellable: true,
         });
-        let descriptor_path = store.object_path_by_id(
-            sync_core::StorageObjectKind::Thread,
-            &thread_ref.descriptor_sha256,
-        )?;
+        let descriptor_path =
+            store.object_path_by_id(StorageObjectKindV4::Thread, &thread_ref.descriptor_sha256)?;
         if !descriptor_path.exists() {
-            downloaded += download_unknown_typed_object(
+            downloaded += download_unknown_v4_object(
                 client,
                 &store,
-                sync_core::StorageObjectKind::Thread,
+                StorageObjectKindV4::Thread,
                 &thread_ref.descriptor_sha256,
                 control,
             )? as usize;
         }
-        let descriptor: sync_core::ThreadDescriptorV3 = store.read_json(
-            sync_core::StorageObjectKind::Thread,
-            &thread_ref.descriptor_sha256,
-            sync_core::MAX_STRUCTURED_OBJECT_BYTES,
-        )?;
+        let descriptor = store.load_descriptor(thread_ref)?;
         descriptor.validate()?;
         if descriptor.thread_id != thread_ref.thread_id {
             bail!("thread reference ID does not match its descriptor");
         }
         for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
             match &content.storage {
-                sync_core::StorageRef::Whole { object_sha256 } => {
-                    let object = sync_core::StorageObjectRef {
-                        kind: sync_core::StorageObjectKind::Whole,
+                sync_core::StorageRefV4::Whole { object_sha256 } => {
+                    let object = sync_core::StorageObjectRefV4 {
+                        kind: StorageObjectKindV4::Whole,
                         sha256: object_sha256.clone(),
                         byte_length: content.byte_length,
                     };
-                    if !store.contains_storage_object(&object)? {
-                        let response = client.download_typed_object(&object)?;
-                        if store.install(&object, response, control)? {
-                            downloaded += 1;
-                        }
+                    if !store.object_path(&object)?.is_file()
+                        && download_known_v4_object(client, &store, &object, control)?
+                    {
+                        downloaded += 1;
                     }
                 }
-                sync_core::StorageRef::Chunked { manifest_sha256 } => {
-                    let manifest_path = store.object_path_by_id(
-                        sync_core::StorageObjectKind::ChunkManifest,
-                        manifest_sha256,
-                    )?;
+                sync_core::StorageRefV4::Chunked { manifest_sha256 } => {
+                    let manifest_path = store
+                        .object_path_by_id(StorageObjectKindV4::ChunkManifest, manifest_sha256)?;
                     if !manifest_path.exists() {
-                        downloaded += download_unknown_typed_object(
+                        downloaded += download_unknown_v4_object(
                             client,
                             &store,
-                            sync_core::StorageObjectKind::ChunkManifest,
+                            StorageObjectKindV4::ChunkManifest,
                             manifest_sha256,
                             control,
                         )? as usize;
                     }
-                    let manifest = store.load_chunk_manifest(manifest_sha256)?;
+                    let manifest: sync_core::ChunkManifestV4 =
+                        store.read_json(StorageObjectKindV4::ChunkManifest, manifest_sha256)?;
+                    manifest.validate()?;
                     if manifest.logical_sha256 != content.logical_sha256
                         || manifest.byte_length != content.byte_length
                     {
                         bail!("downloaded chunk manifest does not match rollout");
                     }
                     for chunk in manifest.chunks {
-                        let object = sync_core::StorageObjectRef {
-                            kind: sync_core::StorageObjectKind::Chunk,
+                        let object = sync_core::StorageObjectRefV4 {
+                            kind: StorageObjectKindV4::Chunk,
                             sha256: chunk.sha256,
                             byte_length: chunk.byte_length,
                         };
-                        if !store.contains_storage_object(&object)? {
-                            let response = client.download_typed_object(&object)?;
-                            if store.install(&object, response, control)? {
-                                downloaded += 1;
-                            }
+                        if !store.object_path(&object)?.is_file()
+                            && download_known_v4_object(client, &store, &object, control)?
+                        {
+                            downloaded += 1;
                         }
                     }
                 }
             }
         }
-        threads.push(descriptor.into_bundle());
+        threads.push(descriptor.into_bundle(None));
     }
     Ok((root, threads, downloaded))
 }
 
-fn download_unknown_typed_object(
+fn download_unknown_v4_object(
     client: &RemoteClient,
-    store: &FilesystemContentStore,
-    kind: sync_core::StorageObjectKind,
+    store: &FilesystemContentStoreV4,
+    kind: StorageObjectKindV4,
     sha256: &str,
     control: &OperationControl,
 ) -> Result<bool> {
-    let probe = sync_core::StorageObjectRef {
+    let probe = sync_core::StorageObjectRefV4 {
         kind,
         sha256: sha256.to_string(),
         byte_length: 0,
     };
-    let response = client.download_typed_object(&probe)?;
+    let response = client.download_v4_object(&probe)?;
     let byte_length = response
         .content_length()
         .context("typed object response has no Content-Length")?;
-    let object = sync_core::StorageObjectRef {
+    let object = sync_core::StorageObjectRefV4 {
         byte_length,
         ..probe
     };
-    store.install(&object, response, control)
+    download_known_v4_response(store, &object, response, control)
+}
+
+fn download_known_v4_object(
+    client: &RemoteClient,
+    store: &FilesystemContentStoreV4,
+    object: &sync_core::StorageObjectRefV4,
+    control: &OperationControl,
+) -> Result<bool> {
+    let response = client.download_v4_object(object)?;
+    download_known_v4_response(store, object, response, control)
+}
+
+fn download_known_v4_response(
+    store: &FilesystemContentStoreV4,
+    object: &sync_core::StorageObjectRefV4,
+    response: reqwest::blocking::Response,
+    control: &OperationControl,
+) -> Result<bool> {
+    control.check_cancelled()?;
+    let bytes = response.bytes()?;
+    let existed = store.object_path(object)?.is_file();
+    store.install_bytes(object.clone(), &bytes)?;
+    Ok(!existed)
 }
 
 fn ensure_ancestor(
@@ -1072,7 +1068,7 @@ fn ensure_ancestor(
         if current == ancestor {
             return Ok(());
         }
-        let revision = client.revision_root(&current)?;
+        let revision = client.revision_root_v4(&current)?;
         validate_revision_root_namespace(&revision, namespace_id)?;
         let Some(parent) = revision.parent_revision else {
             bail!("remote revision history does not contain the locally tracked head");
@@ -1083,7 +1079,7 @@ fn ensure_ancestor(
 }
 
 fn validate_revision_root_namespace(
-    revision: &sync_core::RevisionRootV3,
+    revision: &sync_core::RevisionRootV4,
     namespace_id: Uuid,
 ) -> Result<()> {
     revision.validate()?;
@@ -1095,6 +1091,14 @@ fn validate_revision_root_namespace(
 
 fn thread_states_equal(left: &[ThreadBundle], right: &[ThreadBundle]) -> Result<bool> {
     Ok(thread_state(left)? == thread_state(right)?)
+}
+
+fn project_workspace_identities(snapshot: &mut LocalSnapshot) {
+    for thread in &mut snapshot.threads {
+        if thread.workspace.logical_id.is_none() {
+            thread.workspace.logical_id = thread.workspace.source_path.clone();
+        }
+    }
 }
 
 fn thread_state(threads: &[ThreadBundle]) -> Result<BTreeMap<String, String>> {
@@ -1270,27 +1274,27 @@ mod tests {
             first_record.generation
         );
 
-        let mut advanced_root = client.revision_root(&first_head).unwrap();
+        let mut advanced_root = client.revision_root_v4(&first_head).unwrap();
         advanced_root.parent_revision = Some(first_head.clone());
         advanced_root.created_at = "2100-01-01T00:00:00Z".to_string();
         let advanced_head = advanced_root.revision_id().unwrap();
         assert_ne!(advanced_head, first_head);
-        let store = FilesystemContentStore::open(&repository_b).unwrap();
+        let store = FilesystemContentStoreV4::open(&repository_b).unwrap();
         let root_object = store.store_revision_root(&advanced_root).unwrap();
         client
-            .upload_typed_object(
+            .upload_v4_object(
                 &root_object,
                 &store.object_path(&root_object).unwrap(),
                 &OperationControl::default(),
             )
             .unwrap();
         client
-            .commit_root(
+            .commit_revision_v4(
                 namespace.id,
-                &sync_core::CommitRevisionRootRequest {
+                &sync_core::RevisionCommitRequestV4 {
                     expected_head: Some(first_head),
                     expected_namespace_epoch: 0,
-                    revision_root_sha256: advanced_head.clone(),
+                    revision: advanced_root,
                 },
             )
             .unwrap();
@@ -1408,7 +1412,10 @@ mod tests {
             .rollout
             .sha256
             .clone();
-        assert_eq!(object_cwd(&repository_a, &thread_a_remote_hash), "C:/work");
+        assert_eq!(
+            object_cwd(&repository_a, &thread_a_remote_hash),
+            sync_core::WORKSPACE_TOKEN_V4
+        );
 
         let switched_b = switch_namespace(
             remote_id,
@@ -1535,11 +1542,11 @@ mod tests {
         );
         assert_eq!(
             object_cwd(&repository_b, pushed_b_threads["thread-a"]),
-            "C:/work"
+            sync_core::WORKSPACE_TOKEN_V4
         );
         assert_eq!(
             object_cwd(&repository_b, pushed_b_threads["thread-b"]),
-            "C:/work/new"
+            sync_core::WORKSPACE_TOKEN_V4
         );
 
         let pulled_a = pull_namespace(

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, FileTimes, OpenOptions};
-use std::io;
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use crate::protocol::validate_sha256;
 use crate::storage_v3::{ContentRef, ContentStore, FilesystemContentStore};
 use crate::sync::{TrackingStore, semantic_thread_hash};
 
-pub const CHECKOUT_JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const CHECKOUT_JOURNAL_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +99,12 @@ pub struct CheckoutJournal {
     pub tracking_update: Option<CheckoutTrackingUpdate>,
     pub error: Option<String>,
 }
+
+/// v4 names the checkout journal explicitly. The existing field layout is
+/// intentionally retained as the wire-compatible implementation: directory
+/// swaps are FilePlans, expected thread hashes are semantic materialized
+/// hashes, and `repository_backup_dir` is the pre-operation recovery point.
+pub type OperationJournalV4 = CheckoutJournal;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -273,11 +279,7 @@ fn checkout_local_snapshot_internal(
         &local_backup_dir,
     )?;
 
-    let expected_thread_hashes = snapshot
-        .threads
-        .iter()
-        .map(|thread| Ok((thread.thread_id.clone(), semantic_thread_hash(thread)?)))
-        .collect::<Result<BTreeMap<_, _>>>()?;
+    let expected_thread_hashes = semantic_thread_hashes(&snapshot.threads)?;
     let now = Utc::now().to_rfc3339();
     let mut journal = CheckoutJournal {
         schema_version: CHECKOUT_JOURNAL_SCHEMA_VERSION,
@@ -543,22 +545,64 @@ fn stage_rollouts(
             fs::create_dir_all(parent)?;
         }
         if let Some(storage) = thread.rollout.storage.clone() {
-            FilesystemContentStore::open(repository_root.to_path_buf())?.materialize(
-                &ContentRef {
-                    logical_sha256: thread.rollout.sha256.clone(),
-                    byte_length: thread.rollout.byte_length,
-                    storage,
-                    media_type: Some(thread.rollout.media_type.clone()),
-                    logical_path: thread.rollout.logical_path.clone(),
-                },
-                &target,
-                control,
-            )?;
+            if repository_root.join("format.json").is_file() {
+                let normalized = target.with_extension("normalized.tmp");
+                let v4_storage = match storage {
+                    crate::storage_v3::StorageRef::Whole { object_sha256 } => {
+                        crate::storage_v4::StorageRefV4::Whole { object_sha256 }
+                    }
+                    crate::storage_v3::StorageRef::Chunked { manifest_sha256 } => {
+                        crate::storage_v4::StorageRefV4::Chunked { manifest_sha256 }
+                    }
+                };
+                crate::storage_v4::FilesystemContentStoreV4::open(repository_root.to_path_buf())?
+                    .materialize(
+                    &crate::storage_v4::ContentRefV4 {
+                        logical_sha256: thread.rollout.sha256.clone(),
+                        byte_length: thread.rollout.byte_length,
+                        storage: v4_storage,
+                        media_type: thread.rollout.media_type.clone(),
+                        logical_path: thread.rollout.logical_path.clone(),
+                    },
+                    &normalized,
+                )?;
+                let context = crate::storage_v4::MachineContextV4 {
+                    configured_provider: thread
+                        .model_provider
+                        .clone()
+                        .unwrap_or_else(|| "openai".to_string()),
+                    workspace_path: thread.workspace.source_path.clone(),
+                    target_codex_home: staging_root.to_path_buf(),
+                };
+                let result = crate::storage_v4::materialize_rollout_file(
+                    &normalized,
+                    &target,
+                    &thread.thread_id,
+                    &context,
+                    control,
+                );
+                let _ = fs::remove_file(normalized);
+                result?;
+            } else {
+                FilesystemContentStore::open(repository_root.to_path_buf())?.materialize(
+                    &ContentRef {
+                        logical_sha256: thread.rollout.sha256.clone(),
+                        byte_length: thread.rollout.byte_length,
+                        storage,
+                        media_type: Some(thread.rollout.media_type.clone()),
+                        logical_path: thread.rollout.logical_path.clone(),
+                    },
+                    &target,
+                    control,
+                )?;
+            }
         } else {
             let source = repository_object_path(repository_root, &thread.rollout.sha256)?;
             copy_verified_object(&source, &target, &thread.rollout.sha256, Some(control))?;
         }
-        if fs::metadata(&target)?.len() != thread.rollout.byte_length {
+        if !repository_root.join("format.json").is_file()
+            && fs::metadata(&target)?.len() != thread.rollout.byte_length
+        {
             bail!("staged rollout has an unexpected byte length");
         }
         restore_rollout_modified_time(&target, thread_modified_at_ms(thread))?;
@@ -1195,14 +1239,68 @@ fn validate_checkout_journal_result(journal: &CheckoutJournal) -> Result<()> {
 fn semantic_thread_hashes(threads: &[ThreadBundle]) -> Result<BTreeMap<String, String>> {
     let mut hashes = BTreeMap::new();
     for thread in threads {
+        let mut semantic = thread.clone();
+        if let Some(source) = semantic.rollout.source_path.as_deref() {
+            let file = std::fs::File::open(source)?;
+            let normalized = crate::storage_v4::normalize_rollout_reader(
+                BufReader::new(file),
+                &semantic.thread_id,
+                crate::storage_v4::CHUNK_SIZE_V4 as usize,
+                |_| Ok(()),
+                &OperationControl::default(),
+            )?;
+            semantic.rollout.sha256 = normalized.logical_sha256;
+            semantic.rollout.byte_length = normalized.byte_length;
+        }
+        semantic.model_provider = None;
+        // The scanner can observe the materialized machine path, but it cannot
+        // reconstruct the remote logical workspace identity stored in a v4
+        // descriptor. Checkout validation therefore compares the normalized
+        // rollout and portable thread data, while workspace materialization is
+        // validated by the staged file/database apply paths themselves.
+        semantic.workspace.logical_id = None;
+        semantic.workspace.source_path = None;
+        semantic.rollout.source_path = None;
+        semantic.rollout.storage = None;
+        semantic.rollout.logical_path = None;
+        for attachment in &mut semantic.attachments {
+            attachment.source_path = None;
+            attachment.storage = None;
+            attachment.logical_path = None;
+        }
+        semantic.related_records.source_database = None;
+        for rows in semantic.related_records.tables.values_mut() {
+            for row in rows {
+                strip_machine_fields(row);
+            }
+        }
         if hashes
-            .insert(thread.thread_id.clone(), semantic_thread_hash(thread)?)
+            .insert(thread.thread_id.clone(), semantic_thread_hash(&semantic)?)
             .is_some()
         {
             bail!("checkout contains duplicate thread ID {}", thread.thread_id);
         }
     }
     Ok(hashes)
+}
+
+fn strip_machine_fields(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for key in ["model_provider", "rollout_path", "codex_home", "cwd"] {
+                object.remove(key);
+            }
+            for value in object.values_mut() {
+                strip_machine_fields(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                strip_machine_fields(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_thread_hashes(

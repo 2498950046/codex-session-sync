@@ -35,6 +35,7 @@ pub struct NewRevisionMetadata {
     objects: Vec<ObjectDescriptor>,
     object_count_override: Option<u64>,
     total_bytes_override: Option<u64>,
+    root_schema_version: u32,
 }
 
 impl NewRevisionMetadata {
@@ -89,6 +90,7 @@ impl NewRevisionMetadata {
             objects,
             object_count_override: None,
             total_bytes_override: None,
+            root_schema_version: sync_core::REVISION_ROOT_V3_SCHEMA_VERSION,
         })
     }
 
@@ -117,6 +119,36 @@ impl NewRevisionMetadata {
             objects: Vec::new(),
             object_count_override: Some(graph.len() as u64),
             total_bytes_override: Some(total_bytes),
+            root_schema_version: sync_core::REVISION_ROOT_V3_SCHEMA_VERSION,
+        })
+    }
+
+    pub fn from_revision_root_v4(
+        root: &sync_core::RevisionRootV4,
+        root_byte_length: u64,
+        graph: &[StorageObjectRef],
+    ) -> Result<Self, MetadataError> {
+        root.validate()
+            .map_err(|_| conflict("invalid-v4-revision-root"))?;
+        let id = root
+            .revision_id()
+            .map_err(|_| conflict("invalid-v4-revision-root"))?;
+        let total_bytes = graph.iter().try_fold(0_u64, |total, object| {
+            total
+                .checked_add(object.byte_length)
+                .ok_or_else(|| conflict(&id))
+        })?;
+        Ok(Self {
+            id,
+            namespace_id: root.namespace_id,
+            parent_revision: root.parent_revision.clone(),
+            created_at: root.created_at.clone(),
+            manifest_byte_length: root_byte_length,
+            thread_count: root.threads.len() as u64,
+            objects: Vec::new(),
+            object_count_override: Some(graph.len() as u64),
+            total_bytes_override: Some(total_bytes),
+            root_schema_version: 4,
         })
     }
 
@@ -136,6 +168,7 @@ pub struct RevisionMetadata {
     pub object_count: u64,
     pub total_bytes: u64,
     pub objects: Vec<ObjectDescriptor>,
+    pub root_schema_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,7 +742,7 @@ impl MetadataStore {
             transaction.execute(
                 "INSERT INTO revision_roots (revision_id, root_sha256, root_schema_version)
                  VALUES (?1, ?1, ?2)",
-                params![revision.id, sync_core::REVISION_ROOT_V3_SCHEMA_VERSION],
+                params![revision.id, revision.root_schema_version],
             )?;
             transaction.commit()?;
             Ok((CommitRevisionOutcome::Created, current_epoch as u64))
@@ -1109,6 +1142,7 @@ fn normalize_revision(revision: NewRevisionMetadata) -> Result<RevisionMetadata,
             .total_bytes_override
             .unwrap_or(calculated_total_bytes),
         objects,
+        root_schema_version: revision.root_schema_version,
     })
 }
 
@@ -1142,9 +1176,13 @@ fn read_revision(
 ) -> Result<Option<RevisionMetadata>, MetadataError> {
     let row = connection
         .query_row(
-            "SELECT id, namespace_id, parent_revision, created_at,
-                    manifest_byte_length, thread_count, object_count, total_bytes
-             FROM revisions WHERE id = ?1",
+            "SELECT revisions.id, revisions.namespace_id, revisions.parent_revision,
+                    revisions.created_at, revisions.manifest_byte_length,
+                    revisions.thread_count, revisions.object_count, revisions.total_bytes,
+                    revision_roots.root_schema_version
+             FROM revisions
+             LEFT JOIN revision_roots ON revision_roots.revision_id = revisions.id
+             WHERE revisions.id = ?1",
             [revision_id],
             |row| {
                 let namespace_id: String = row.get(1)?;
@@ -1157,6 +1195,9 @@ fn read_revision(
                     row.get::<_, i64>(5)? as u64,
                     row.get::<_, i64>(6)? as u64,
                     row.get::<_, i64>(7)? as u64,
+                    row.get::<_, Option<i64>>(8)?
+                        .unwrap_or(i64::from(sync_core::REVISION_ROOT_V3_SCHEMA_VERSION))
+                        as u32,
                 ))
             },
         )
@@ -1170,6 +1211,7 @@ fn read_revision(
         thread_count,
         object_count,
         total_bytes,
+        root_schema_version,
     )) = row
     else {
         return Ok(None);
@@ -1196,6 +1238,7 @@ fn read_revision(
         object_count,
         total_bytes,
         objects,
+        root_schema_version,
     }))
 }
 

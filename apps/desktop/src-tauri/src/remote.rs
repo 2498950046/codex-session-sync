@@ -5,19 +5,18 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::StatusCode;
 use reqwest::blocking::{Body, Client, RequestBuilder, Response};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, HeaderMap, HeaderValue};
 use reqwest::redirect::Policy;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sync_core::{
-    ApiError, CommitRevisionResponse, CommitRevisionRootRequest, CreateNamespaceRequest,
-    HistoryTrashListResponse, HistoryTrashOperation, Namespace, NamespaceHeadResponse,
-    NamespaceListResponse, OperationControl, ProtocolInfoResponse, PutObjectResponse,
-    REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RestoreHistoryRequest, RevisionListResponse,
-    RevisionRootV3, RevisionSummary, StorageObjectRef, TruncateHistoryRequest,
-    TypedMissingObjectsRequest, TypedMissingObjectsResponse, digest_bytes,
+    ApiError, CreateNamespaceRequest, HistoryTrashListResponse, HistoryTrashOperation, Namespace,
+    NamespaceHeadResponse, NamespaceListResponse, OperationControl, ProtocolInfoResponseV4,
+    PutObjectResponse, REMOTE_PROTOCOL_VERSION_V4, RenameNamespaceRequest, RestoreHistoryRequest,
+    RevisionCommitRequestV4, RevisionCommitResponseV4, RevisionListResponse, RevisionRootV4,
+    RevisionSummary, StorageObjectKindV4, StorageObjectRef, StorageObjectRefV4,
+    TruncateHistoryRequest, TypedMissingObjectsRequest, TypedMissingObjectsResponse, digest_bytes,
 };
 use url::Url;
 use uuid::Uuid;
@@ -89,40 +88,22 @@ impl RemoteClient {
         Ok(Self { client, base_url })
     }
 
-    pub fn info(&self) -> Result<ProtocolInfoResponse> {
+    pub fn info(&self) -> Result<ProtocolInfoResponseV4> {
         let response = self
             .client
-            .get(self.endpoint("api/v3/info")?)
+            .get(self.endpoint("api/v4/info")?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to connect to synchronization server")?;
-        if response.status() == StatusCode::NOT_FOUND {
-            let legacy = self
-                .client
-                .get(self.endpoint("api/v2/info")?)
-                .timeout(REQUEST_TIMEOUT)
-                .send()
-                .context("failed to probe the synchronization server protocol")?;
-            if legacy.status().is_success() {
-                let legacy: ProtocolInfoResponse = parse_json_response(legacy)?;
-                if legacy.service == "codex-session-sync" {
-                    bail!(
-                        "incompatible synchronization protocol: server {}, client {}; deploy or reset the server for v3",
-                        legacy.protocol_version,
-                        REMOTE_PROTOCOL_VERSION
-                    );
-                }
-            }
-        }
-        let info: ProtocolInfoResponse = parse_json_response(response)?;
+        let info: ProtocolInfoResponseV4 = parse_json_response(response)?;
         if info.service != "codex-session-sync" {
             bail!("server returned an unexpected service identifier");
         }
-        if info.protocol_version != REMOTE_PROTOCOL_VERSION {
+        if info.protocol_version != REMOTE_PROTOCOL_VERSION_V4 {
             bail!(
                 "incompatible synchronization protocol: server {}, client {}",
                 info.protocol_version,
-                REMOTE_PROTOCOL_VERSION
+                REMOTE_PROTOCOL_VERSION_V4
             );
         }
         Ok(info)
@@ -131,7 +112,7 @@ impl RemoteClient {
     pub fn list_namespaces(&self) -> Result<Vec<Namespace>> {
         let response = self
             .client
-            .get(self.endpoint("api/v3/namespaces")?)
+            .get(self.endpoint("api/v4/namespaces")?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to list remote namespaces")?;
@@ -140,7 +121,7 @@ impl RemoteClient {
 
     pub fn create_namespace(&self, display_name: String) -> Result<Namespace> {
         self.send_json(
-            self.client.post(self.endpoint("api/v3/namespaces")?),
+            self.client.post(self.endpoint("api/v4/namespaces")?),
             &CreateNamespaceRequest { display_name },
         )
     }
@@ -148,7 +129,7 @@ impl RemoteClient {
     pub fn rename_namespace(&self, namespace_id: Uuid, display_name: String) -> Result<Namespace> {
         self.send_json(
             self.client
-                .patch(self.endpoint(&format!("api/v3/namespaces/{namespace_id}"))?),
+                .patch(self.endpoint(&format!("api/v4/namespaces/{namespace_id}"))?),
             &RenameNamespaceRequest { display_name },
         )
     }
@@ -156,7 +137,7 @@ impl RemoteClient {
     pub fn namespace_head(&self, namespace_id: Uuid) -> Result<Option<String>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/head"))?)
+            .get(self.endpoint(&format!("api/v4/namespaces/{namespace_id}/head"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to read namespace head")?;
@@ -170,7 +151,7 @@ impl RemoteClient {
     pub fn namespace_head_state(&self, namespace_id: Uuid) -> Result<NamespaceHeadResponse> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/head"))?)
+            .get(self.endpoint(&format!("api/v4/namespaces/{namespace_id}/head"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to read namespace head")?;
@@ -184,7 +165,7 @@ impl RemoteClient {
     pub fn list_revisions(&self, namespace_id: Uuid) -> Result<Vec<RevisionSummary>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/revisions"))?)
+            .get(self.endpoint(&format!("api/v4/namespaces/{namespace_id}/revisions"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()
             .context("failed to list remote revisions")?;
@@ -198,7 +179,7 @@ impl RemoteClient {
     ) -> Result<HistoryTrashOperation> {
         self.send_json(
             self.client.post(self.endpoint(&format!(
-                "api/v3/namespaces/{namespace_id}/history/truncations"
+                "api/v4/namespaces/{namespace_id}/history/truncations"
             ))?),
             request,
         )
@@ -207,7 +188,7 @@ impl RemoteClient {
     pub fn list_history_trash(&self, namespace_id: Uuid) -> Result<Vec<HistoryTrashOperation>> {
         let response = self
             .client
-            .get(self.endpoint(&format!("api/v3/namespaces/{namespace_id}/trash"))?)
+            .get(self.endpoint(&format!("api/v4/namespaces/{namespace_id}/trash"))?)
             .timeout(REQUEST_TIMEOUT)
             .send()?;
         Ok(parse_json_response::<HistoryTrashListResponse>(response)?.operations)
@@ -221,7 +202,7 @@ impl RemoteClient {
     ) -> Result<HistoryTrashOperation> {
         self.send_json(
             self.client.post(self.endpoint(&format!(
-                "api/v3/namespaces/{namespace_id}/trash/{operation_id}/restore"
+                "api/v4/namespaces/{namespace_id}/trash/{operation_id}/restore"
             ))?),
             request,
         )
@@ -232,7 +213,7 @@ impl RemoteClient {
         objects: Vec<StorageObjectRef>,
     ) -> Result<Vec<StorageObjectRef>> {
         let response: TypedMissingObjectsResponse = self.send_json(
-            self.client.post(self.endpoint("api/v3/objects/missing")?),
+            self.client.post(self.endpoint("api/v4/objects/missing")?),
             &TypedMissingObjectsRequest { objects },
         )?;
         Ok(response.missing)
@@ -252,7 +233,7 @@ impl RemoteClient {
         let response = self
             .client
             .put(self.endpoint(&format!(
-                "api/v3/objects/{}/{digest}",
+                "api/v4/objects/{}/{digest}",
                 object.kind.wire_name()
             ))?)
             .header(CONTENT_LENGTH, object.byte_length)
@@ -276,14 +257,41 @@ impl RemoteClient {
         ensure_success(
             self.client
                 .get(self.endpoint(&format!(
-                    "api/v3/objects/{}/{digest}",
+                    "api/v4/objects/{}/{digest}",
                     object.kind.wire_name()
                 ))?)
                 .send()?,
         )
     }
 
-    pub fn revision_root(&self, revision_id: &str) -> Result<RevisionRootV3> {
+    pub fn missing_v4_objects(
+        &self,
+        objects: Vec<StorageObjectRefV4>,
+    ) -> Result<Vec<StorageObjectRefV4>> {
+        let legacy = objects
+            .into_iter()
+            .map(v4_object_to_transport)
+            .collect::<Result<Vec<_>>>()?;
+        self.missing_typed_objects(legacy)?
+            .into_iter()
+            .map(transport_object_to_v4)
+            .collect()
+    }
+
+    pub fn upload_v4_object(
+        &self,
+        object: &StorageObjectRefV4,
+        path: &Path,
+        control: &OperationControl,
+    ) -> Result<bool> {
+        self.upload_typed_object(&v4_object_to_transport(object.clone())?, path, control)
+    }
+
+    pub fn download_v4_object(&self, object: &StorageObjectRefV4) -> Result<Response> {
+        self.download_typed_object(&v4_object_to_transport(object.clone())?)
+    }
+
+    pub fn revision_root_v4(&self, revision_id: &str) -> Result<RevisionRootV4> {
         let object = StorageObjectRef {
             kind: sync_core::StorageObjectKind::RevisionRoot,
             sha256: revision_id.to_string(),
@@ -291,24 +299,24 @@ impl RemoteClient {
         };
         let bytes = self.download_typed_object(&object)?.bytes()?;
         if digest_bytes(&bytes) != revision_id {
-            bail!("server returned a corrupt revision root");
+            bail!("server returned a corrupt v4 revision root");
         }
-        let root: RevisionRootV3 = serde_json::from_slice(&bytes)?;
+        let root: RevisionRootV4 = serde_json::from_slice(&bytes)?;
         root.validate()?;
         if root.revision_id()? != revision_id {
-            bail!("server returned a non-canonical revision root");
+            bail!("server returned a non-canonical v4 revision root");
         }
         Ok(root)
     }
 
-    pub fn commit_root(
+    pub fn commit_revision_v4(
         &self,
         namespace_id: Uuid,
-        request: &CommitRevisionRootRequest,
-    ) -> Result<CommitRevisionResponse> {
+        request: &RevisionCommitRequestV4,
+    ) -> Result<RevisionCommitResponseV4> {
         self.send_json(
             self.client.post(self.endpoint(&format!(
-                "api/v3/namespaces/{namespace_id}/revisions/commit"
+                "api/v4/namespaces/{namespace_id}/revisions/commit"
             ))?),
             request,
         )
@@ -332,6 +340,37 @@ impl RemoteClient {
             .context("synchronization server request failed")?;
         parse_json_response(response)
     }
+}
+
+fn v4_object_to_transport(object: StorageObjectRefV4) -> Result<StorageObjectRef> {
+    let kind = match object.kind {
+        StorageObjectKindV4::Whole => sync_core::StorageObjectKind::Whole,
+        StorageObjectKindV4::Chunk => sync_core::StorageObjectKind::Chunk,
+        StorageObjectKindV4::ChunkManifest => sync_core::StorageObjectKind::ChunkManifest,
+        StorageObjectKindV4::Thread => sync_core::StorageObjectKind::Thread,
+        StorageObjectKindV4::RevisionRoot => sync_core::StorageObjectKind::RevisionRoot,
+        StorageObjectKindV4::SnapshotOverlay => bail!("snapshot overlays are local-only"),
+    };
+    Ok(StorageObjectRef {
+        kind,
+        sha256: object.sha256,
+        byte_length: object.byte_length,
+    })
+}
+
+fn transport_object_to_v4(object: StorageObjectRef) -> Result<StorageObjectRefV4> {
+    let kind = match object.kind {
+        sync_core::StorageObjectKind::Whole => StorageObjectKindV4::Whole,
+        sync_core::StorageObjectKind::Chunk => StorageObjectKindV4::Chunk,
+        sync_core::StorageObjectKind::ChunkManifest => StorageObjectKindV4::ChunkManifest,
+        sync_core::StorageObjectKind::Thread => StorageObjectKindV4::Thread,
+        sync_core::StorageObjectKind::RevisionRoot => StorageObjectKindV4::RevisionRoot,
+    };
+    Ok(StorageObjectRefV4 {
+        kind,
+        sha256: object.sha256,
+        byte_length: object.byte_length,
+    })
 }
 
 struct CancellableReader<R> {
@@ -502,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn client_runs_the_authenticated_v3_namespace_and_typed_object_flow() {
+    fn client_runs_the_authenticated_v4_namespace_and_typed_object_flow() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -532,7 +571,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             client.info().unwrap().protocol_version,
-            REMOTE_PROTOCOL_VERSION
+            REMOTE_PROTOCOL_VERSION_V4
         );
         assert!(client.list_namespaces().unwrap().is_empty());
         let _namespace = client.create_namespace("Personal".to_string()).unwrap();

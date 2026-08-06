@@ -8,8 +8,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::models::{ContentObject, THREAD_BUNDLE_SCHEMA_VERSION, ThreadBundle};
+use crate::storage_v4::{
+    NORMALIZATION_SCHEMA_VERSION_V4, RevisionRootV4, STORAGE_PROTOCOL_VERSION_V4,
+    StorageObjectKindV4,
+};
 
 pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
+pub const REMOTE_PROTOCOL_VERSION_V4: u32 = 4;
 pub const REVISION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +27,168 @@ pub struct ProtocolInfoResponse {
     pub capabilities: ProtocolCapabilities,
     #[serde(default)]
     pub limits: ProtocolLimits,
+}
+
+/// v4 negotiation response.  The storage and normalization markers are
+/// deliberately explicit so a v3 repository/server cannot be mistaken for a
+/// v4 endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolInfoResponseV4 {
+    pub service: String,
+    pub version: String,
+    pub protocol_version: u32,
+    pub storage_protocol_version: u32,
+    pub normalization_schema_version: u32,
+    #[serde(default)]
+    pub capabilities: ProtocolCapabilitiesV4,
+    #[serde(default)]
+    pub limits: ProtocolLimitsV4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolCapabilitiesV4 {
+    pub namespaces: bool,
+    pub immutable_objects: bool,
+    pub revision_roots: bool,
+    pub chunk_manifests: bool,
+    pub history_epochs: bool,
+    pub gc: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolLimitsV4 {
+    pub chunk_size: u32,
+    pub max_chunks_per_content: usize,
+    pub max_threads_per_revision: usize,
+    pub max_object_references: usize,
+    pub max_structured_object_bytes: u64,
+}
+
+impl Default for ProtocolLimitsV4 {
+    fn default() -> Self {
+        Self {
+            chunk_size: crate::storage_v4::CHUNK_SIZE_V4,
+            max_chunks_per_content: crate::storage_v4::MAX_CHUNKS_PER_CONTENT_V4,
+            max_threads_per_revision: 100_000,
+            max_object_references: 500_000,
+            max_structured_object_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectDescriptorV4 {
+    pub kind: StorageObjectKindV4,
+    pub sha256: String,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingObjectsRequestV4 {
+    pub objects: Vec<ObjectDescriptorV4>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingObjectsResponseV4 {
+    pub missing: Vec<ObjectDescriptorV4>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionCommitRequestV4 {
+    pub expected_head: Option<String>,
+    pub expected_namespace_epoch: u64,
+    pub revision: RevisionRootV4,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionCommitResponseV4 {
+    pub namespace_id: Uuid,
+    pub head: String,
+    pub created: bool,
+    pub namespace_epoch: u64,
+}
+
+impl RevisionCommitRequestV4 {
+    pub fn validate(&self) -> Result<String, RevisionValidationErrorV4> {
+        self.revision
+            .validate()
+            .map_err(|error| RevisionValidationErrorV4::InvalidRoot(error.to_string()))?;
+        let actual = self
+            .revision
+            .revision_id()
+            .map_err(|error| RevisionValidationErrorV4::InvalidRoot(error.to_string()))?;
+        if self.expected_head != self.revision.parent_revision {
+            return Err(RevisionValidationErrorV4::ExpectedHeadParentMismatch {
+                expected_head: self.expected_head.clone(),
+                parent_revision: self.revision.parent_revision.clone(),
+            });
+        }
+        if let Some(head) = &self.expected_head {
+            crate::storage_v4::validate_sha256_v4(head)
+                .map_err(|_| RevisionValidationErrorV4::InvalidExpectedHead(head.clone()))?;
+        }
+        Ok(actual)
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum RevisionValidationErrorV4 {
+    #[error("invalid v4 revision root: {0}")]
+    InvalidRoot(String),
+    #[error("invalid v4 expected head: {0}")]
+    InvalidExpectedHead(String),
+    #[error("expected head {expected_head:?} must equal revision parent {parent_revision:?}")]
+    ExpectedHeadParentMismatch {
+        expected_head: Option<String>,
+        parent_revision: Option<String>,
+    },
+    #[error("v4 overlay objects are local-only and cannot be uploaded")]
+    OverlayNotRemote,
+}
+
+pub fn validate_v4_remote_object(
+    object: &ObjectDescriptorV4,
+) -> Result<(), RevisionValidationErrorV4> {
+    if object.kind == StorageObjectKindV4::SnapshotOverlay {
+        return Err(RevisionValidationErrorV4::OverlayNotRemote);
+    }
+    crate::storage_v4::validate_sha256_v4(&object.sha256)
+        .map_err(|_| RevisionValidationErrorV4::InvalidRoot("invalid object hash".to_string()))?;
+    if object.kind == StorageObjectKindV4::Chunk
+        && object.byte_length > u64::from(crate::storage_v4::CHUNK_SIZE_V4)
+    {
+        return Err(RevisionValidationErrorV4::InvalidRoot(
+            "chunk exceeds v4 chunk size".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn protocol_info_v4(version: impl Into<String>) -> ProtocolInfoResponseV4 {
+    ProtocolInfoResponseV4 {
+        service: "codex-session-sync".to_string(),
+        version: version.into(),
+        protocol_version: REMOTE_PROTOCOL_VERSION_V4,
+        storage_protocol_version: STORAGE_PROTOCOL_VERSION_V4,
+        normalization_schema_version: NORMALIZATION_SCHEMA_VERSION_V4,
+        capabilities: ProtocolCapabilitiesV4 {
+            namespaces: true,
+            immutable_objects: true,
+            revision_roots: true,
+            chunk_manifests: true,
+            history_epochs: true,
+            gc: true,
+        },
+        limits: ProtocolLimitsV4::default(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

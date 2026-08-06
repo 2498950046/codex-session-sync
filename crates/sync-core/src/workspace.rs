@@ -14,6 +14,7 @@ use crate::local::{
     install_prepared_repository_object, repository_object_path, validate_repository_object,
 };
 use crate::storage_v3::ContentStore;
+use crate::storage_v4::{FilesystemContentStoreV4, StorageRefV4};
 use crate::{LocalSnapshot, ObjectDescriptor, OperationControl, OperationProgress, ThreadBundle};
 
 const MAX_SESSION_META_BYTES: u64 = 1024 * 1024;
@@ -93,6 +94,24 @@ impl WorkspacePathMapper {
         repository_root: &Path,
         control: &OperationControl,
     ) -> Result<LocalSnapshot> {
+        let canonical = self.snapshot_with_canonical_reference(snapshot, canonical_reference)?;
+        self.materialize_snapshot_objects(&canonical, repository_root, control)
+    }
+
+    pub fn materialize_snapshot_with_reference(
+        &self,
+        snapshot: &LocalSnapshot,
+        canonical_reference: &[ThreadBundle],
+    ) -> Result<LocalSnapshot> {
+        let canonical = self.snapshot_with_canonical_reference(snapshot, canonical_reference)?;
+        Ok(self.materialize_snapshot(&canonical))
+    }
+
+    fn snapshot_with_canonical_reference(
+        &self,
+        snapshot: &LocalSnapshot,
+        canonical_reference: &[ThreadBundle],
+    ) -> Result<LocalSnapshot> {
         let mut reference_paths = BTreeMap::new();
         for thread in canonical_reference {
             let Some(path) = thread_workspace_path(thread) else {
@@ -112,7 +131,7 @@ impl WorkspacePathMapper {
                 set_thread_workspace_path(thread, path);
             }
         }
-        self.materialize_snapshot_objects(&canonical, repository_root, control)
+        Ok(canonical)
     }
 
     pub fn materialize_thread(&self, thread: &mut ThreadBundle) {
@@ -163,18 +182,18 @@ impl WorkspacePathMapper {
         } else {
             self.canonicalize_snapshot(snapshot)
         };
-        for (index, (original, thread)) in snapshot
+        for (index, (_original, thread)) in snapshot
             .threads
             .iter()
             .zip(&mut transformed.threads)
             .enumerate()
         {
             control.check_cancelled()?;
-            let original_path = thread_workspace_path(original);
             let target_path = thread_workspace_path(thread);
-            if original_path == target_path {
-                continue;
-            }
+            // v4 normalized rollouts carry the workspace token even when no
+            // mapping is configured. Rewriting the first session record is
+            // therefore still required for the legacy materialization path;
+            // the v4 semantic descriptor itself never includes this value.
             let target_path = target_path.with_context(|| {
                 format!(
                     "thread {} workspace mapping removed its target path",
@@ -240,7 +259,40 @@ fn rewrite_rollout_session_meta_cwd(
     repository_root: &Path,
     control: &OperationControl,
 ) -> Result<()> {
-    let source = repository_object_path(repository_root, &object.sha256)?;
+    let (source, temporary_source) = if repository_root.join("format.json").is_file() {
+        let storage = object
+            .storage
+            .as_ref()
+            .context("v4 rollout has no storage reference")?;
+        let storage = match storage {
+            crate::storage_v3::StorageRef::Whole { object_sha256 } => StorageRefV4::Whole {
+                object_sha256: object_sha256.clone(),
+            },
+            crate::storage_v3::StorageRef::Chunked { manifest_sha256 } => StorageRefV4::Chunked {
+                manifest_sha256: manifest_sha256.clone(),
+            },
+        };
+        let temporary = repository_root
+            .join("objects")
+            .join("tmp")
+            .join(format!("{}.workspace-source.tmp", Uuid::now_v7()));
+        FilesystemContentStoreV4::open(repository_root.to_path_buf())?.materialize(
+            &crate::storage_v4::ContentRefV4 {
+                logical_sha256: object.sha256.clone(),
+                byte_length: object.byte_length,
+                storage,
+                media_type: object.media_type.clone(),
+                logical_path: object.logical_path.clone(),
+            },
+            &temporary,
+        )?;
+        (temporary.clone(), Some(temporary))
+    } else {
+        (
+            repository_object_path(repository_root, &object.sha256)?,
+            None,
+        )
+    };
     let input = File::open(&source)
         .with_context(|| format!("failed to open rollout object {}", source.display()))?;
     let mut reader = BufReader::new(input);
@@ -254,13 +306,39 @@ fn rewrite_rollout_session_meta_cwd(
     }
     let rewritten_first_line = rewrite_session_meta_cwd(&first_line, thread_id, target_cwd)?;
     if rewritten_first_line == first_line {
-        validate_repository_object(
-            repository_root,
-            &ObjectDescriptor {
-                sha256: object.sha256.clone(),
-                byte_length: object.byte_length,
-            },
-        )?;
+        if repository_root.join("format.json").is_file() {
+            FilesystemContentStoreV4::open(repository_root.to_path_buf())?.validate_content(
+                &crate::storage_v4::ContentRefV4 {
+                    logical_sha256: object.sha256.clone(),
+                    byte_length: object.byte_length,
+                    storage: match object.storage.as_ref().context("missing v4 storage")? {
+                        crate::storage_v3::StorageRef::Whole { object_sha256 } => {
+                            StorageRefV4::Whole {
+                                object_sha256: object_sha256.clone(),
+                            }
+                        }
+                        crate::storage_v3::StorageRef::Chunked { manifest_sha256 } => {
+                            StorageRefV4::Chunked {
+                                manifest_sha256: manifest_sha256.clone(),
+                            }
+                        }
+                    },
+                    media_type: object.media_type.clone(),
+                    logical_path: object.logical_path.clone(),
+                },
+            )?;
+        } else {
+            validate_repository_object(
+                repository_root,
+                &ObjectDescriptor {
+                    sha256: object.sha256.clone(),
+                    byte_length: object.byte_length,
+                },
+            )?;
+        }
+        if let Some(path) = temporary_source {
+            let _ = fs::remove_file(path);
+        }
         return Ok(());
     }
 
@@ -323,13 +401,22 @@ fn rewrite_rollout_session_meta_cwd(
         Ok(descriptor) => descriptor,
         Err(error) => {
             let _ = fs::remove_file(&temporary);
+            if let Some(path) = temporary_source {
+                let _ = fs::remove_file(path);
+            }
             return Err(error);
         }
     };
     if let Err(error) = install_prepared_repository_object(repository_root, &temporary, &descriptor)
     {
         let _ = fs::remove_file(&temporary);
+        if let Some(path) = temporary_source {
+            let _ = fs::remove_file(path);
+        }
         return Err(error);
+    }
+    if let Some(path) = temporary_source {
+        let _ = fs::remove_file(path);
     }
     object.sha256 = descriptor.sha256;
     object.byte_length = descriptor.byte_length;

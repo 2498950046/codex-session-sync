@@ -700,7 +700,7 @@ impl ContentStore for FilesystemContentStore {
 
 impl ChunkManifest {
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != CHUNK_MANIFEST_SCHEMA_VERSION {
+        if self.schema_version != CHUNK_MANIFEST_SCHEMA_VERSION && self.schema_version != 4 {
             bail!(
                 "unsupported chunk manifest schema version {}",
                 self.schema_version
@@ -1615,6 +1615,9 @@ fn validate_uuid(value: &str, kind: &str) -> Result<()> {
 }
 
 pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
+    if repository_root.join("format.json").is_file() {
+        return crate::storage_v4::plan_local_gc_v4(repository_root);
+    }
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let mut reachable = BTreeSet::new();
     let snapshot_dir = repository_root.join("snapshots");
@@ -1713,6 +1716,9 @@ pub fn plan_local_gc(repository_root: &Path) -> Result<GcPlan> {
 }
 
 pub fn repository_storage_summary(repository_root: &Path) -> Result<RepositoryStorageSummary> {
+    if repository_root.join("format.json").is_file() {
+        return crate::storage_v4::repository_storage_summary_v4(repository_root);
+    }
     let store = FilesystemContentStore::open(repository_root.to_path_buf())?;
     let snapshots = list_local_snapshots(repository_root)?;
     let logical_bytes = snapshots.iter().try_fold(0_u64, |total, snapshot| {

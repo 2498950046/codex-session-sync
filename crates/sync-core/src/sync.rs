@@ -702,6 +702,8 @@ pub fn semantic_thread_hash(thread: &ThreadBundle) -> Result<String> {
 
 pub fn remote_thread_view(thread: &ThreadBundle) -> ThreadBundle {
     let mut thread = thread.clone();
+    thread.model_provider = None;
+    thread.workspace.source_path = None;
     thread.rollout.source_path = None;
     thread.rollout.storage = None;
     for attachment in &mut thread.attachments {
@@ -714,6 +716,8 @@ pub fn remote_thread_view(thread: &ThreadBundle) -> ThreadBundle {
             if let Some(row) = row.as_object_mut() {
                 row.remove("rollout_path");
                 row.remove("codex_home");
+                row.remove("model_provider");
+                row.remove("cwd");
                 // SQLite scans materialize every column in the local schema. Treat
                 // nullable additions and known sentinel defaults as equivalent to
                 // an older source schema that did not contain those columns.
@@ -1097,7 +1101,10 @@ mod tests {
         };
         let manifest = snapshot_to_revision(&snapshot, Uuid::now_v7(), None).unwrap();
         let restored = revision_to_snapshot(&manifest).unwrap();
-        assert_eq!(restored.threads, snapshot.threads);
+        assert_eq!(
+            restored.threads,
+            vec![remote_thread_view(&snapshot.threads[0])]
+        );
         assert_eq!(restored.warning_count, snapshot.warning_count);
     }
 }

@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod provider;
 pub mod provider_sync;
 pub mod storage_v3;
+pub mod storage_v4;
 pub mod sync;
 pub mod workspace;
 
@@ -31,5 +32,6 @@ pub use protocol::*;
 pub use provider::*;
 pub use provider_sync::*;
 pub use storage_v3::*;
+pub use storage_v4::*;
 pub use sync::*;
 pub use workspace::*;

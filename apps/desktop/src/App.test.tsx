@@ -91,7 +91,7 @@ test("history graph selects snapshots and exposes recoverable local deletion", a
   expect(screen.getByLabelText("仓库存储统计")).toHaveTextContent("仓库占用");
 
   await user.click(screen.getByText("发布前"));
-  expect(await screen.findByRole("button", { name: "精确恢复" })).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: "语义恢复" })).toBeInTheDocument();
   await user.click(screen.getAllByRole("button", { name: /移入回收站/ }).at(-1)!);
   expect(await screen.findByText("将快照移入回收站")).toBeInTheDocument();
   await user.click(screen.getAllByRole("button", { name: /移入回收站/ }).at(-1)!);

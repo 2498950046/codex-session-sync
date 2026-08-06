@@ -14,14 +14,14 @@ use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use sync_core::{
-    ChunkManifest, CommitRevisionResponse, CommitRevisionRootRequest, ContentRef,
+    ChunkManifest, ChunkManifestV4, CommitRevisionResponse, CommitRevisionRootRequest, ContentRef,
     CreateNamespaceRequest, HistoryTrashListResponse, NamespaceHeadResponse, NamespaceListResponse,
-    ProtocolCapabilities, ProtocolInfoResponse, ProtocolLimits, PutObjectResponse,
-    REMOTE_PROTOCOL_VERSION, RenameNamespaceRequest, RestoreHistoryRequest, RevisionListResponse,
-    RevisionRootV3, ServerGcPlan, ServerGcQuarantineRequest, ServerGcQuarantineResponse,
-    ServerStorageSummary, StorageObjectKind, StorageObjectRef, StorageRef, ThreadDescriptorV3,
-    TruncateHistoryRequest, TypedMissingObjectsRequest, TypedMissingObjectsResponse,
-    canonical_json, digest_bytes, validate_sha256,
+    PutObjectResponse, RenameNamespaceRequest, RestoreHistoryRequest, RevisionCommitRequestV4,
+    RevisionListResponse, RevisionRootV3, RevisionRootV4, SemanticThreadDescriptorV4, ServerGcPlan,
+    ServerGcQuarantineRequest, ServerGcQuarantineResponse, ServerStorageSummary, StorageObjectKind,
+    StorageObjectRef, StorageRef, StorageRefV4, ThreadDescriptorV3, TruncateHistoryRequest,
+    TypedMissingObjectsRequest, TypedMissingObjectsResponse, canonical_json, digest_bytes,
+    protocol_info_v4, validate_sha256,
 };
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
@@ -146,14 +146,14 @@ pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
             .saturating_add(REQUEST_ENVELOPE_OVERHEAD_BYTES),
     )
     .unwrap_or(usize::MAX);
-    let protected_v3 = Router::new()
+    let protected_v4 = Router::new()
         .route("/namespaces", get(list_namespaces).post(create_namespace))
         .route("/namespaces/{namespace_id}", patch(rename_namespace))
         .route("/namespaces/{namespace_id}/head", get(namespace_head))
         .route("/namespaces/{namespace_id}/revisions", get(list_revisions))
         .route(
             "/namespaces/{namespace_id}/revisions/commit",
-            post(commit_revision_root),
+            post(commit_revision_root_v4),
         )
         .route(
             "/namespaces/{namespace_id}/history/truncations",
@@ -178,11 +178,10 @@ pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
             require_auth,
         ))
         .with_state(state.clone());
-
     Router::new()
         .route("/health", get(health))
-        .route("/api/v3/info", get(info))
-        .nest("/api/v3", protected_v3)
+        .route("/api/v4/info", get(info_v4))
+        .nest("/api/v4", protected_v4)
         .layer(TraceLayer::new_for_http())
 }
 
@@ -194,19 +193,8 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn info() -> Json<ProtocolInfoResponse> {
-    Json(ProtocolInfoResponse {
-        service: "codex-session-sync".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_version: REMOTE_PROTOCOL_VERSION,
-        capabilities: ProtocolCapabilities {
-            chunked_objects: true,
-            thread_descriptors: true,
-            revision_roots_v3: true,
-            garbage_collection: true,
-        },
-        limits: ProtocolLimits::default(),
-    })
+async fn info_v4() -> Json<sync_core::ProtocolInfoResponseV4> {
+    Json(protocol_info_v4(env!("CARGO_PKG_VERSION")))
 }
 
 async fn plan_server_gc(State(state): State<AppState>) -> Result<Json<ServerGcPlan>, HttpError> {
@@ -521,6 +509,7 @@ async fn restore_history_trash(
     ))
 }
 
+#[allow(dead_code)]
 async fn commit_revision_root(
     State(state): State<AppState>,
     Path(namespace_id): Path<String>,
@@ -573,6 +562,177 @@ async fn commit_revision_root(
     ))
 }
 
+async fn commit_revision_root_v4(
+    State(state): State<AppState>,
+    Path(namespace_id): Path<String>,
+    payload: Result<Json<RevisionCommitRequestV4>, JsonRejection>,
+) -> Result<impl IntoResponse, HttpError> {
+    let _gc_guard = state.gc_gate.read().await;
+    let namespace_id = parse_namespace_id(&namespace_id)?;
+    let Json(payload) = parse_json(payload)?;
+    let revision_id = payload
+        .validate()
+        .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+    if payload.revision.namespace_id != namespace_id {
+        return Err(HttpError::invalid_request(
+            "v4 revision namespaceId must match the namespace route",
+        ));
+    }
+    let (root, graph) = validate_revision_graph_v4(&state, &revision_id).await?;
+    if root != payload.revision {
+        return Err(HttpError::invalid_request(
+            "uploaded v4 revision root does not match commit payload",
+        ));
+    }
+    let root_length = graph
+        .iter()
+        .find(|object| object.kind == StorageObjectKind::RevisionRoot)
+        .map(|object| object.byte_length)
+        .ok_or_else(|| HttpError::invalid_request("validated v4 graph has no revision root"))?;
+    let metadata = NewRevisionMetadata::from_revision_root_v4(&root, root_length, &graph)
+        .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+    let (outcome, namespace_epoch) = state
+        .metadata
+        .commit_revision_root(
+            payload.expected_head,
+            payload.expected_namespace_epoch,
+            metadata,
+        )
+        .await?;
+    let created = outcome.created();
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(sync_core::RevisionCommitResponseV4 {
+            namespace_id,
+            head: revision_id,
+            created,
+            namespace_epoch,
+        }),
+    ))
+}
+
+async fn validate_revision_graph_v4(
+    state: &AppState,
+    revision_id: &str,
+) -> Result<(RevisionRootV4, Vec<StorageObjectRef>), HttpError> {
+    let (root, root_object) =
+        read_typed_json::<RevisionRootV4>(state, StorageObjectKind::RevisionRoot, revision_id)
+            .await?;
+    root.validate()
+        .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+    if root
+        .revision_id()
+        .map_err(|error| HttpError::invalid_request(error.to_string()))?
+        != revision_id
+    {
+        return Err(HttpError::invalid_request(
+            "v4 revision root hash is not canonical",
+        ));
+    }
+    let mut graph = BTreeMap::from([(
+        (root_object.kind, root_object.sha256.clone()),
+        root_object.clone(),
+    )]);
+    let mut root_targets = Vec::new();
+    for thread_ref in &root.threads {
+        let (descriptor, descriptor_object) = read_typed_json::<SemanticThreadDescriptorV4>(
+            state,
+            StorageObjectKind::Thread,
+            &thread_ref.descriptor_sha256,
+        )
+        .await?;
+        descriptor
+            .validate()
+            .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+        if descriptor.thread_id != thread_ref.thread_id {
+            return Err(HttpError::invalid_request(
+                "v4 thread reference ID does not match descriptor",
+            ));
+        }
+        root_targets.push(descriptor_object.clone());
+        graph.insert(
+            (descriptor_object.kind, descriptor_object.sha256.clone()),
+            descriptor_object.clone(),
+        );
+        let mut descriptor_targets = Vec::new();
+        for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
+            let targets = validate_content_graph_v4(state, content).await?;
+            descriptor_targets.extend(targets.iter().cloned());
+            for object in targets {
+                graph.insert((object.kind, object.sha256.clone()), object);
+            }
+        }
+        state
+            .metadata
+            .replace_object_edges(descriptor_object, descriptor_targets)
+            .await?;
+    }
+    state
+        .metadata
+        .replace_object_edges(root_object, root_targets)
+        .await?;
+    Ok((root, graph.into_values().collect()))
+}
+
+async fn validate_content_graph_v4(
+    state: &AppState,
+    content: &sync_core::ContentRefV4,
+) -> Result<Vec<StorageObjectRef>, HttpError> {
+    match &content.storage {
+        StorageRefV4::Whole { object_sha256 } => {
+            let object = StorageObjectRef {
+                kind: StorageObjectKind::Whole,
+                sha256: object_sha256.clone(),
+                byte_length: content.byte_length,
+            };
+            ensure_typed_object(state, &object).await?;
+            Ok(vec![object])
+        }
+        StorageRefV4::Chunked { manifest_sha256 } => {
+            let (manifest, manifest_object) = read_typed_json::<ChunkManifestV4>(
+                state,
+                StorageObjectKind::ChunkManifest,
+                manifest_sha256,
+            )
+            .await?;
+            manifest
+                .validate()
+                .map_err(|error| HttpError::invalid_request(error.to_string()))?;
+            if manifest.logical_sha256 != content.logical_sha256
+                || manifest.byte_length != content.byte_length
+            {
+                return Err(HttpError::invalid_request(
+                    "v4 chunk manifest identity mismatch",
+                ));
+            }
+            let chunks = manifest
+                .chunks
+                .iter()
+                .map(|chunk| StorageObjectRef {
+                    kind: StorageObjectKind::Chunk,
+                    sha256: chunk.sha256.clone(),
+                    byte_length: chunk.byte_length,
+                })
+                .collect::<Vec<_>>();
+            for chunk in &chunks {
+                ensure_typed_object(state, chunk).await?;
+            }
+            state
+                .metadata
+                .replace_object_edges(manifest_object.clone(), chunks.clone())
+                .await?;
+            let mut result = vec![manifest_object];
+            result.extend(chunks);
+            Ok(result)
+        }
+    }
+}
+
+#[allow(dead_code)]
 async fn validate_revision_graph(
     state: &AppState,
     revision_id: &str,
@@ -636,6 +796,7 @@ async fn validate_revision_graph(
     Ok((root, graph.into_values().collect()))
 }
 
+#[allow(dead_code)]
 async fn validate_content_graph(
     state: &AppState,
     content: &ContentRef,

@@ -7,13 +7,15 @@ storage.
 
 ## Current implementation
 
-The development target is storage/protocol v3-only. Earlier synchronization
+The development target is storage/protocol v4-only. Earlier synchronization
 endpoints, untyped remote object transfer, and the old server Revision store
 are not part of the build. Codex compatibility is still separate: both modern
 `sqlite/*.db` and legacy `state_5.sqlite` homes are scanned, and active plus
 archived rollout directories are supported.
 
-v3 stores a provider-neutral immutable typed object graph:
+v4 stores a provider/workspace-neutral immutable typed object graph. Rollouts
+are normalized to fixed provider/workspace tokens before hashing; restore and
+checkout materialize the current machine's provider and workspace afterward:
 
 ```text
 Revision Root
@@ -31,8 +33,10 @@ rollback.
 ## Desktop features
 
 - IDEA-style version graph on Sync and Snapshot & Recovery pages.
-- Local snapshot list with labels, tags, pinning, compare, validation, exact
-  restore, and recoverable trash.
+- Local snapshot list with labels, tags, pinning, compare, validation, semantic
+  restore, and recoverable trash. Semantic restore preserves thread meaning,
+  while current-machine provider, workspace paths, and rollout formatting are
+  materialized locally.
 - Remote namespace and Revision history with download, local restore, restore
   and publish, explicit Head rewind, current-Head deletion, and trash restore.
 - Operation Recovery Points that automatically surface incomplete import and
@@ -49,28 +53,29 @@ rollback.
 - Repository storage statistics: logical bytes, physical bytes, shared and
   exclusive references, trash protection, quarantine, and reclaimable bytes.
 
-## v3 HTTP API
+## v4 HTTP API
 
-Public endpoints are `GET /health` and `GET /api/v3/info`. All data endpoints
+Public endpoints are `GET /health` and `GET /api/v4/info`. All data endpoints
 require the configured Bearer token.
 
 ```text
-GET/POST  /api/v3/namespaces
-PATCH     /api/v3/namespaces/{id}
-GET       /api/v3/namespaces/{id}/head
-GET       /api/v3/namespaces/{id}/revisions
-POST      /api/v3/namespaces/{id}/revisions/commit
-POST      /api/v3/objects/missing
-PUT/GET   /api/v3/objects/{kind}/{sha256}
-POST      /api/v3/namespaces/{id}/history/truncations
-GET       /api/v3/namespaces/{id}/trash
-POST      /api/v3/namespaces/{id}/trash/{operation}/restore
-GET       /api/v3/storage
-GET       /api/v3/gc/plan
-POST      /api/v3/gc/quarantine
+GET/POST  /api/v4/namespaces
+PATCH     /api/v4/namespaces/{id}
+GET       /api/v4/namespaces/{id}/head
+GET       /api/v4/namespaces/{id}/revisions
+POST      /api/v4/namespaces/{id}/revisions/commit
+POST      /api/v4/objects/missing
+PUT/GET   /api/v4/objects/{kind}/{sha256}
+POST      /api/v4/namespaces/{id}/history/truncations
+GET       /api/v4/namespaces/{id}/trash
+POST      /api/v4/namespaces/{id}/trash/{operation}/restore
+GET       /api/v4/storage
+GET       /api/v4/gc/plan
+POST      /api/v4/gc/quarantine
 ```
 
-Revision commits use `expectedHead` and `expectedNamespaceEpoch`. The server
+Revision commits use `expectedHead` and `expectedNamespaceEpoch`. Snapshot
+overlays are local-only and are never uploaded. The server
 validates the complete Root/Descriptor/Manifest/Chunk/Attachment graph before
 the SQLite Head compare-and-swap. History rewrites increment the namespace
 epoch and move removed revisions into recoverable trash. Server GC uses a
@@ -91,7 +96,7 @@ excluded from plans for a short safety grace period.
 ├─ trash/snapshots/
 ├─ trash/gc/
 ├─ quarantine/
-└─ index/source-objects-v3.json
+└─ index/source-objects-v4.json
 ```
 
 The default repository is `~/.codex-session-sync`. It is independent from the
@@ -99,7 +104,7 @@ real Codex Home (`~/.codex`).
 
 ## Safety boundaries
 
-Codex must be fully closed before snapshot creation, import, exact restore,
+Codex must be fully closed before snapshot creation, import, semantic restore,
 Push, Pull, conflict resolution, namespace switching, or quarantine cleanup.
 The backend performs a fresh cross-platform process check and refuses to
 terminate Codex automatically. Every write to a real Codex Home creates a

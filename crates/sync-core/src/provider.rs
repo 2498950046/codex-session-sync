@@ -62,6 +62,26 @@ pub fn materialize_snapshot_provider_objects(
     transform_snapshot_provider_objects(snapshot, Some(provider), repository_root, control)
 }
 
+pub fn canonicalize_snapshot_provider_metadata(snapshot: &LocalSnapshot) -> LocalSnapshot {
+    let mut transformed = snapshot.clone();
+    for thread in &mut transformed.threads {
+        set_thread_provider(thread, None);
+    }
+    transformed
+}
+
+pub fn materialize_snapshot_provider_metadata(
+    snapshot: &LocalSnapshot,
+    provider: &str,
+) -> Result<LocalSnapshot> {
+    let provider = validate_provider_id(provider)?;
+    let mut transformed = snapshot.clone();
+    for thread in &mut transformed.threads {
+        set_thread_provider(thread, Some(provider));
+    }
+    Ok(transformed)
+}
+
 fn transform_snapshot_provider_objects(
     snapshot: &LocalSnapshot,
     provider: Option<&str>,
