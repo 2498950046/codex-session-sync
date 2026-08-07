@@ -464,6 +464,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .advanced-mapping[open] summary { border-bottom: 1px solid var(--border); }
 .advanced-mapping .workspace-mapping-builder { padding: 10px; }
 .workspace-mapping-builder { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(260px, 1.2fr) auto; gap: 10px; align-items: end; }
+.history-fold { padding: 0; }
+.history-fold > summary, .advanced-fold > summary { padding: 13px 15px; color: var(--text-secondary); cursor: pointer; font-size: 11px; font-weight: 800; user-select: none; }
+.history-fold[open] > summary, .advanced-fold[open] > summary { border-bottom: 1px solid var(--border); }
+.history-fold > .page-stack { border-top: 1px solid var(--border); }
+.advanced-fold > .advanced-section { padding: 14px; border-top: 1px solid var(--border); }
+.advanced-fold > .advanced-section:first-of-type { border-top: none; }
+.advanced-fold .advanced-section > h3 { margin: 0 0 10px; font-size: 11px; }
+.namespaces-manager { display: grid; gap: 12px; }
 .inline-action { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-subtle); }
 .inline-action > div { display: grid; gap: 2px; }
 .inline-action span { color: var(--text-muted); font-size: 9px; }

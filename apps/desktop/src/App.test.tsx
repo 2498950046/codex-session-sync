@@ -63,6 +63,10 @@ beforeEach(() => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
 });
 
+async function expandAdvanced(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByText("高级工具"));
+}
+
 test("ready sync context exposes both directions and process detection gates writes", async () => {
   const user = userEvent.setup();
   render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
@@ -84,13 +88,14 @@ test("ready sync context exposes both directions and process detection gates wri
 
 test("history graph selects snapshots and exposes recoverable local deletion", async () => {
   const user = userEvent.setup();
-  render(<ThemeProvider><MemoryRouter initialEntries={["/history"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
 
+  await user.click(await screen.findByRole("button", { name: "打开历史与恢复" }));
   expect(await screen.findByRole("heading", { level: 2, name: "快照与恢复" })).toBeInTheDocument();
-  expect(await screen.findByText("发布前")).toBeInTheDocument();
+  expect((await screen.findAllByText("发布前")).length).toBeGreaterThan(0);
   expect(screen.getByLabelText("仓库存储统计")).toHaveTextContent("仓库占用");
 
-  await user.click(screen.getByText("发布前"));
+  await user.click(screen.getAllByText("发布前").at(-1)!);
   expect(await screen.findByRole("button", { name: "语义恢复" })).toBeInTheDocument();
   await user.click(screen.getAllByRole("button", { name: /移入回收站/ }).at(-1)!);
   expect(await screen.findByText("将快照移入回收站")).toBeInTheDocument();
@@ -103,8 +108,10 @@ test("history graph selects snapshots and exposes recoverable local deletion", a
 
 test("provider preview runs as a progress job and disables the write action", async () => {
   const user = userEvent.setup();
-  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
 
+  await screen.findByRole("heading", { level: 2, name: "设置" });
+  await expandAdvanced(user);
   const preview = await screen.findByRole("button", { name: "预览" });
   expect(screen.getByLabelText("Provider 同步范围")).toHaveTextContent("同步范围：活动会话归档会话");
   await waitFor(() => expect(preview).toBeEnabled());
@@ -116,18 +123,27 @@ test("provider preview runs as a progress job and disables the write action", as
   expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
 });
 
-test("provider sync panel is no longer rendered in settings", async () => {
+test("provider sync panel now lives inside settings advanced tools", async () => {
+  const user = userEvent.setup();
   render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
 
   expect(await screen.findByRole("heading", { level: 2, name: "设置" })).toBeInTheDocument();
-  expect(screen.queryByRole("heading", { level: 3, name: "会话 Provider" })).not.toBeInTheDocument();
+  const panel = screen.getByText("本地会话同步");
+  const advancedDetails = panel.closest("details.advanced-fold");
+  expect(advancedDetails).not.toBeNull();
+  expect(advancedDetails).not.toHaveAttribute("open");
+  await expandAdvanced(user);
+  expect(advancedDetails).toHaveAttribute("open");
+  expect(panel).toBeVisible();
 });
 
 test("provider sync remains available when preview reports zero changes", async () => {
   const user = userEvent.setup();
   providerPreviewResult = { provider: "openai", rolloutCount: 0, rolloutBytes: 0, databaseRowCount: 0, noChanges: true, warnings: [] };
-  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
 
+  await screen.findByRole("heading", { level: 2, name: "设置" });
+  await expandAdvanced(user);
   const preview = await screen.findByRole("button", { name: "预览" });
   await waitFor(() => expect(preview).toBeEnabled());
   await user.click(preview);
@@ -139,8 +155,10 @@ test("provider sync remains available when preview reports zero changes", async 
 
 test("provider sync is available before running an optional preview", async () => {
   const user = userEvent.setup();
-  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
 
+  await screen.findByRole("heading", { level: 2, name: "设置" });
+  await expandAdvanced(user);
   const sync = await screen.findByRole("button", { name: "备份并同步" });
   await waitFor(() => expect(sync).toBeEnabled());
   expect(invokeMock).not.toHaveBeenCalledWith("start_provider_sync_preview_job", expect.anything());
@@ -154,8 +172,10 @@ test("button operation failures open a focused error dialog", async () => {
   invokeMock.mockImplementation((command: string) => command === "start_provider_sync_preview_job"
     ? Promise.reject(new Error("repository is busy"))
     : Promise.resolve(response(command)));
-  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
+  render(<ThemeProvider><MemoryRouter initialEntries={["/settings"]}><App /></MemoryRouter></ThemeProvider>);
 
+  await screen.findByRole("heading", { level: 2, name: "设置" });
+  await expandAdvanced(user);
   const preview = await screen.findByRole("button", { name: "预览" });
   await waitFor(() => expect(preview).toBeEnabled());
   await user.click(preview);

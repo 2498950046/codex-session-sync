@@ -9,8 +9,8 @@ async function bootstrap() {
   const preview = new URLSearchParams(window.location.search).get("preview");
   if (!window.location.hash) {
     const lastRoute = window.localStorage.getItem("codex-session-sync.last-route");
-    const previewRoute = preview === "history" ? "/history"
-      : preview === "mapping" ? "/advanced/automatic"
+    const previewRoute = preview === "history" ? "/sync"
+      : preview === "mapping" ? "/settings"
       : preview === "conflict" || preview === "job" || preview === "failure" ? "/sync"
         : preview === "empty" || preview === "process-running" || preview === "ready" ? "/overview"
           : null;

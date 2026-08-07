@@ -2,8 +2,6 @@ import { useEffect, type ReactNode } from "react";
 import { NavLink, useLocation } from "./router";
 import {
   Activity,
-  ArchiveRestore,
-  Boxes,
   ChevronRight,
   CloudCog,
   Home,
@@ -12,29 +10,22 @@ import {
   RefreshCw,
   Settings,
   SlidersHorizontal,
-  Wrench,
 } from "lucide-react";
 import iconUrl from "../app-icon.svg";
 import type { CodexProcess } from "./types";
 
 const navigation = [
-  { to: "/history", label: "快照与恢复", icon: ArchiveRestore },
   { to: "/overview", label: "概览", icon: Home },
   { to: "/sync", label: "同步", icon: RefreshCw },
   { to: "/sessions", label: "会话", icon: MessagesSquare },
-  { to: "/namespaces", label: "命名空间", icon: Boxes },
   { to: "/settings", label: "设置", icon: Settings },
-  { to: "/advanced", label: "高级工具", icon: Wrench },
 ] as const;
 
 const titles: Record<string, { title: string; description: string }> = {
-  "/history": { title: "快照与恢复", description: "浏览本地快照、远端版本与可恢复删除记录" },
   "/overview": { title: "概览", description: "查看同步环境、配置状态和最近结果" },
   "/sync": { title: "同步", description: "安全推送、拉取或切换 Codex 会话" },
   "/sessions": { title: "会话", description: "扫描本机会话并检查兼容性" },
-  "/namespaces": { title: "命名空间", description: "组织并选择独立的会话集合" },
-  "/settings": { title: "设置", description: "配置本机路径、远端服务器和外观" },
-  "/advanced": { title: "高级工具", description: "管理映射、项目路径、快照与恢复" },
+  "/settings": { title: "设置", description: "配置本机路径、远端服务器、命名空间和高级工具" },
 };
 
 function currentTitle(pathname: string) {
@@ -67,7 +58,7 @@ export function AppShell({ children, processes, busy, onRefreshProcesses }: AppS
         {navigation.map(({ to, label, icon: Icon }) => <NavLink
           key={to}
           to={to}
-          className={({ isActive }) => `navigation-item ${isActive || (to === "/advanced" && location.pathname.startsWith("/advanced")) ? "active" : ""}`}
+          className={({ isActive }) => `navigation-item ${isActive ? "active" : ""}`}
           title={label}
         >
           <Icon size={19} aria-hidden="true" />
