@@ -1,6 +1,7 @@
 /* Product application shell and design tokens */
 * { box-sizing: border-box; }
 @keyframes progress-slide { from { transform: translateX(-130%); } to { transform: translateX(330%); } }
+@keyframes history-spinner { to { transform: rotate(360deg); } }
 :root {
   --font-sans: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
   --bg: #f3f6f7;
@@ -263,6 +264,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .version-labels { display: flex; gap: 4px; }
 .version-labels b { padding: 2px 5px; border-radius: 4px; color: var(--brand); background: color-mix(in srgb, var(--brand-soft) 70%, var(--surface)); font-size: 8px; }
 .version-log-empty { display: grid; min-height: 140px; place-items: center; color: var(--text-muted); font-size: 11px; }
+.version-log-loading, .history-action-loading { min-height: 140px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--text-muted); font-size: 11px; }
+.version-log-loading svg, .history-action-loading svg { flex: 0 0 auto; color: var(--brand); animation: history-spinner .9s linear infinite; }
+.history-action-loading { min-width: 0; border-bottom: 1px solid var(--border); }
 .version-details { min-width: 760px; display: grid; gap: 12px; padding: 16px; border-top: 1px solid var(--border); background: var(--surface-subtle); }
 .version-details h3 { margin: 2px 0 5px; }
 .version-detail-metrics { display: flex; flex-wrap: wrap; gap: 18px; color: var(--text-muted); font-size: 10px; }
