@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::body::Body;
@@ -128,6 +129,48 @@ impl AppState {
             self.metadata.complete_gc_entry(entry).await?;
         }
         Ok((count, bytes))
+    }
+
+    async fn sync_revision_graph_directories(
+        &self,
+        graph: &[StorageObjectRef],
+    ) -> Result<(), HttpError> {
+        let mut by_kind = BTreeMap::<StorageObjectKind, Vec<String>>::new();
+        for object in graph {
+            by_kind
+                .entry(object.kind)
+                .or_default()
+                .push(object.sha256.clone());
+        }
+        let started = Instant::now();
+        let mut directory_count = 0_usize;
+        let mut filesystem_wait_ms = 0_u64;
+        let mut file_sync_count_total = 0_u64;
+        let mut file_sync_bytes_total = 0_u64;
+        let mut file_sync_ms_total = 0_u64;
+        for (kind, digests) in by_kind {
+            let store = typed_store(self, kind)?;
+            let report = store.sync_object_directories(&digests).await?;
+            directory_count = directory_count.saturating_add(report.directory_count);
+            filesystem_wait_ms = filesystem_wait_ms
+                .saturating_add(u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX));
+            let metrics = store.io_metrics();
+            file_sync_count_total = file_sync_count_total.saturating_add(metrics.file_sync_count);
+            file_sync_bytes_total = file_sync_bytes_total.saturating_add(metrics.file_sync_bytes);
+            file_sync_ms_total =
+                file_sync_ms_total.saturating_add(metrics.file_sync_nanos / 1_000_000);
+        }
+        tracing::info!(
+            object_count = graph.len(),
+            directory_count,
+            directory_sync_ms = filesystem_wait_ms,
+            file_sync_count_total,
+            file_sync_bytes_total,
+            file_sync_ms_total,
+            barrier_total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "completed revision object durability barrier"
+        );
+        Ok(())
     }
 }
 
@@ -537,6 +580,7 @@ async fn commit_revision_root(
         .find(|object| object.kind == StorageObjectKind::RevisionRoot)
         .map(|object| object.byte_length)
         .ok_or_else(|| HttpError::invalid_request("validated graph has no revision root"))?;
+    state.sync_revision_graph_directories(&graph).await?;
     let metadata = NewRevisionMetadata::from_revision_root(&root, root_length, &graph)?;
     let (outcome, namespace_epoch) = state
         .metadata
@@ -589,6 +633,7 @@ async fn commit_revision_root_v4(
         .find(|object| object.kind == StorageObjectKind::RevisionRoot)
         .map(|object| object.byte_length)
         .ok_or_else(|| HttpError::invalid_request("validated v4 graph has no revision root"))?;
+    state.sync_revision_graph_directories(&graph).await?;
     let metadata = NewRevisionMetadata::from_revision_root_v4(&root, root_length, &graph)
         .map_err(|error| HttpError::invalid_request(error.to_string()))?;
     let (outcome, namespace_epoch) = state

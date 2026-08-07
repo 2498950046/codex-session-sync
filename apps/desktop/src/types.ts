@@ -414,4 +414,13 @@ export type SyncReport = {
   threadCount: number;
   conflicts: ThreadConflict[];
   checkout: CheckoutReport | null;
+  pushMetrics?: {
+    missingQueryMs: number;
+    uploadMs: number;
+    commitMs: number;
+    transferredObjects: number;
+    transferredBytes: number;
+    createdObjects: number;
+    maxConcurrency: number;
+  };
 };

@@ -2,6 +2,10 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Take};
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -219,11 +223,29 @@ impl RemoteClient {
         Ok(response.missing)
     }
 
+    #[cfg(test)]
     pub fn upload_typed_object(
         &self,
         object: &StorageObjectRef,
         path: &Path,
         control: &OperationControl,
+    ) -> Result<bool> {
+        self.upload_typed_object_with_progress(
+            object,
+            path,
+            control,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+        )
+    }
+
+    pub fn upload_typed_object_with_progress(
+        &self,
+        object: &StorageObjectRef,
+        path: &Path,
+        control: &OperationControl,
+        internal_stop: Arc<AtomicBool>,
+        on_bytes: Arc<dyn Fn(u64) + Send + Sync>,
     ) -> Result<bool> {
         let digest = raw_digest(&object.sha256)?;
         if std::fs::metadata(path)?.len() != object.byte_length {
@@ -241,6 +263,8 @@ impl RemoteClient {
                 CancellableReader {
                     inner: file,
                     control: control.clone(),
+                    internal_stop,
+                    on_bytes,
                 },
                 object.byte_length,
             ))
@@ -278,6 +302,7 @@ impl RemoteClient {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn upload_v4_object(
         &self,
         object: &StorageObjectRefV4,
@@ -285,6 +310,23 @@ impl RemoteClient {
         control: &OperationControl,
     ) -> Result<bool> {
         self.upload_typed_object(&v4_object_to_transport(object.clone())?, path, control)
+    }
+
+    pub fn upload_v4_object_with_progress(
+        &self,
+        object: &StorageObjectRefV4,
+        path: &Path,
+        control: &OperationControl,
+        internal_stop: Arc<AtomicBool>,
+        on_bytes: Arc<dyn Fn(u64) + Send + Sync>,
+    ) -> Result<bool> {
+        self.upload_typed_object_with_progress(
+            &v4_object_to_transport(object.clone())?,
+            path,
+            control,
+            internal_stop,
+            on_bytes,
+        )
     }
 
     pub fn download_v4_object(&self, object: &StorageObjectRefV4) -> Result<Response> {
@@ -376,6 +418,8 @@ fn transport_object_to_v4(object: StorageObjectRef) -> Result<StorageObjectRefV4
 struct CancellableReader<R> {
     inner: R,
     control: OperationControl,
+    internal_stop: Arc<AtomicBool>,
+    on_bytes: Arc<dyn Fn(u64) + Send + Sync>,
 }
 
 impl<R: Read> Read for CancellableReader<R> {
@@ -386,7 +430,17 @@ impl<R: Read> Read for CancellableReader<R> {
                 "operation cancelled",
             ));
         }
-        self.inner.read(buffer)
+        if self.internal_stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "parallel upload stopped after another object failed",
+            ));
+        }
+        let count = self.inner.read(buffer)?;
+        if count > 0 {
+            (self.on_bytes)(count as u64);
+        }
+        Ok(count)
     }
 }
 
@@ -466,6 +520,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicU64;
     use std::thread;
     use sync_core::{StorageObjectKind, StorageObjectRef};
     use tempfile::tempdir;
@@ -591,11 +646,22 @@ mod tests {
         );
         let object_path = temp.path().join("object");
         std::fs::write(&object_path, content).unwrap();
+        let transferred = Arc::new(AtomicU64::new(0));
+        let captured = transferred.clone();
         assert!(
             client
-                .upload_typed_object(&descriptor, &object_path, &OperationControl::default())
+                .upload_typed_object_with_progress(
+                    &descriptor,
+                    &object_path,
+                    &OperationControl::default(),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(move |count| {
+                        captured.fetch_add(count, Ordering::Relaxed);
+                    }),
+                )
                 .unwrap()
         );
+        assert_eq!(transferred.load(Ordering::Relaxed), content.len() as u64);
         assert!(
             client
                 .missing_typed_objects(vec![descriptor.clone()])

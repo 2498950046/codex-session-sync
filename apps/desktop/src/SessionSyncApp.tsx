@@ -523,6 +523,15 @@ export default function SessionSyncApp() {
   const progressPercent = job?.progress.total && job.progress.total > 0
     ? Math.min(100, Math.round((job.progress.completed / job.progress.total) * 100))
     : null;
+  const progressDetail = job
+    ? job.progress.unit === "bytes"
+      ? progressPercent === null
+        ? formatBytes(job.progress.completed)
+        : `${progressPercent}% · ${formatBytes(job.progress.completed)}/${formatBytes(job.progress.total ?? 0)}`
+      : progressPercent === null
+        ? `${job.progress.completed} ${job.progress.unit}`
+        : `${progressPercent}% · ${job.progress.completed}/${job.progress.total} ${job.progress.unit}`
+    : "";
   const jobFailure = job?.state === "failed"
     ? job.error ?? "任务失败，但没有返回错误详情"
     : null;
@@ -1518,7 +1527,7 @@ export default function SessionSyncApp() {
     <div className="section-title"><div><span className="overline">本次运行</span><h3>最近同步结果</h3></div><StatusBadge tone={syncReport.kind === "conflict" ? "warning" : "success"}>{syncReport.kind}</StatusBadge></div>
     <div className="result-summary-grid">
       <article><span>Head</span><CopyCode value={syncReport.head ?? "无 Head"} compact /><small>{syncReport.threadCount} 个会话</small></article>
-      <article><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.checkout ? "已创建本地备份" : "无需本地 checkout"}</small></article>
+      <article><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.pushMetrics ? `${formatBytes(syncReport.pushMetrics.transferredBytes)} · ${(syncReport.pushMetrics.uploadMs / 1000).toFixed(1)} 秒 · ${syncReport.pushMetrics.maxConcurrency} 路并发` : syncReport.checkout ? "已创建本地备份" : "无需本地 checkout"}</small></article>
     </div>
     {syncReport.conflicts.length > 0 && activeConflicts.length === 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><div><strong>冲突上下文已经变化</strong><span>请切回产生冲突的 Home、远端和命名空间后重新拉取。</span></div></div>}
     {activeConflicts.length > 0 && <div className="conflict-workbench modern-conflicts">
@@ -1684,7 +1693,7 @@ export default function SessionSyncApp() {
     {pendingWorkspaceSync && <div className="dialog-backdrop" role="presentation"><section className="workspace-path-modal" role="dialog" aria-modal="true" aria-label="设置本机项目路径"><div className="workspace-modal-heading"><div><span className="overline">同步前路径检查</span><h2>设置本机项目路径</h2></div><button type="button" className="icon-button" onClick={() => setPendingWorkspaceSync(null)} disabled={busy} aria-label="关闭"><X size={19} /></button></div><p>远端会话引用了当前电脑尚不可用的项目路径。选择统一父目录后仍可逐项修改。</p><div className="migration-summary"><strong>{pendingWorkspaceSync.plan.unmappedPaths.length} 项待设置</strong><span>{pendingWorkspaceSync.plan.mappedPathCount} 项已有映射 · {pendingWorkspaceSync.plan.existingPathCount} 项原路径可用</span></div><WorkspacePathEditor parentDirectory={workspaceEditorParent} drafts={workspaceDrafts} busy={busy} submitLabel="保存路径并继续" onParentChange={(value) => changeEditorParent("sync", value)} onTargetChange={(index, value) => setWorkspaceDrafts((current) => current.map((draft, candidate) => candidate === index ? { ...draft, localPath: value } : draft))} onChooseParent={() => void chooseEditorParent("sync")} onChooseTarget={(index) => void chooseEditorTarget("sync", index)} onSubmit={() => void saveWorkspaceDraftsAndContinue()} onCancel={() => setPendingWorkspaceSync(null)} /></section></div>}
     <ConfirmDialog request={confirmation} onClose={() => setConfirmation(null)} />
     <ErrorDialog message={error} onClose={() => setError(null)} />
-    {job && <aside className={`task-center ${jobFailure ? "failed" : ""}`} aria-live="polite"><div className="task-center-heading"><div><span className="overline">{job.kind} · {job.state}</span><strong>{jobFailure ? "任务失败" : job.progress.phase.replaceAll("_", " ")}</strong></div>{!isActive(job) && <button className="icon-button" onClick={() => setJob(null)} aria-label="关闭任务"><X size={17} /></button>}</div><p>{jobFailure ?? job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><div className="task-center-footer"><small>{progressPercent === null ? `${job.progress.completed} ${job.progress.unit}` : `${progressPercent}% · ${job.progress.completed}/${job.progress.total} ${job.progress.unit}`}</small>{isActive(job) && <button className="button danger small" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button>}</div></aside>}
+    {job && <aside className={`task-center ${jobFailure ? "failed" : ""}`} aria-live="polite"><div className="task-center-heading"><div><span className="overline">{job.kind} · {job.state}</span><strong>{jobFailure ? "任务失败" : job.progress.phase.replaceAll("_", " ")}</strong></div>{!isActive(job) && <button className="icon-button" onClick={() => setJob(null)} aria-label="关闭任务"><X size={17} /></button>}</div><p>{jobFailure ?? job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><div className="task-center-footer"><small>{progressDetail}</small>{isActive(job) && <button className="button danger small" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button>}</div></aside>}
   </AppShell>;
 
 }

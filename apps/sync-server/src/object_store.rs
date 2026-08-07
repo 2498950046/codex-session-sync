@@ -1,6 +1,12 @@
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -16,12 +22,33 @@ pub struct ObjectStore {
     sha256_dir: PathBuf,
     tmp_dir: PathBuf,
     max_object_bytes: u64,
+    metrics: Arc<ObjectStoreMetrics>,
+}
+
+#[derive(Debug, Default)]
+struct ObjectStoreMetrics {
+    file_sync_count: AtomicU64,
+    file_sync_bytes: AtomicU64,
+    file_sync_nanos: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutObjectResult {
     Created,
     AlreadyPresent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectorySyncReport {
+    pub directory_count: usize,
+    pub elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStoreIoMetrics {
+    pub file_sync_count: u64,
+    pub file_sync_bytes: u64,
+    pub file_sync_nanos: u64,
 }
 
 #[derive(Debug)]
@@ -74,6 +101,7 @@ impl ObjectStore {
             sha256_dir,
             tmp_dir,
             max_object_bytes,
+            metrics: Arc::new(ObjectStoreMetrics::default()),
         })
     }
 
@@ -130,8 +158,6 @@ impl ObjectStore {
 
         match fs::rename(&temp_path, &target_path).await {
             Ok(()) => {
-                sync_directory(parent).await?;
-                sync_directory(&self.sha256_dir).await?;
                 temp_guard.disarm();
                 Ok(PutObjectResult::Created)
             }
@@ -160,9 +186,43 @@ impl ObjectStore {
         }
     }
 
+    pub async fn sync_object_directories(
+        &self,
+        digests: &[String],
+    ) -> Result<DirectorySyncReport, ObjectStoreError> {
+        let mut directories = BTreeSet::new();
+        for digest in digests {
+            let path = self.object_path(digest)?;
+            directories.insert(
+                path.parent()
+                    .expect("content-addressed object paths always have a parent")
+                    .to_path_buf(),
+            );
+        }
+        let started = Instant::now();
+        for directory in &directories {
+            sync_directory(directory).await?;
+        }
+        if !directories.is_empty() {
+            sync_directory(&self.sha256_dir).await?;
+        }
+        Ok(DirectorySyncReport {
+            directory_count: directories.len() + usize::from(!directories.is_empty()),
+            elapsed: started.elapsed(),
+        })
+    }
+
     pub async fn contains(&self, digest: &str) -> Result<bool, ObjectStoreError> {
         let path = self.object_path(digest)?;
         file_exists(&path).await
+    }
+
+    pub fn io_metrics(&self) -> ObjectStoreIoMetrics {
+        ObjectStoreIoMetrics {
+            file_sync_count: self.metrics.file_sync_count.load(Ordering::Relaxed),
+            file_sync_bytes: self.metrics.file_sync_bytes.load(Ordering::Relaxed),
+            file_sync_nanos: self.metrics.file_sync_nanos.load(Ordering::Relaxed),
+        }
     }
 
     pub async fn missing(
@@ -326,9 +386,24 @@ impl ObjectStore {
         file.flush()
             .await
             .map_err(|error| io_error("flush", temp_path, error))?;
+        let sync_started = Instant::now();
         file.sync_all()
             .await
             .map_err(|error| io_error("sync", temp_path, error))?;
+        let sync_elapsed = sync_started.elapsed();
+        self.metrics.file_sync_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .file_sync_bytes
+            .fetch_add(expected_length, Ordering::Relaxed);
+        self.metrics.file_sync_nanos.fetch_add(
+            u64::try_from(sync_elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        tracing::debug!(
+            object_bytes = expected_length,
+            file_sync_ms = duration_ms(sync_elapsed),
+            "synchronized uploaded object data"
+        );
         Ok(())
     }
 
@@ -397,6 +472,10 @@ impl ObjectStore {
             .join(&hex_digest[..2])
             .join(&hex_digest[2..]))
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 async fn create_dir_all(path: &Path) -> Result<(), ObjectStoreError> {
@@ -572,6 +651,9 @@ mod tests {
         let mut downloaded = Vec::new();
         download.file.read_to_end(&mut downloaded).await.unwrap();
         assert_eq!(downloaded, content);
+        let metrics = store.io_metrics();
+        assert_eq!(metrics.file_sync_count, 1);
+        assert_eq!(metrics.file_sync_bytes, content.len() as u64);
         assert_tmp_empty(&store).await;
     }
 
@@ -771,5 +853,33 @@ mod tests {
         download.file.read_to_end(&mut downloaded).await.unwrap();
         assert_eq!(downloaded, content);
         assert_tmp_empty(&store).await;
+    }
+
+    #[tokio::test]
+    async fn commit_barrier_deduplicates_object_prefix_directories() {
+        let root = tempdir().unwrap();
+        let store = ObjectStore::open(root.path(), 1024).await.unwrap();
+        let first = digest(b"same-prefix-a");
+        let prefix = &first["sha256:".len()..][..2];
+        let second = (0_u64..)
+            .map(|index| digest(format!("same-prefix-{index}").as_bytes()))
+            .find(|candidate| &candidate["sha256:".len()..][..2] == prefix && candidate != &first)
+            .unwrap();
+        let different = (0_u64..)
+            .map(|index| digest(format!("different-prefix-{index}").as_bytes()))
+            .find(|candidate| &candidate["sha256:".len()..][..2] != prefix)
+            .unwrap();
+
+        for value in [&first, &second, &different] {
+            let path = store.object_path(value).unwrap();
+            fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+            fs::write(path, b"present").await.unwrap();
+        }
+        let report = store
+            .sync_object_directories(&[first, second, different])
+            .await
+            .unwrap();
+
+        assert_eq!(report.directory_count, 3);
     }
 }

@@ -1,7 +1,12 @@
-use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -26,6 +31,9 @@ use sync_core::detect_codex_processes;
 use crate::remote::RemoteClient;
 
 const MAX_ANCESTRY_DEPTH: usize = 10_000;
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+const UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+const UPLOAD_SPEED_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -250,6 +258,7 @@ pub fn reapply_workspace_mappings(
         thread_count,
         conflicts: Vec::new(),
         checkout: Some(checkout),
+        push_metrics: None,
     })
 }
 
@@ -266,6 +275,283 @@ pub struct SyncReport {
     pub thread_count: usize,
     pub conflicts: Vec<ThreadConflict>,
     pub checkout: Option<CheckoutReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_metrics: Option<PushMetrics>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PushMetrics {
+    pub missing_query_ms: u64,
+    pub upload_ms: u64,
+    pub commit_ms: u64,
+    pub transferred_objects: usize,
+    pub transferred_bytes: u64,
+    pub created_objects: usize,
+    pub max_concurrency: usize,
+}
+
+#[derive(Debug)]
+struct UploadBatchReport {
+    elapsed_ms: u64,
+    transferred_objects: usize,
+    transferred_bytes: u64,
+    created_objects: usize,
+    max_concurrency: usize,
+}
+
+struct UploadProgressAggregator {
+    control: OperationControl,
+    total_bytes: u64,
+    total_objects: u64,
+    transferred_bytes: AtomicU64,
+    completed_objects: AtomicU64,
+    state: Mutex<UploadProgressState>,
+}
+
+struct UploadProgressState {
+    last_report: Instant,
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl UploadProgressAggregator {
+    fn new(control: OperationControl, total_bytes: u64, total_objects: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            control,
+            total_bytes,
+            total_objects: total_objects as u64,
+            transferred_bytes: AtomicU64::new(0),
+            completed_objects: AtomicU64::new(0),
+            state: Mutex::new(UploadProgressState {
+                last_report: now.checked_sub(UPLOAD_PROGRESS_INTERVAL).unwrap_or(now),
+                samples: VecDeque::from([(now, 0)]),
+            }),
+        }
+    }
+
+    fn add_bytes(&self, count: u64) {
+        self.transferred_bytes.fetch_add(count, Ordering::Relaxed);
+        self.report(false);
+    }
+
+    fn complete_object(&self) {
+        self.completed_objects.fetch_add(1, Ordering::Relaxed);
+        self.report(false);
+    }
+
+    fn report(&self, force: bool) {
+        let now = Instant::now();
+        let transferred_bytes = self.transferred_bytes.load(Ordering::Relaxed);
+        let completed_objects = self.completed_objects.load(Ordering::Relaxed);
+        let mut state = self.state.lock().expect("upload progress lock poisoned");
+        if !force && now.duration_since(state.last_report) < UPLOAD_PROGRESS_INTERVAL {
+            return;
+        }
+        state.last_report = now;
+        state.samples.push_back((now, transferred_bytes));
+        while state.samples.len() > 2
+            && now.duration_since(state.samples[0].0) > UPLOAD_SPEED_WINDOW
+        {
+            state.samples.pop_front();
+        }
+        let bytes_per_second = state.samples.front().and_then(|(started, initial_bytes)| {
+            let elapsed = now.duration_since(*started).as_secs_f64();
+            (elapsed >= 0.1).then(|| {
+                ((transferred_bytes.saturating_sub(*initial_bytes)) as f64 / elapsed) as u64
+            })
+        });
+        drop(state);
+
+        let speed = bytes_per_second
+            .filter(|speed| *speed > 0)
+            .map(format_bytes_per_second)
+            .unwrap_or_else(|| "正在计算速度".to_string());
+        let eta = bytes_per_second
+            .filter(|speed| *speed > 0)
+            .map(|speed| {
+                format_duration(
+                    self.total_bytes
+                        .saturating_sub(transferred_bytes)
+                        .div_ceil(speed),
+                )
+            })
+            .unwrap_or_else(|| "--".to_string());
+        self.control.report(OperationProgress {
+            phase: "push_typed_objects".to_string(),
+            message: format!(
+                "已传输 {}/{}，对象 {}/{}，{}，剩余约 {}",
+                format_bytes(transferred_bytes),
+                format_bytes(self.total_bytes),
+                completed_objects,
+                self.total_objects,
+                speed,
+                eta
+            ),
+            completed: transferred_bytes,
+            total: Some(self.total_bytes),
+            unit: "bytes".to_string(),
+            cancellable: true,
+        });
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_bytes_per_second(bytes: u64) -> String {
+    format!("{}/s", format_bytes(bytes))
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds} 秒")
+    } else {
+        format!("{} 分 {} 秒", seconds / 60, seconds % 60)
+    }
+}
+
+fn upload_missing_v4_objects(
+    client: &RemoteClient,
+    store: &FilesystemContentStoreV4,
+    objects: Vec<sync_core::StorageObjectRefV4>,
+    control: &OperationControl,
+) -> Result<UploadBatchReport> {
+    let started = Instant::now();
+    let transferred_objects = objects.len();
+    let transferred_bytes = objects.iter().try_fold(0_u64, |total, object| {
+        total
+            .checked_add(object.byte_length)
+            .context("missing object byte total overflow")
+    })?;
+    if objects.is_empty() {
+        return Ok(UploadBatchReport {
+            elapsed_ms: duration_ms(started.elapsed()),
+            transferred_objects: 0,
+            transferred_bytes: 0,
+            created_objects: 0,
+            max_concurrency: 0,
+        });
+    }
+    let mut queued = VecDeque::with_capacity(transferred_objects);
+    for object in objects {
+        queued.push_back((store.object_path(&object)?, object));
+    }
+    let worker_count = DEFAULT_UPLOAD_CONCURRENCY.min(transferred_objects);
+    let queue = Arc::new(Mutex::new(queued));
+    let stop_scheduling = Arc::new(AtomicBool::new(false));
+    let first_error = Arc::new(Mutex::new(None::<anyhow::Error>));
+    let created_objects = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(UploadProgressAggregator::new(
+        control.clone(),
+        transferred_bytes,
+        transferred_objects,
+    ));
+    progress.report(true);
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let client = client.clone();
+            let control = control.clone();
+            let queue = queue.clone();
+            let stop_scheduling = stop_scheduling.clone();
+            let first_error = first_error.clone();
+            let created_objects = created_objects.clone();
+            let progress = progress.clone();
+            workers.push(scope.spawn(move || {
+                loop {
+                    if control.is_cancelled() || stop_scheduling.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let next = queue
+                        .lock()
+                        .expect("upload queue lock poisoned")
+                        .pop_front();
+                    let Some((path, object)) = next else {
+                        break;
+                    };
+                    if control.is_cancelled() || stop_scheduling.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let byte_progress = progress.clone();
+                    let on_bytes: Arc<dyn Fn(u64) + Send + Sync> =
+                        Arc::new(move |count| byte_progress.add_bytes(count));
+                    match client.upload_v4_object_with_progress(
+                        &object,
+                        &path,
+                        &control,
+                        stop_scheduling.clone(),
+                        on_bytes,
+                    ) {
+                        Ok(created) => {
+                            if created {
+                                created_objects.fetch_add(1, Ordering::Relaxed);
+                            }
+                            progress.complete_object();
+                        }
+                        Err(error) => {
+                            if !control.is_cancelled() {
+                                let mut first =
+                                    first_error.lock().expect("upload error lock poisoned");
+                                if first.is_none() {
+                                    *first = Some(error.context(format!(
+                                        "failed to upload {} {}",
+                                        object.kind.wire_name(),
+                                        object.sha256
+                                    )));
+                                }
+                            }
+                            stop_scheduling.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+        for worker in workers {
+            if worker.join().is_err() {
+                let mut first = first_error.lock().expect("upload error lock poisoned");
+                if first.is_none() {
+                    *first = Some(anyhow::anyhow!("parallel upload worker panicked"));
+                }
+                stop_scheduling.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+
+    control.check_cancelled()?;
+    if let Some(error) = first_error
+        .lock()
+        .expect("upload error lock poisoned")
+        .take()
+    {
+        return Err(error);
+    }
+    progress.report(true);
+    Ok(UploadBatchReport {
+        elapsed_ms: duration_ms(started.elapsed()),
+        transferred_objects,
+        transferred_bytes,
+        created_objects: created_objects.load(Ordering::Relaxed),
+        max_concurrency: worker_count,
+    })
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub fn push_namespace(
@@ -399,6 +685,7 @@ fn push_namespace_with_snapshot(
                 thread_count: snapshot.threads.len(),
                 conflicts: Vec::new(),
                 checkout: None,
+                push_metrics: None,
             });
         }
     }
@@ -412,23 +699,10 @@ fn push_namespace_with_snapshot(
 
     let typed_store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
     let typed_objects = sync_core::collect_revision_graph_v4(&revision_root, &typed_store)?;
+    let missing_query_started = Instant::now();
     let missing_typed = client.missing_v4_objects(typed_objects.into_iter().collect())?;
-    let mut uploaded = 0;
-    for (index, object) in missing_typed.iter().enumerate() {
-        control.check_cancelled()?;
-        control.report(OperationProgress {
-            phase: "push_typed_objects".to_string(),
-            message: format!("{} {}", object.kind.wire_name(), object.sha256),
-            completed: index as u64,
-            total: Some(missing_typed.len() as u64),
-            unit: "objects".to_string(),
-            cancellable: true,
-        });
-        let path = typed_store.object_path(object)?;
-        if client.upload_v4_object(object, &path, control)? {
-            uploaded += 1;
-        }
-    }
+    let missing_query_ms = duration_ms(missing_query_started.elapsed());
+    let upload = upload_missing_v4_objects(client, &typed_store, missing_typed, control)?;
 
     control.check_cancelled()?;
     let request = RevisionCommitRequestV4 {
@@ -444,6 +718,7 @@ fn push_namespace_with_snapshot(
         unit: "steps".to_string(),
         cancellable: false,
     });
+    let commit_started = Instant::now();
     let commit = match client.commit_revision_v4(namespace_id, &request) {
         Ok(commit) => commit,
         Err(error) => {
@@ -459,6 +734,7 @@ fn push_namespace_with_snapshot(
             }
         }
     };
+    let commit_ms = duration_ms(commit_started.elapsed());
     if commit.namespace_id != namespace_id || commit.head != revision_id {
         bail!("server committed an unexpected revision");
     }
@@ -483,11 +759,20 @@ fn push_namespace_with_snapshot(
         previous_head: remote_head,
         head: updated.integrated_head,
         revision_id: Some(revision_id),
-        uploaded_objects: uploaded,
+        uploaded_objects: upload.created_objects,
         downloaded_objects: 0,
         thread_count: snapshot.threads.len(),
         conflicts: Vec::new(),
         checkout: None,
+        push_metrics: Some(PushMetrics {
+            missing_query_ms,
+            upload_ms: upload.elapsed_ms,
+            commit_ms,
+            transferred_objects: upload.transferred_objects,
+            transferred_bytes: upload.transferred_bytes,
+            created_objects: upload.created_objects,
+            max_concurrency: upload.max_concurrency,
+        }),
     })
 }
 
@@ -510,6 +795,7 @@ pub fn pull_namespace(
                 thread_count: 0,
                 conflicts: Vec::new(),
                 checkout: None,
+                push_metrics: None,
             });
         }
         PreparedPull::Merge(prepared) => *prepared,
@@ -526,6 +812,7 @@ pub fn pull_namespace(
             thread_count: prepared.merged.threads.len(),
             conflicts: prepared.merged.conflicts,
             checkout: None,
+            push_metrics: None,
         });
     }
     let thread_count = prepared.merged.threads.len();
@@ -562,6 +849,7 @@ pub fn pull_namespace(
         thread_count,
         conflicts: Vec::new(),
         checkout: Some(checkout),
+        push_metrics: None,
     })
 }
 
@@ -651,6 +939,7 @@ pub fn resolve_pull_conflicts(
         thread_count,
         conflicts: Vec::new(),
         checkout: Some(checkout),
+        push_metrics: pushed.push_metrics,
     })
 }
 
@@ -907,6 +1196,7 @@ pub fn switch_namespace(
         thread_count: snapshot.threads.len(),
         conflicts: Vec::new(),
         checkout: Some(checkout),
+        push_metrics: None,
     })
 }
 
@@ -1177,14 +1467,159 @@ fn ensure_codex_closed() -> Result<()> {
 mod tests {
     use std::fs::{self, File};
     use std::io::{BufRead, BufReader, Write};
+    use std::sync::atomic::AtomicUsize;
 
-    use axum::Router;
+    use axum::body::Bytes;
+    use axum::extract::{Path as AxumPath, State};
+    use axum::routing::put;
+    use axum::{Json, Router};
     use rusqlite::{Connection, params};
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
     use crate::remote::SecretToken;
+
+    #[test]
+    fn upload_progress_reports_bytes_and_object_counts() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let captured = reports.clone();
+        let control = OperationControl::new(Arc::new(AtomicBool::new(false)), move |progress| {
+            captured.lock().unwrap().push(progress);
+        });
+        let progress = UploadProgressAggregator::new(control, 1024, 2);
+
+        progress.add_bytes(512);
+        progress.complete_object();
+        progress.report(true);
+
+        let reports = reports.lock().unwrap();
+        let latest = reports.last().unwrap();
+        assert_eq!(latest.phase, "push_typed_objects");
+        assert_eq!(latest.completed, 512);
+        assert_eq!(latest.total, Some(1024));
+        assert_eq!(latest.unit, "bytes");
+        assert!(latest.message.contains("对象 1/2"));
+    }
+
+    #[test]
+    fn missing_object_uploads_use_at_most_four_concurrent_requests() {
+        #[derive(Clone)]
+        struct ConcurrencyState {
+            active: Arc<AtomicUsize>,
+            maximum: Arc<AtomicUsize>,
+        }
+
+        async fn upload(
+            State(state): State<ConcurrencyState>,
+            AxumPath((_kind, digest)): AxumPath<(String, String)>,
+            body: Bytes,
+        ) -> Json<sync_core::PutObjectResponse> {
+            let active = state.active.fetch_add(1, Ordering::SeqCst) + 1;
+            state.maximum.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state.active.fetch_sub(1, Ordering::SeqCst);
+            Json(sync_core::PutObjectResponse {
+                sha256: format!("sha256:{digest}"),
+                byte_length: body.len() as u64,
+                created: true,
+            })
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = ConcurrencyState {
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum: Arc::new(AtomicUsize::new(0)),
+        };
+        let maximum = state.maximum.clone();
+        let (address, task) = runtime.block_on(async {
+            let app = Router::new()
+                .route("/api/v4/objects/{kind}/{digest}", put(upload))
+                .with_state(state);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await });
+            (address, task)
+        });
+        let client = RemoteClient::new(
+            &format!("http://{address}"),
+            SecretToken::new("test-token-that-is-long-enough-for-auth".to_string()).unwrap(),
+        )
+        .unwrap();
+        let repository = tempdir().unwrap();
+        let store = FilesystemContentStoreV4::open(repository.path()).unwrap();
+        let mut objects = Vec::new();
+        for index in 0..8 {
+            let bytes = format!("parallel-object-{index}").into_bytes();
+            let object = sync_core::StorageObjectRefV4 {
+                kind: StorageObjectKindV4::Chunk,
+                sha256: sync_core::digest_bytes(&bytes),
+                byte_length: bytes.len() as u64,
+            };
+            store.install_bytes(object.clone(), &bytes).unwrap();
+            objects.push(object);
+        }
+
+        let report =
+            upload_missing_v4_objects(&client, &store, objects, &OperationControl::default())
+                .unwrap();
+
+        assert_eq!(report.transferred_objects, 8);
+        assert_eq!(report.created_objects, 8);
+        assert_eq!(report.max_concurrency, DEFAULT_UPLOAD_CONCURRENCY);
+        assert!((2..=DEFAULT_UPLOAD_CONCURRENCY).contains(&maximum.load(Ordering::SeqCst)));
+        task.abort();
+        runtime.block_on(async {
+            let _ = task.await;
+        });
+    }
+
+    #[test]
+    fn upload_failure_does_not_mark_operation_as_user_cancelled() {
+        async fn fail_upload() -> axum::http::StatusCode {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (address, task) = runtime.block_on(async {
+            let app = Router::new().route("/api/v4/objects/{kind}/{digest}", put(fail_upload));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await });
+            (address, task)
+        });
+        let client = RemoteClient::new(
+            &format!("http://{address}"),
+            SecretToken::new("test-token-that-is-long-enough-for-auth".to_string()).unwrap(),
+        )
+        .unwrap();
+        let repository = tempdir().unwrap();
+        let store = FilesystemContentStoreV4::open(repository.path()).unwrap();
+        let bytes = b"failed-object";
+        let object = sync_core::StorageObjectRefV4 {
+            kind: StorageObjectKindV4::Chunk,
+            sha256: sync_core::digest_bytes(bytes),
+            byte_length: bytes.len() as u64,
+        };
+        store.install_bytes(object.clone(), bytes).unwrap();
+        let control = OperationControl::default();
+
+        let error = upload_missing_v4_objects(&client, &store, vec![object], &control)
+            .expect_err("server failure must fail the upload batch");
+
+        assert!(!control.is_cancelled());
+        assert!(error.to_string().contains("failed to upload chunk"));
+        task.abort();
+        runtime.block_on(async {
+            let _ = task.await;
+        });
+    }
 
     #[test]
     fn thread_state_ignores_machine_local_database_paths() {
@@ -1250,6 +1685,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pushed_a.kind, SyncOutcomeKind::Pushed);
+        let metrics = pushed_a.push_metrics.as_ref().unwrap();
+        assert!(metrics.transferred_objects > 0);
+        assert!(metrics.transferred_bytes > 0);
+        assert_eq!(metrics.max_concurrency, DEFAULT_UPLOAD_CONCURRENCY);
         let first_head = pushed_a.head.unwrap();
 
         let tracking_b = TrackingStore::open(&repository_b).unwrap();
