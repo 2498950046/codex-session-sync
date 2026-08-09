@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -11,9 +11,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::checkout::{discover_local_thread_catalog_databases, invalidate_local_thread_catalogs};
-use crate::local::{
-    atomic_write_json, backup_database, invalidate_source_object_index, restore_database,
-};
+use crate::local::{atomic_write_json, invalidate_source_object_index};
 use crate::provider::{detect_configured_provider, transform_rollout_file, validate_provider_id};
 use crate::{
     ObjectDescriptor, OperationControl, OperationProgress, ScanWarning,
@@ -26,13 +24,11 @@ pub const PROVIDER_SYNC_JOURNAL_SCHEMA_VERSION: u32 = 1;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderSyncStatus {
     Preparing,
-    BackedUp,
     ApplyingFiles,
     ApplyingDatabases,
     Validating,
     Completed,
-    RolledBack,
-    RecoveryRequired,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,18 +36,10 @@ pub enum ProviderSyncStatus {
 pub struct ProviderSyncFilePlan {
     pub thread_id: String,
     pub target: PathBuf,
-    pub backup: PathBuf,
     pub staged: PathBuf,
     pub displaced: PathBuf,
     pub original: ObjectDescriptor,
     pub replacement: ObjectDescriptor,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderSyncDatabaseBackup {
-    pub target: PathBuf,
-    pub backup: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -66,7 +54,6 @@ pub struct ProviderSyncJournal {
     pub started_at: String,
     pub updated_at: String,
     pub files: Vec<ProviderSyncFilePlan>,
-    pub database_backups: Vec<ProviderSyncDatabaseBackup>,
     pub error: Option<String>,
 }
 
@@ -89,7 +76,6 @@ pub struct ProviderSyncReport {
     pub provider: String,
     pub rollout_count: usize,
     pub database_row_count: usize,
-    pub backup_dir: PathBuf,
     pub journal_path: PathBuf,
 }
 
@@ -138,7 +124,6 @@ pub fn synchronize_local_provider(
     }
     let codex_home = codex_home.as_ref().to_path_buf();
     let repository_root = repository_root.as_ref().to_path_buf();
-    ensure_no_incomplete_provider_sync(&repository_root, &codex_home)?;
     let provider = detect_configured_provider(&codex_home)?;
     validate_provider_id(&provider)?;
     let scan = scan_codex_home_with_control(&codex_home, control)?;
@@ -159,10 +144,6 @@ pub fn synchronize_local_provider(
     let planned_database_row_count = count_database_rows(&scan.database_paths, &provider)?;
 
     let operation_id = Uuid::now_v7().to_string();
-    let backup_dir = repository_root
-        .join("backups")
-        .join("provider-sync")
-        .join(&operation_id);
     let staging_dir = codex_home
         .join(".codex-session-sync")
         .join("provider-sync")
@@ -170,8 +151,6 @@ pub fn synchronize_local_provider(
     let journal_path = repository_root
         .join("journal")
         .join(format!("provider-sync-{operation_id}.json"));
-    fs::create_dir_all(backup_dir.join("rollouts"))?;
-    fs::create_dir_all(backup_dir.join("databases"))?;
     fs::create_dir_all(&staging_dir)?;
     fs::create_dir_all(repository_root.join("journal"))?;
     let now = Utc::now().to_rfc3339();
@@ -185,7 +164,6 @@ pub fn synchronize_local_provider(
         started_at: now.clone(),
         updated_at: now,
         files: Vec::new(),
-        database_backups: Vec::new(),
         error: None,
     };
     write_journal(&journal_path, &journal)?;
@@ -212,8 +190,6 @@ pub fn synchronize_local_provider(
                 unit: "rollouts".to_string(),
                 cancellable: true,
             });
-            let backup = backup_dir.join("rollouts").join(format!("{index}.jsonl"));
-            copy_durable(target, &backup, control)?;
             let staged = staging_dir.join(format!("{index}.jsonl"));
             let replacement =
                 stage_provider_rollout(target, &staged, thread_id, &provider, control)?;
@@ -222,7 +198,6 @@ pub fn synchronize_local_provider(
             journal.files.push(ProviderSyncFilePlan {
                 thread_id: thread_id.clone(),
                 target: target.clone(),
-                backup,
                 staged,
                 displaced,
                 original,
@@ -232,39 +207,21 @@ pub fn synchronize_local_provider(
             write_journal(&journal_path, &journal)?;
         }
 
-        let mut databases = scan.database_paths.clone();
-        for catalog in discover_local_thread_catalog_databases(&codex_home)? {
-            if !databases.contains(&catalog) {
-                databases.push(catalog);
-            }
-        }
-        for (index, database) in databases.iter().enumerate() {
-            let backup = backup_dir.join("databases").join(format!("{index}.sqlite"));
-            backup_database(database, &backup)?;
-            journal.database_backups.push(ProviderSyncDatabaseBackup {
-                target: database.clone(),
-                backup,
-            });
-            journal.updated_at = Utc::now().to_rfc3339();
-            write_journal(&journal_path, &journal)?;
-        }
-        journal.status = ProviderSyncStatus::BackedUp;
-        journal.updated_at = Utc::now().to_rfc3339();
-        write_journal(&journal_path, &journal)?;
         control.check_cancelled()?;
 
-        let write_control = control.non_cancellable();
+        let write_control = control;
         journal.status = ProviderSyncStatus::ApplyingFiles;
         journal.updated_at = Utc::now().to_rfc3339();
         write_journal(&journal_path, &journal)?;
         for (index, file) in journal.files.iter().enumerate() {
+            write_control.check_cancelled()?;
             write_control.report(OperationProgress {
                 phase: "provider_sync_files".to_string(),
                 message: file.thread_id.clone(),
                 completed: index as u64,
                 total: Some(journal.files.len() as u64),
                 unit: "rollouts".to_string(),
-                cancellable: false,
+                cancellable: true,
             });
             replace_with_staged(file)?;
         }
@@ -272,6 +229,7 @@ pub fn synchronize_local_provider(
         journal.status = ProviderSyncStatus::ApplyingDatabases;
         journal.updated_at = Utc::now().to_rfc3339();
         write_journal(&journal_path, &journal)?;
+        write_control.check_cancelled()?;
         let database_rows = update_database_providers(&scan.database_paths, &provider)?;
         let catalogs = discover_local_thread_catalog_databases(&codex_home)?;
         invalidate_local_thread_catalogs(&catalogs)?;
@@ -280,21 +238,18 @@ pub fn synchronize_local_provider(
         journal.status = ProviderSyncStatus::Validating;
         journal.updated_at = Utc::now().to_rfc3339();
         write_journal(&journal_path, &journal)?;
-        validate_provider_sync(&codex_home, &provider, &write_control)?;
+        validate_provider_sync(&codex_home, &provider, write_control)?;
         Ok((journal.files.len(), database_rows))
     })();
 
     let (rollout_count, database_row_count) = match result {
         Ok(result) => result,
         Err(error) => {
-            let message = error.to_string();
-            if let Err(rollback_error) =
-                rollback_provider_sync(&journal_path, &mut journal, &message)
-            {
-                return Err(error.context(format!(
-                    "provider synchronization rollback also failed: {rollback_error}"
-                )));
-            }
+            journal.status = ProviderSyncStatus::Failed;
+            journal.updated_at = Utc::now().to_rfc3339();
+            journal.error = Some(error.to_string());
+            write_journal(&journal_path, &journal)?;
+            let _ = fs::remove_dir_all(&staging_dir);
             return Err(error);
         }
     };
@@ -311,34 +266,8 @@ pub fn synchronize_local_provider(
         provider,
         rollout_count,
         database_row_count,
-        backup_dir,
         journal_path,
     })
-}
-
-pub fn recover_provider_sync(
-    journal_path: impl AsRef<Path>,
-    confirmed_codex_closed: bool,
-) -> Result<ProviderSyncJournal> {
-    if !confirmed_codex_closed {
-        bail!("provider synchronization recovery requires confirmation that Codex is fully closed");
-    }
-    let journal_path = journal_path.as_ref();
-    let mut journal: ProviderSyncJournal =
-        serde_json::from_reader(BufReader::new(File::open(journal_path)?))?;
-    validate_journal(&journal)?;
-    if matches!(
-        journal.status,
-        ProviderSyncStatus::Completed | ProviderSyncStatus::RolledBack
-    ) {
-        return Ok(journal);
-    }
-    rollback_provider_sync(
-        journal_path,
-        &mut journal,
-        "recovered after an interrupted operation",
-    )?;
-    Ok(journal)
 }
 
 fn count_database_rows(databases: &[PathBuf], provider: &str) -> Result<usize> {
@@ -455,6 +384,7 @@ fn replace_with_staged(file: &ProviderSyncFilePlan) -> Result<()> {
         let _ = fs::rename(&file.displaced, &file.target);
         return Err(error.into());
     }
+    fs::remove_file(&file.displaced)?;
     Ok(())
 }
 
@@ -472,84 +402,6 @@ fn validate_provider_sync(
     if mismatched > 0 {
         bail!("provider synchronization validation found {mismatched} mismatched threads");
     }
-    Ok(())
-}
-
-fn rollback_provider_sync(
-    journal_path: &Path,
-    journal: &mut ProviderSyncJournal,
-    message: &str,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    for file in journal.files.iter().rev() {
-        if file.displaced.exists() {
-            if file.target.exists()
-                && let Err(error) = fs::remove_file(&file.target)
-            {
-                failures.push(format!(
-                    "failed to remove {}: {error}",
-                    file.target.display()
-                ));
-                continue;
-            }
-            if let Err(error) = fs::rename(&file.displaced, &file.target) {
-                failures.push(format!(
-                    "failed to restore {}: {error}",
-                    file.target.display()
-                ));
-            }
-        }
-        let _ = fs::remove_file(&file.staged);
-    }
-    for database in &journal.database_backups {
-        if let Err(error) = restore_database(&database.target, &database.backup) {
-            failures.push(format!(
-                "failed to restore {}: {error}",
-                database.target.display()
-            ));
-        }
-    }
-    journal.status = if failures.is_empty() {
-        ProviderSyncStatus::RolledBack
-    } else {
-        ProviderSyncStatus::RecoveryRequired
-    };
-    journal.updated_at = Utc::now().to_rfc3339();
-    journal.error = Some(if failures.is_empty() {
-        message.to_string()
-    } else {
-        format!("{message}; {}", failures.join("; "))
-    });
-    write_journal(journal_path, journal)?;
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!(
-            "provider synchronization recovery requires attention: {}",
-            failures.join("; ")
-        )
-    }
-}
-
-fn copy_durable(source: &Path, destination: &Path, control: &OperationControl) -> Result<()> {
-    let mut reader = BufReader::new(File::open(source)?);
-    let mut writer = BufWriter::new(
-        OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(destination)?,
-    );
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        control.check_cancelled()?;
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        writer.write_all(&buffer[..count])?;
-    }
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -577,51 +429,6 @@ fn write_journal(path: &Path, journal: &ProviderSyncJournal) -> Result<()> {
     atomic_write_json(path, journal)
 }
 
-fn validate_journal(journal: &ProviderSyncJournal) -> Result<()> {
-    if journal.schema_version != PROVIDER_SYNC_JOURNAL_SCHEMA_VERSION {
-        bail!(
-            "unsupported provider sync journal schema version {}",
-            journal.schema_version
-        );
-    }
-    validate_provider_id(&journal.target_provider)?;
-    Ok(())
-}
-
-fn ensure_no_incomplete_provider_sync(repository_root: &Path, codex_home: &Path) -> Result<()> {
-    let directory = repository_root.join("journal");
-    if !directory.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("provider-sync-") && name.ends_with(".json"))
-        {
-            continue;
-        }
-        let Ok(journal) =
-            serde_json::from_reader::<_, ProviderSyncJournal>(BufReader::new(File::open(&path)?))
-        else {
-            continue;
-        };
-        if journal.target_codex_home == codex_home
-            && !matches!(
-                journal.status,
-                ProviderSyncStatus::Completed | ProviderSyncStatus::RolledBack
-            )
-        {
-            bail!(
-                "an incomplete provider synchronization requires recovery: {}",
-                path.display()
-            );
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
@@ -631,7 +438,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_sync_updates_rollout_and_database_with_recoverable_backup() {
+    fn provider_sync_updates_rollout_and_database_without_creating_a_backup() {
         let temp = tempdir().unwrap();
         let home = temp.path().join("home");
         let repository = temp.path().join("repository");
@@ -684,7 +491,7 @@ mod tests {
             synchronize_local_provider(&home, &repository, true, &OperationControl::default())
                 .unwrap();
         assert_eq!(result.rollout_count, 1);
-        assert!(result.backup_dir.join("rollouts/0.jsonl").is_file());
+        assert!(!repository.join("backups/provider-sync").exists());
         assert_eq!(
             read_rollout_provider(&rollout).unwrap().as_deref(),
             Some("custom")
@@ -708,16 +515,11 @@ mod tests {
                 .unwrap();
         assert_eq!(unchanged.rollout_count, 0);
         assert_eq!(unchanged.database_row_count, 0);
-        assert_eq!(
-            std::fs::read_dir(unchanged.backup_dir.join("databases"))
-                .unwrap()
-                .count(),
-            0
-        );
+        assert!(!repository.join("backups/provider-sync").exists());
     }
 
     #[test]
-    fn database_failure_rolls_back_an_already_replaced_rollout() {
+    fn database_failure_keeps_completed_rollouts_for_the_next_run() {
         let temp = tempdir().unwrap();
         let home = temp.path().join("home");
         let repository = temp.path().join("repository");
@@ -744,7 +546,11 @@ mod tests {
             synchronize_local_provider(&home, &repository, true, &OperationControl::default())
                 .unwrap_err();
         assert!(error.to_string().contains("CHECK constraint failed"));
-        assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+        assert_ne!(fs::read_to_string(&rollout).unwrap(), original);
+        assert_eq!(
+            read_rollout_provider(&rollout).unwrap().as_deref(),
+            Some("custom")
+        );
         let provider: String = Connection::open(database)
             .unwrap()
             .query_row(
@@ -762,64 +568,7 @@ mod tests {
             .path();
         let journal: ProviderSyncJournal =
             serde_json::from_reader(File::open(journal_path).unwrap()).unwrap();
-        assert_eq!(journal.status, ProviderSyncStatus::RolledBack);
-    }
-
-    #[test]
-    fn interrupted_file_apply_is_recovered_from_the_displaced_original() {
-        let temp = tempdir().unwrap();
-        let repository = temp.path().join("repository");
-        let home = temp.path().join("home");
-        let target = home.join("sessions/rollout-thread.jsonl");
-        let displaced = home.join("sessions/rollout-thread.provider-sync.old");
-        let staged = home.join("staging/rollout-thread.jsonl");
-        let backup = repository.join("backups/provider-sync/op/rollout.jsonl");
-        fs::create_dir_all(target.parent().unwrap()).unwrap();
-        fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        fs::create_dir_all(backup.parent().unwrap()).unwrap();
-        fs::create_dir_all(repository.join("journal")).unwrap();
-        fs::write(&target, b"replacement").unwrap();
-        fs::write(&displaced, b"original").unwrap();
-        fs::write(&staged, b"staged").unwrap();
-        fs::write(&backup, b"original").unwrap();
-        let now = Utc::now().to_rfc3339();
-        let journal_path = repository.join("journal/provider-sync-op.json");
-        write_journal(
-            &journal_path,
-            &ProviderSyncJournal {
-                schema_version: PROVIDER_SYNC_JOURNAL_SCHEMA_VERSION,
-                operation_id: "op".to_string(),
-                target_codex_home: home,
-                repository_root: repository,
-                target_provider: "custom".to_string(),
-                status: ProviderSyncStatus::ApplyingFiles,
-                started_at: now.clone(),
-                updated_at: now,
-                files: vec![ProviderSyncFilePlan {
-                    thread_id: "thread".to_string(),
-                    target: target.clone(),
-                    backup,
-                    staged: staged.clone(),
-                    displaced: displaced.clone(),
-                    original: ObjectDescriptor {
-                        sha256: "sha256:00".to_string(),
-                        byte_length: 8,
-                    },
-                    replacement: ObjectDescriptor {
-                        sha256: "sha256:11".to_string(),
-                        byte_length: 11,
-                    },
-                }],
-                database_backups: Vec::new(),
-                error: None,
-            },
-        )
-        .unwrap();
-
-        let recovered = recover_provider_sync(&journal_path, true).unwrap();
-        assert_eq!(recovered.status, ProviderSyncStatus::RolledBack);
-        assert_eq!(fs::read(&target).unwrap(), b"original");
-        assert!(!displaced.exists());
-        assert!(!staged.exists());
+        assert_eq!(journal.status, ProviderSyncStatus::Failed);
+        assert!(!repository.join("backups/provider-sync").exists());
     }
 }

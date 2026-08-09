@@ -1668,7 +1668,7 @@ export default function SessionSyncApp() {
     </div>
     {providerSyncPreview && <div className={`inline-alert ${providerSyncPreview.noChanges ? "success" : "warning"}`}>{providerSyncPreview.noChanges ? <Check size={17} /> : <AlertTriangle size={17} />}<span>{providerSyncPreview.noChanges ? `当前 provider 为 ${providerSyncPreview.provider}，无需同步` : `目标 ${providerSyncPreview.provider} · ${providerSyncPreview.rolloutCount} 个 rollout（${formatBytes(providerSyncPreview.rolloutBytes)}）· ${providerSyncPreview.databaseRowCount} 条 SQLite 记录`}</span></div>}
     {providerSyncPreview && providerSyncPreview.warnings.length > 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><span>扫描发现 {providerSyncPreview.warnings.length} 条警告；对应文件会保持原样并跳过。</span></div>}
-    {providerSyncReport && <div className="inline-alert success"><Check size={17} /><span>{providerSyncReport.rolloutCount === 0 && providerSyncReport.databaseRowCount === 0 ? `检查完成：Provider 已是 ${providerSyncReport.provider}，0 条改变` : `已同步到 ${providerSyncReport.provider}：${providerSyncReport.rolloutCount} 个 rollout、${providerSyncReport.databaseRowCount} 条 SQLite 记录发生改变；备份保存在 ${providerSyncReport.backupDir}`}</span></div>}
+    {providerSyncReport && <div className="inline-alert success"><Check size={17} /><span>{providerSyncReport.rolloutCount === 0 && providerSyncReport.databaseRowCount === 0 ? `检查完成：Provider 已是 ${providerSyncReport.provider}，0 条改变` : `已同步到 ${providerSyncReport.provider}：${providerSyncReport.rolloutCount} 个 rollout、${providerSyncReport.databaseRowCount} 条 SQLite 记录发生改变`}</span></div>}
   </section>;
 
   const projectTools = selectedNamespace && workspaceMappingState ? <>

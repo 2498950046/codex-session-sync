@@ -73,7 +73,6 @@ export type ProviderSyncReport = {
   provider: string;
   rolloutCount: number;
   databaseRowCount: number;
-  backupDir: string;
   journalPath: string;
 };
 

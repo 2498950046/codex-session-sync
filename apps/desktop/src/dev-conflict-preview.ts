@@ -391,7 +391,7 @@ export async function installDevelopmentPreview(preview: "ready" | "empty" | "pr
     }
     if (command === "take_job_result") {
       const jobId = (args as { jobId?: string } | undefined)?.jobId;
-      return jobId === "preview-scan" ? scanReport : jobId === "preview-remap" ? remapReport : jobId === "preview-provider-sync-scan" ? { provider: "custom", rolloutCount: 418, rolloutBytes: 984811738, databaseRowCount: 418, catalogDatabaseCount: 1, warnings: [], noChanges: false } : jobId === "preview-provider-sync" ? { operationId: "preview-provider-sync", provider: "custom", rolloutCount: 418, databaseRowCount: 418, backupDir: "C:/Users/demo/.codex-session-sync/backups/provider-sync/preview", journalPath: "C:/Users/demo/.codex-session-sync/journal/provider-sync-preview.json" } : conflictReport;
+      return jobId === "preview-scan" ? scanReport : jobId === "preview-remap" ? remapReport : jobId === "preview-provider-sync-scan" ? { provider: "custom", rolloutCount: 418, rolloutBytes: 984811738, databaseRowCount: 418, catalogDatabaseCount: 1, warnings: [], noChanges: false } : jobId === "preview-provider-sync" ? { operationId: "preview-provider-sync", provider: "custom", rolloutCount: 418, databaseRowCount: 418, journalPath: "C:/Users/demo/.codex-session-sync/journal/provider-sync-preview.json" } : conflictReport;
     }
     if (command === "select_remote_namespace") {
       const selected = String((args as { namespaceId?: string } | undefined)?.namespaceId);
