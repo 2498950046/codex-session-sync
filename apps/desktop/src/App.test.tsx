@@ -157,9 +157,9 @@ test("provider preview runs as a progress job and disables the write action", as
   await user.click(preview);
   expect(await screen.findByText("provider_sync_preview · running")).toBeInTheDocument();
   expect(screen.getByText("正在扫描活动与归档会话")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "备份并同步" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "开始同步" })).toBeDisabled();
   expect(await screen.findByText(/目标 openai/)).toBeInTheDocument();
-  expect(await screen.findByRole("button", { name: "备份并同步" })).toBeEnabled();
+  expect(await screen.findByRole("button", { name: "开始同步" })).toBeEnabled();
 });
 
 test("provider sync panel now lives inside settings advanced tools", async () => {
@@ -188,7 +188,7 @@ test("provider sync remains available when preview reports zero changes", async 
   await user.click(preview);
   expect(await screen.findByText("当前 provider 为 openai，无需同步")).toBeInTheDocument();
 
-  await user.click(screen.getByRole("button", { name: "备份并同步" }));
+  await user.click(screen.getByRole("button", { name: "开始同步" }));
   expect(await screen.findByText(/任务将以 0 条改变完成/)).toBeInTheDocument();
 });
 
@@ -198,7 +198,7 @@ test("provider sync is available before running an optional preview", async () =
 
   await screen.findByRole("heading", { level: 2, name: "设置" });
   await expandAdvanced(user);
-  const sync = await screen.findByRole("button", { name: "备份并同步" });
+  const sync = await screen.findByRole("button", { name: "开始同步" });
   await waitFor(() => expect(sync).toBeEnabled());
   expect(invokeMock).not.toHaveBeenCalledWith("start_provider_sync_preview_job", expect.anything());
 
