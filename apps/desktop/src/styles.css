@@ -275,9 +275,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .trash-list article { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
 .trash-list article > div { display: grid; gap: 3px; }
 .trash-list span { color: var(--text-muted); font-size: 9px; }
-.gc-panel { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
-.gc-panel h3 { margin: 0; }
-.gc-panel p { margin: 4px 0 0; color: var(--text-secondary); font-size: 11px; }
+.trash-list article > .trash-item-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .storage-summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; overflow: hidden; padding: 0; background: var(--border); }
 .storage-summary > div { display: grid; gap: 4px; min-width: 0; padding: 13px 15px; background: var(--surface); }
 .storage-summary span { color: var(--text-muted); font-size: 10px; }

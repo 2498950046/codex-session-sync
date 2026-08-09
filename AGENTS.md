@@ -49,8 +49,6 @@ Codex SQLite files.
   lease, and never permanently delete it from the warning UI.
 - A local probe on 2026-07-23 found one zero-byte rollout among 342 active
   sessions. This is a supported skipped-file condition, not a fatal error.
-- Any write must create a local backup and operation journal before changing
-  session files or SQLite data.
 
 ## Delivery Order
 

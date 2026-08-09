@@ -17,7 +17,8 @@ use serde::de::DeserializeOwned;
 use sync_core::{
     ApiError, CreateNamespaceRequest, HistoryTrashListResponse, HistoryTrashOperation, Namespace,
     NamespaceHeadResponse, NamespaceListResponse, OperationControl, ProtocolInfoResponseV4,
-    PutObjectResponse, REMOTE_PROTOCOL_VERSION_V4, RenameNamespaceRequest, RestoreHistoryRequest,
+    PurgeHistoryTrashRequest, PurgeHistoryTrashResponse, PutObjectResponse,
+    REMOTE_PROTOCOL_VERSION_V4, RenameNamespaceRequest, RestoreHistoryRequest,
     RevisionCommitRequestV4, RevisionCommitResponseV4, RevisionListResponse, RevisionRootV4,
     RevisionSummary, StorageObjectKindV4, StorageObjectRef, StorageObjectRefV4,
     TruncateHistoryRequest, TypedMissingObjectsRequest, TypedMissingObjectsResponse, digest_bytes,
@@ -208,6 +209,18 @@ impl RemoteClient {
             self.client.post(self.endpoint(&format!(
                 "api/v4/namespaces/{namespace_id}/trash/{operation_id}/restore"
             ))?),
+            request,
+        )
+    }
+
+    pub fn purge_history_trash(
+        &self,
+        namespace_id: Uuid,
+        request: &PurgeHistoryTrashRequest,
+    ) -> Result<PurgeHistoryTrashResponse> {
+        self.send_json(
+            self.client
+                .post(self.endpoint(&format!("api/v4/namespaces/{namespace_id}/trash/purge"))?),
             request,
         )
     }

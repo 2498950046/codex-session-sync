@@ -28,10 +28,11 @@ use remote_sync::{
 use serde::Deserialize;
 use serde::Serialize;
 use sync_core::{
-    CheckoutJournal, GcPlan, ImportReport, LocalSnapshotListItem, OperationJournal,
-    ProviderSyncJournal, QuarantinedRollout, RepositoryStorageSummary, ScanDashboardReport,
-    SnapshotDeletionPlan, SnapshotDiff, SnapshotMetadata, SnapshotSummary, SnapshotTrashEntry,
-    SnapshotValidationReport, ThreadConflictResolution, TrackingStore, create_local_snapshot,
+    CheckoutJournal, GcPlan, ImportReport, LocalSnapshotListItem, LocalTrashPurgePlanV4,
+    LocalTrashPurgeResultV4, OperationJournal, ProviderSyncJournal, QuarantinedRollout,
+    RepositoryStorageSummary, ScanDashboardReport, SnapshotDeletionPlan, SnapshotDiff,
+    SnapshotMetadata, SnapshotSummary, SnapshotTrashEntry, SnapshotValidationReport,
+    ThreadConflictResolution, TrackingStore, create_local_snapshot,
     create_local_snapshot_with_control, default_codex_home, default_repository_root,
     detect_codex_processes, import_local_snapshot, import_local_snapshot_with_control,
     preview_provider_sync, quarantine_empty_rollout, recover_checkout_operation,
@@ -351,6 +352,41 @@ async fn restore_trashed_snapshot(
 }
 
 #[tauri::command]
+async fn plan_local_trash_purge(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    operation_ids: Vec<String>,
+    purge_all: bool,
+) -> Result<LocalTrashPurgePlanV4, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::plan_local_trash_purge_v4(&repository, &operation_ids, purge_all)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn purge_local_trash(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    plan: LocalTrashPurgePlanV4,
+) -> Result<LocalTrashPurgeResultV4, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        sync_core::purge_local_trash_v4(&repository, &plan)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn plan_local_gc(
     jobs: State<'_, JobManager>,
     repository_root: Option<String>,
@@ -565,6 +601,37 @@ async fn restore_remote_history_trash(
             )?;
         }
         Ok::<_, anyhow::Error>(operation)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn purge_remote_history_trash(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    operation_ids: Vec<String>,
+    purge_all: bool,
+) -> Result<sync_core::PurgeHistoryTrashResponse, String> {
+    let repository = resolve_repository_root(repository_root);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        let (_, client) = load_remote_client(&repository, parse_uuid(&remote_id)?)?;
+        let operation_ids = operation_ids
+            .into_iter()
+            .map(|operation_id| parse_uuid(&operation_id))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        client.purge_history_trash(
+            parse_uuid(&namespace_id)?,
+            &sync_core::PurgeHistoryTrashRequest {
+                operation_ids,
+                purge_all,
+            },
+        )
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1937,6 +2004,8 @@ pub fn run() {
             trash_local_snapshot,
             list_local_snapshot_trash,
             restore_trashed_snapshot,
+            plan_local_trash_purge,
+            purge_local_trash,
             plan_local_gc,
             get_repository_storage_summary,
             list_recovery_points,
@@ -1946,6 +2015,7 @@ pub fn run() {
             list_remote_history_trash,
             truncate_remote_history,
             restore_remote_history_trash,
+            purge_remote_history_trash,
             start_remote_revision_download_job,
             start_remote_revision_restore_job,
             import_snapshot,

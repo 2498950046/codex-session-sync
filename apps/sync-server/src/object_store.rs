@@ -318,6 +318,34 @@ impl ObjectStore {
         }
     }
 
+    pub async fn purge_quarantined(
+        &self,
+        path: &Path,
+        expected_length: u64,
+    ) -> Result<bool, ObjectStoreError> {
+        let metadata = match fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_error("inspect quarantined", path, error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(not_a_file(path));
+        }
+        if metadata.len() != expected_length {
+            return Err(ObjectStoreError::LengthMismatch {
+                expected_bytes: expected_length,
+                actual_bytes: metadata.len(),
+            });
+        }
+        fs::remove_file(path)
+            .await
+            .map_err(|error| io_error("purge quarantined", path, error))?;
+        if let Some(parent) = path.parent() {
+            sync_directory(parent).await?;
+        }
+        Ok(true)
+    }
+
     async fn write_verified_temp<S, E>(
         &self,
         temp_path: &Path,

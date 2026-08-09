@@ -17,10 +17,11 @@ use serde::Serialize;
 use sync_core::{
     ChunkManifest, ChunkManifestV4, CommitRevisionResponse, CommitRevisionRootRequest, ContentRef,
     CreateNamespaceRequest, HistoryTrashListResponse, NamespaceHeadResponse, NamespaceListResponse,
-    PutObjectResponse, RenameNamespaceRequest, RestoreHistoryRequest, RevisionCommitRequestV4,
-    RevisionListResponse, RevisionRootV3, RevisionRootV4, SemanticThreadDescriptorV4, ServerGcPlan,
-    ServerGcQuarantineRequest, ServerGcQuarantineResponse, ServerStorageSummary, StorageObjectKind,
-    StorageObjectRef, StorageRef, StorageRefV4, ThreadDescriptorV3, TruncateHistoryRequest,
+    PurgeHistoryTrashRequest, PurgeHistoryTrashResponse, PutObjectResponse, RenameNamespaceRequest,
+    RestoreHistoryRequest, RevisionCommitRequestV4, RevisionListResponse, RevisionRootV3,
+    RevisionRootV4, SemanticThreadDescriptorV4, ServerGcPlan, ServerGcQuarantineRequest,
+    ServerGcQuarantineResponse, ServerStorageSummary, StorageObjectKind, StorageObjectRef,
+    StorageRef, StorageRefV4, ThreadDescriptorV3, TruncateHistoryRequest,
     TypedMissingObjectsRequest, TypedMissingObjectsResponse, canonical_json, digest_bytes,
     protocol_info_v4, validate_sha256,
 };
@@ -87,6 +88,33 @@ impl AppState {
     async fn resume_pending_gc(&self) -> Result<(), HttpError> {
         let entries = self.metadata.pending_gc_entries().await?;
         self.process_gc_entries(entries).await?;
+        let entries = self.metadata.quarantined_gc_entries_for_purge().await?;
+        for entry in entries {
+            self.purge_gc_entry(&entry).await?;
+        }
+        Ok(())
+    }
+
+    fn gc_destination(&self, entry: &GcQueueEntry) -> Result<PathBuf, HttpError> {
+        let digest = entry
+            .object
+            .sha256
+            .strip_prefix("sha256:")
+            .ok_or_else(|| HttpError::invalid_digest("invalid queued object digest"))?;
+        Ok(self
+            .data_dir
+            .join("gc")
+            .join(entry.operation_id.to_string())
+            .join(entry.object.kind.directory())
+            .join(digest))
+    }
+
+    async fn purge_gc_entry(&self, entry: &GcQueueEntry) -> Result<(), HttpError> {
+        let destination = self.gc_destination(entry)?;
+        typed_store(self, entry.object.kind)?
+            .purge_quarantined(&destination, entry.object.byte_length)
+            .await?;
+        self.metadata.mark_gc_entry_purged(entry.id).await?;
         Ok(())
     }
 
@@ -110,23 +138,16 @@ impl AppState {
                     .await?;
                 continue;
             }
-            let digest = entry
-                .object
-                .sha256
-                .strip_prefix("sha256:")
-                .ok_or_else(|| HttpError::invalid_digest("invalid queued object digest"))?;
-            let destination = self
-                .data_dir
-                .join("gc")
-                .join(entry.operation_id.to_string())
-                .join(entry.object.kind.directory())
-                .join(digest);
+            let destination = self.gc_destination(&entry)?;
             typed_store(self, entry.object.kind)?
                 .quarantine(&entry.object.sha256, &destination)
                 .await?;
             count += 1;
             bytes = bytes.saturating_add(entry.object.byte_length);
-            self.metadata.complete_gc_entry(entry).await?;
+            self.metadata.complete_gc_entry(entry.clone()).await?;
+            if entry.delete_after_quarantine {
+                self.purge_gc_entry(&entry).await?;
+            }
         }
         Ok((count, bytes))
     }
@@ -203,6 +224,10 @@ pub fn build_router(state: AppState, config: &ServerConfig) -> Router {
             post(truncate_history),
         )
         .route("/namespaces/{namespace_id}/trash", get(list_history_trash))
+        .route(
+            "/namespaces/{namespace_id}/trash/purge",
+            post(purge_history_trash),
+        )
         .route(
             "/namespaces/{namespace_id}/trash/{operation_id}/restore",
             post(restore_history_trash),
@@ -496,6 +521,7 @@ async fn truncate_history(
     Path(namespace_id): Path<String>,
     payload: Result<Json<TruncateHistoryRequest>, JsonRejection>,
 ) -> Result<Json<sync_core::HistoryTrashOperation>, HttpError> {
+    let _gc_guard = state.gc_gate.write().await;
     let namespace_id = parse_namespace_id(&namespace_id)?;
     let Json(payload) = parse_json(payload)?;
     if let Some(head) = &payload.expected_head {
@@ -527,11 +553,42 @@ async fn list_history_trash(
     }))
 }
 
+async fn purge_history_trash(
+    State(state): State<AppState>,
+    Path(namespace_id): Path<String>,
+    payload: Result<Json<PurgeHistoryTrashRequest>, JsonRejection>,
+) -> Result<Json<PurgeHistoryTrashResponse>, HttpError> {
+    let namespace_id = parse_namespace_id(&namespace_id)?;
+    let Json(payload) = parse_json(payload)?;
+    if payload.purge_all != payload.operation_ids.is_empty() {
+        return Err(HttpError::invalid_request(
+            "provide operationIds or set purgeAll, but not both",
+        ));
+    }
+    let _gc_guard = state.gc_gate.write().await;
+    let plan = state
+        .metadata
+        .plan_history_trash_purge(namespace_id, payload.operation_ids, payload.purge_all)
+        .await?;
+    let (committed, entries) = state
+        .metadata
+        .commit_history_trash_purge(namespace_id, plan)
+        .await?;
+    let (deleted_object_count, reclaimed_bytes) = state.process_gc_entries(entries).await?;
+    Ok(Json(PurgeHistoryTrashResponse {
+        purged_operation_count: committed.operation_ids.len(),
+        purged_revision_count: committed.revision_count,
+        deleted_object_count,
+        reclaimed_bytes,
+    }))
+}
+
 async fn restore_history_trash(
     State(state): State<AppState>,
     Path((namespace_id, operation_id)): Path<(String, String)>,
     payload: Result<Json<RestoreHistoryRequest>, JsonRejection>,
 ) -> Result<Json<sync_core::HistoryTrashOperation>, HttpError> {
+    let _gc_guard = state.gc_gate.write().await;
     let namespace_id = parse_namespace_id(&namespace_id)?;
     let operation_id = Uuid::parse_str(&operation_id)
         .map_err(|_| HttpError::invalid_request("invalid trash operation ID"))?;

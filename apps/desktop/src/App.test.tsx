@@ -16,6 +16,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 const remoteId = "remote-1";
 const namespaceId = "namespace-1";
 let runningProcesses = false;
+let showTrashEntries = false;
 let providerPreviewResult = { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
 
 function providerPreviewJob(state: "running" | "completed") {
@@ -42,7 +43,7 @@ function response(command: string) {
   if (command === "get_remote_namespace_status") return { remoteId, namespaceId, active: true, activeRemoteId: remoteId, activeNamespaceId: namespaceId, integratedHead: "sha256:remote", remoteHead: "sha256:remote", generation: 2 };
   if (command === "get_workspace_mapping_state") return { remoteId, namespaceId, codexHomeKey: "c:/users/test/.codex", mappings: [] };
   if (command === "list_local_snapshots") return [{ snapshotId: "01900000-0000-7000-8000-000000000001", createdAt: "2026-07-31T10:00:00Z", manifestPath: "C:/Users/test/.codex-session-sync/snapshots/01900000-0000-7000-8000-000000000001.json", threadCount: 12, objectCount: 20, logicalBytes: 2048, physicalReferencedBytes: 1024, warningCount: 0, metadata: { description: "发布前", tags: ["manual"], pinned: false, automatic: false } }];
-  if (command === "list_local_snapshot_trash") return [];
+  if (command === "list_local_snapshot_trash") return showTrashEntries ? [{ operationId: "01900000-0000-7000-8000-000000000003", snapshotId: "01900000-0000-7000-8000-000000000001", trashedAt: "2026-07-31T11:00:00Z", originalManifestPath: "snapshot.json", trashManifestPath: "trash.json" }] : [];
   if (command === "get_repository_storage_summary") return { logicalBytes: 2048, repositoryPhysicalBytes: 1024, activePhysicalBytes: 1024, sharedPhysicalBytes: 512, exclusivePhysicalBytes: 512, trashBytes: 0, gcQuarantineBytes: 0, reclaimableBytes: 0, protectedByJournalBytes: 0 };
   if (command === "list_recovery_points") return [];
   if (command === "list_remote_revisions") return [{ revisionId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", namespaceId, parentRevision: null, createdAt: "2026-07-31T09:00:00Z", threadCount: 10, objectCount: 18, logicalBytes: 1800, physicalReferencedBytes: 900, state: "active" }];
@@ -53,11 +54,14 @@ function response(command: string) {
   if (command === "update_snapshot_metadata") return { description: "发布前", tags: ["manual"], pinned: true, automatic: false };
   if (command === "plan_snapshot_deletion") return { snapshotId: "01900000-0000-7000-8000-000000000001", manifestPath: "C:/Users/test/.codex-session-sync/snapshots/01900000-0000-7000-8000-000000000001.json", pinned: false, sharedObjectCount: 10, exclusiveObjectCount: 10, estimatedReclaimableBytes: 512, planFingerprint: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
   if (command === "trash_local_snapshot") return { operationId: "01900000-0000-7000-8000-000000000002", snapshotId: "01900000-0000-7000-8000-000000000001", trashedAt: "2026-07-31T11:00:00Z", originalManifestPath: "snapshot.json", trashManifestPath: "trash.json" };
+  if (command === "plan_local_trash_purge") return { schemaVersion: 1, createdAt: "2026-07-31T12:00:00Z", operationIds: ["01900000-0000-7000-8000-000000000003"], trashEntryCount: 1, candidateObjects: [], objectReclaimableBytes: 1024, trashMetadataBytes: 128, retainedSharedBytes: 512, planFingerprint: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" };
+  if (command === "purge_local_trash") return { operationId: "01900000-0000-7000-8000-000000000004", deletedTrashEntries: 1, deletedObjectCount: 2, freedBytes: 1152, retainedSharedBytes: 512, journalPath: "C:/Users/test/.codex-session-sync/journal/local-trash-purge.json" };
   throw new Error(`Unexpected command in test: ${command}`);
 }
 
 beforeEach(() => {
   runningProcesses = false;
+  showTrashEntries = false;
   providerPreviewResult = { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
   invokeMock.mockImplementation((command: string) => Promise.resolve(response(command)));
   Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
@@ -103,6 +107,41 @@ test("history graph selects snapshots and exposes recoverable local deletion", a
 
   await waitFor(() => {
     expect(invokeMock).toHaveBeenCalledWith("trash_local_snapshot", expect.any(Object));
+  });
+});
+
+test("local recycle bin supports permanent deletion and emptying after confirmation", async () => {
+  const user = userEvent.setup();
+  showTrashEntries = true;
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
+
+  await user.click(await screen.findByRole("button", { name: "打开历史与恢复" }));
+  await user.click(await screen.findByRole("button", { name: /回收站/ }));
+  expect(screen.queryByRole("button", { name: "对象 GC" })).not.toBeInTheDocument();
+
+  await user.click(await screen.findByRole("button", { name: "永久删除" }));
+  expect(await screen.findByText("永久删除本地快照")).toBeInTheDocument();
+  expect(screen.getByText(/预计释放 1\.1 KB/)).toBeInTheDocument();
+  await user.click(screen.getAllByRole("button", { name: "永久删除" }).at(-1)!);
+
+  await waitFor(() => {
+    expect(invokeMock).toHaveBeenCalledWith("purge_local_trash", expect.objectContaining({
+      repositoryRoot: "C:/Users/test/.codex-session-sync",
+      plan: expect.objectContaining({ trashEntryCount: 1 }),
+    }));
+  });
+
+  invokeMock.mockClear();
+  await user.click(await screen.findByRole("button", { name: "清空本地" }));
+  expect(await screen.findByText("清空本地回收站")).toBeInTheDocument();
+  expect(invokeMock).toHaveBeenCalledWith("plan_local_trash_purge", {
+    repositoryRoot: "C:/Users/test/.codex-session-sync",
+    operationIds: [],
+    purgeAll: true,
+  });
+  await user.click(screen.getByRole("button", { name: "确认清空" }));
+  await waitFor(() => {
+    expect(invokeMock).toHaveBeenCalledWith("purge_local_trash", expect.any(Object));
   });
 });
 

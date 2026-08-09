@@ -33,9 +33,10 @@ import type {
   CheckoutReport,
   CodexProcess,
   ImportReport,
-  GcPlan,
   JobSnapshot,
   LocalSnapshotListItem,
+  LocalTrashPurgePlan,
+  LocalTrashPurgeResult,
   NamespaceMappingState,
   OperationJournal,
   ProviderSyncPreview,
@@ -48,6 +49,7 @@ import type {
   RemoteNamespaceStatus,
   RemoteProfileSummary,
   RemoteHistoryTrashOperation,
+  RemoteHistoryTrashPurgeResult,
   RevisionSummary,
   ScanReport,
   ScanWarning,
@@ -373,7 +375,6 @@ export default function SessionSyncApp() {
   }, [location.pathname, settingsTab]);
   const [historyOpen, setHistoryOpen] = useState(previewKind === "history");
   const [advancedOpen, setAdvancedOpen] = useState(previewKind === "mapping");
-  const [gcPlan, setGcPlan] = useState<GcPlan | null>(null);
   const [storageSummary, setStorageSummary] = useState<RepositoryStorageSummary | null>(null);
   const [recoveryPoints, setRecoveryPoints] = useState<RecoveryPoint[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -936,23 +937,29 @@ export default function SessionSyncApp() {
     finally { setHistoryLoading(false); }
   }
 
-  async function inspectGc() {
+  async function requestLocalTrashPurge(operationIds: string[], purgeAll: boolean) {
     setHistoryLoading(true);
-    setHistoryLoadingLabel("正在计算对象 GC…");
+    setHistoryLoadingLabel("正在计算永久删除范围…");
     try {
-      setGcPlan(await invoke<GcPlan>("plan_local_gc", { repositoryRoot: repositoryRoot.trim() }));
-    } catch (reason) { setError(String(reason)); }
-    finally { setHistoryLoading(false); }
-  }
-
-  async function quarantineGc() {
-    if (!gcPlan) return;
-    setHistoryLoading(true);
-    setHistoryLoadingLabel("正在隔离不可达对象…");
-    try {
-      await invoke("quarantine_local_gc", { repositoryRoot: repositoryRoot.trim(), plan: gcPlan });
-      setGcPlan(null);
-      await refreshHistory("正在更新存储统计…");
+      const plan = await invoke<LocalTrashPurgePlan>("plan_local_trash_purge", {
+        repositoryRoot: repositoryRoot.trim(), operationIds, purgeAll,
+      });
+      const estimatedBytes = plan.objectReclaimableBytes + plan.trashMetadataBytes;
+      setConfirmation({
+        title: purgeAll ? "清空本地回收站" : "永久删除本地快照",
+        description: <p>将永久删除 {plan.trashEntryCount} 个恢复点，预计释放 {formatBytes(estimatedBytes)}。仍被其他快照或远端缓存引用的 {formatBytes(plan.retainedSharedBytes)} 会保留；此操作不可撤销。</p>,
+        confirmLabel: purgeAll ? "确认清空" : "永久删除",
+        tone: "danger",
+        onConfirm: async () => {
+          setHistoryLoading(true);
+          setHistoryLoadingLabel("正在永久删除本地回收站内容…");
+          const result = await invoke<LocalTrashPurgeResult>("purge_local_trash", {
+            repositoryRoot: repositoryRoot.trim(), plan,
+          });
+          setSelectedHistoryId(null);
+          await refreshHistory(`已删除 ${result.deletedTrashEntries} 个本地恢复点，释放 ${formatBytes(result.freedBytes)}`);
+        },
+      });
     } catch (reason) { setError(String(reason)); }
     finally { setHistoryLoading(false); }
   }
@@ -966,6 +973,30 @@ export default function SessionSyncApp() {
       await refreshHistory("正在更新远端历史…");
     } catch (reason) { setError(String(reason)); }
     finally { setHistoryLoading(false); }
+  }
+
+  function requestRemoteTrashPurge(operationIds: string[], purgeAll: boolean) {
+    const count = purgeAll
+      ? remoteHistoryTrash.filter((entry) => entry.state === "active").length
+      : operationIds.length;
+    setConfirmation({
+      title: purgeAll ? "清空远端回收站" : "永久删除远端历史",
+      description: <p>将永久删除 {count} 个远端历史恢复点。服务端只会删除不再被任何命名空间引用的对象；此操作不可撤销。</p>,
+      confirmLabel: purgeAll ? "确认清空" : "永久删除",
+      tone: "danger",
+      onConfirm: async () => {
+        setHistoryLoading(true);
+        setHistoryLoadingLabel("正在永久删除远端历史…");
+        try {
+          const result = await invoke<RemoteHistoryTrashPurgeResult>("purge_remote_history_trash", {
+            repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId,
+            namespaceId: selectedNamespaceId, operationIds, purgeAll,
+          });
+          await refreshHistory(`已删除 ${result.purgedOperationCount} 个远端恢复点，释放 ${formatBytes(result.reclaimedBytes)}`);
+        } catch (reason) { setError(String(reason)); }
+        finally { setHistoryLoading(false); }
+      },
+    });
   }
 
   async function truncateRemoteHistory(newHead: string | null, label: string) {
@@ -1700,7 +1731,7 @@ export default function SessionSyncApp() {
   const selectedLocalSnapshot = localSnapshots.find((item) => item.snapshotId === selectedHistoryId) ?? null;
   const selectedRemoteRevision = remoteRevisions.find((item) => item.revisionId === selectedHistoryId) ?? null;
   const historyPage = <div className="page-stack history-page">
-    <PageIntro title="快照与恢复" description="以版本图方式浏览本地快照和远端命名空间历史；删除先进入回收站，对象回收另行确认。" action={<div className="button-row"><button className="button secondary" onClick={() => void refreshHistory()} disabled={historyLoading}><RefreshCw size={15} />刷新</button><button className="button primary" onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建快照</button></div>} />
+    <PageIntro title="快照与恢复" description="以版本图方式浏览本地快照和远端命名空间历史；删除先进入回收站，永久删除或清空回收站时释放空间。" action={<div className="button-row"><button className="button secondary" onClick={() => void refreshHistory()} disabled={historyLoading}><RefreshCw size={15} />刷新</button><button className="button primary" onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建快照</button></div>} />
     <section className="history-workbench surface">
       <aside className="history-tree">
         <strong>来源</strong>
@@ -1708,15 +1739,13 @@ export default function SessionSyncApp() {
         <button className={historySource === "remote" ? "active" : ""} onClick={() => { setHistorySource("remote"); setSelectedHistoryId(null); }} disabled={!selectedNamespaceId}><Server size={15} />{selectedNamespace?.displayName ?? "远端命名空间"} <b>{remoteRevisions.length}</b></button>
         <button className={historySource === "recovery" ? "active" : ""} onClick={() => { setHistorySource("recovery"); setSelectedHistoryId(null); }}><RotateCcw size={15} />操作恢复 <b>{recoveryPoints.filter((point) => point.requiresAttention).length}</b></button>
         <button className={historySource === "trash" ? "active" : ""} onClick={() => { setHistorySource("trash"); setSelectedHistoryId(null); }}><Trash2 size={15} />回收站 <b>{snapshotTrash.length + remoteHistoryTrash.filter((entry) => entry.state === "active").length}</b></button>
-        <div className="history-tree-divider" />
-        <button onClick={() => void inspectGc()}><ArchiveRestore size={15} />对象 GC</button>
       </aside>
       <div className="history-main">
-        <div className="history-toolbar"><strong>{historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : "可恢复删除"}</strong><span>{historyLoading ? historyLoadingLabel : "按创建时间倒序"}</span></div>
+        <div className="history-toolbar"><strong>{historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : "可恢复删除"}</strong>{historySource === "trash" && !historyLoading ? <div className="button-row"><button className="button danger small" onClick={() => void requestLocalTrashPurge([], true)} disabled={snapshotTrash.length === 0}>清空本地</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([], true)} disabled={!selectedNamespaceId || remoteHistoryTrash.every((entry) => entry.state !== "active")}>清空远端</button></div> : <span>{historyLoading ? historyLoadingLabel : "按创建时间倒序"}</span>}</div>
         {historySource === "local" && <VersionGraphTable rows={localVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "remote" && <VersionGraphTable rows={remoteVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "recovery" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="trash-list">{recoveryPoints.map((point) => <article key={point.operationId} className={point.requiresAttention ? "requires-attention" : ""}><div><strong>{point.kind === "checkout" ? "语义切换" : point.kind === "provider_sync" ? "Provider 同步" : "增量导入"} · {point.status}</strong><span>{point.updatedAt ? new Date(point.updatedAt).toLocaleString("zh-CN") : point.journalPath}</span></div>{point.requiresAttention && <button className="button warning small" onClick={() => { setJournalPath(point.journalPath); setConfirmation({ title: "恢复未完成操作", description: <p>将根据 Journal 和备份重新校验后恢复。Codex 必须完全退出。</p>, confirmLabel: "确认恢复", tone: "warning", onConfirm: () => start("start_recovery_job", { journalPath: point.journalPath, confirmedCodexClosed: true }) }); }} disabled={!canWrite || busy}><RotateCcw size={14} />处理恢复</button>}</article>)}{recoveryPoints.length === 0 && <div className="version-log-empty">没有发现操作恢复点</div>}</div>)}
-        {historySource === "trash" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="trash-list">{snapshotTrash.map((entry) => <article key={entry.operationId}><div><strong>本地快照 · {shortHead(entry.snapshotId)}</strong><span>{new Date(entry.trashedAt).toLocaleString("zh-CN")}</span></div><button className="button secondary small" onClick={() => void restoreTrash(entry)}><RotateCcw size={14} />恢复快照</button></article>)}{remoteHistoryTrash.filter((entry) => entry.state === "active").map((entry) => <article key={entry.operationId}><div><strong>远端历史 · {entry.revisionCount} 个版本</strong><span>{shortHead(entry.oldHead)} → {shortHead(entry.newHead)} · 到期 {new Date(entry.expiresAt).toLocaleDateString("zh-CN")}</span></div><button className="button secondary small" onClick={() => void restoreRemoteHistoryTrash(entry)}><RotateCcw size={14} />恢复远端历史</button></article>)}{snapshotTrash.length === 0 && remoteHistoryTrash.every((entry) => entry.state !== "active") && <div className="version-log-empty">回收站为空</div>}</div>)}
+        {historySource === "trash" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="trash-list">{snapshotTrash.map((entry) => <article key={entry.operationId}><div><strong>本地快照 · {shortHead(entry.snapshotId)}</strong><span>{new Date(entry.trashedAt).toLocaleString("zh-CN")}</span></div><div className="trash-item-actions"><button className="button secondary small" onClick={() => void restoreTrash(entry)}><RotateCcw size={14} />恢复快照</button><button className="button danger small" onClick={() => void requestLocalTrashPurge([entry.operationId], false)}><Trash2 size={14} />永久删除</button></div></article>)}{remoteHistoryTrash.filter((entry) => entry.state === "active").map((entry) => <article key={entry.operationId}><div><strong>远端历史 · {entry.revisionCount} 个版本</strong><span>{shortHead(entry.oldHead)} → {shortHead(entry.newHead)} · 到期 {new Date(entry.expiresAt).toLocaleDateString("zh-CN")}</span></div><div className="trash-item-actions"><button className="button secondary small" onClick={() => void restoreRemoteHistoryTrash(entry)}><RotateCcw size={14} />恢复远端历史</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([entry.operationId], false)}><Trash2 size={14} />永久删除</button></div></article>)}{snapshotTrash.length === 0 && remoteHistoryTrash.every((entry) => entry.state !== "active") && <div className="version-log-empty">回收站为空</div>}</div>)}
         {(selectedLocalSnapshot || selectedRemoteRevision) && <section className="version-details">
           <div><span className="overline">选中版本</span><h3>{selectedLocalSnapshot ? (selectedLocalSnapshot.metadata.description || "本地快照") : "远端 Revision"}</h3><CopyCode value={selectedHistoryId ?? ""} /></div>
           <div className="version-detail-metrics"><span>会话 <b>{selectedLocalSnapshot?.threadCount ?? selectedRemoteRevision?.threadCount}</b></span><span>逻辑大小 <b>{formatBytes(selectedLocalSnapshot?.logicalBytes ?? selectedRemoteRevision?.logicalBytes ?? 0)}</b></span><span>物理引用 <b>{formatBytes(selectedLocalSnapshot?.physicalReferencedBytes ?? selectedRemoteRevision?.physicalReferencedBytes ?? 0)}</b></span></div>
@@ -1725,8 +1754,7 @@ export default function SessionSyncApp() {
         </section>}
       </div>
     </section>
-    {storageSummary && <section className="surface storage-summary" aria-label="仓库存储统计"><div><span>仓库占用</span><strong>{formatBytes(storageSummary.repositoryPhysicalBytes)}</strong></div><div><span>活动可达</span><strong>{formatBytes(storageSummary.activePhysicalBytes)}</strong></div><div><span>共享对象</span><strong>{formatBytes(storageSummary.sharedPhysicalBytes)}</strong></div><div><span>回收站保护</span><strong>{formatBytes(storageSummary.trashBytes)}</strong></div><div><span>可隔离</span><strong>{formatBytes(storageSummary.reclaimableBytes)}</strong></div><div><span>已隔离</span><strong>{formatBytes(storageSummary.gcQuarantineBytes)}</strong></div></section>}
-    {gcPlan && <section className="surface gc-panel"><div><h3>GC 隔离计划</h3><p>{gcPlan.unreachableObjects.length} 个全局不可达对象，可释放约 {formatBytes(gcPlan.reclaimableBytes)}。执行后先移入隔离区，不会永久删除。</p></div><div className="button-row"><button className="button secondary" onClick={() => setGcPlan(null)}>关闭</button><button className="button danger" onClick={() => setConfirmation({ title: "隔离不可达对象", description: <p>计划会在执行前重新计算；仍被任何活动快照、回收站快照或远端 Revision 缓存引用的对象不会移动。</p>, confirmLabel: "确认隔离", tone: "danger", onConfirm: quarantineGc })} disabled={gcPlan.unreachableObjects.length === 0}>隔离对象</button></div></section>}
+    {storageSummary && <section className="surface storage-summary" aria-label="仓库存储统计"><div><span>仓库占用</span><strong>{formatBytes(storageSummary.repositoryPhysicalBytes)}</strong></div><div><span>活动可达</span><strong>{formatBytes(storageSummary.activePhysicalBytes)}</strong></div><div><span>共享对象</span><strong>{formatBytes(storageSummary.sharedPhysicalBytes)}</strong></div><div><span>回收站保护</span><strong>{formatBytes(storageSummary.trashBytes)}</strong></div><div><span>可释放</span><strong>{formatBytes(storageSummary.reclaimableBytes)}</strong></div><div><span>待清理</span><strong>{formatBytes(storageSummary.gcQuarantineBytes)}</strong></div></section>}
   </div>;
 
   return <AppShell processes={processes} busy={busy} onRefreshProcesses={() => void refreshProcesses()}>

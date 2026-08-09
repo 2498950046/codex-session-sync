@@ -45,11 +45,12 @@ rollback.
   with preview, backups, rollback, and restart recovery. Provider identity is
   materialized per machine and does not create remote revisions.
 - Repository shared/exclusive leases in the Tauri backend. Read-only history,
-  validation, and sync operations can share a repository; trash and GC use an
-  exclusive lease. The React busy flag is not the synchronization boundary.
-- Local reachability GC that protects active snapshots, snapshot trash,
-  cached remote Revision Roots, and non-terminal journals. GC first moves
-  objects to quarantine and never permanently deletes them automatically.
+  validation, and sync operations can share a repository; trash changes and
+  permanent deletion use an exclusive lease. The React busy flag is not the
+  synchronization boundary.
+- Local snapshot and server history recycle bins support restoring, permanently
+  deleting one recovery point, or emptying the bin. Permanent deletion removes
+  only objects that are globally unreachable; shared objects remain intact.
 - Repository storage statistics: logical bytes, physical bytes, shared and
   exclusive references, trash protection, quarantine, and reclaimable bytes.
 
@@ -69,6 +70,7 @@ PUT/GET   /api/v4/objects/{kind}/{sha256}
 POST      /api/v4/namespaces/{id}/history/truncations
 GET       /api/v4/namespaces/{id}/trash
 POST      /api/v4/namespaces/{id}/trash/{operation}/restore
+POST      /api/v4/namespaces/{id}/trash/purge
 GET       /api/v4/storage
 GET       /api/v4/gc/plan
 POST      /api/v4/gc/quarantine
@@ -80,8 +82,10 @@ validates the complete Root/Descriptor/Manifest/Chunk/Attachment graph before
 the SQLite Head compare-and-swap. History rewrites increment the namespace
 epoch and move removed revisions into recoverable trash. Server GC uses a
 persistent queue, rechecks global reachability immediately before quarantine,
-and resumes pending entries after restart. Recently uploaded objects are
-excluded from plans for a short safety grace period.
+and resumes pending entries after restart. A manual history purge advances its
+selected unreachable objects through quarantine to permanent deletion; shared
+or newly reachable objects are retained. Recently uploaded objects are excluded
+from ordinary GC plans for a short safety grace period.
 
 ## Local repository layout
 

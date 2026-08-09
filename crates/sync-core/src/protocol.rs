@@ -506,6 +506,24 @@ pub struct HistoryTrashListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct PurgeHistoryTrashRequest {
+    #[serde(default)]
+    pub operation_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub purge_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PurgeHistoryTrashResponse {
+    pub purged_operation_count: usize,
+    pub purged_revision_count: usize,
+    pub deleted_object_count: usize,
+    pub reclaimed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerGcPlan {
     pub created_at: String,
     pub reachable_object_count: usize,

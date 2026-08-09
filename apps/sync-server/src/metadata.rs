@@ -14,7 +14,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const METADATA_SCHEMA_VERSION: i64 = 5;
+const METADATA_SCHEMA_VERSION: i64 = 6;
 const MAX_NAMESPACE_NAME_CHARS: usize = 128;
 pub const MAX_REVISION_OBJECTS: usize = 10_000;
 pub const MAX_REVISION_OBJECT_REFERENCES: usize = 20_000;
@@ -189,6 +189,14 @@ pub struct GcQueueEntry {
     pub operation_id: Uuid,
     pub object: StorageObjectRef,
     pub state: String,
+    pub delete_after_quarantine: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryTrashPurgePlan {
+    pub operation_ids: Vec<Uuid>,
+    pub revision_count: usize,
+    pub candidate_objects: Vec<StorageObjectRef>,
 }
 
 #[derive(Debug, Error)]
@@ -257,6 +265,28 @@ impl MetadataStore {
                     "ALTER TABLE revisions ADD COLUMN trash_operation_id TEXT",
                     [],
                 )?;
+            }
+            let gc_queue_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gc_queue')",
+                [],
+                |row| row.get(0),
+            )?;
+            if schema_version < 6 && gc_queue_exists {
+                let columns = {
+                    let mut statement = connection.prepare("PRAGMA table_info(gc_queue)")?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<BTreeSet<_>, _>>()?
+                };
+                if !columns.contains("delete_after_quarantine") {
+                    connection.execute(
+                        "ALTER TABLE gc_queue ADD COLUMN delete_after_quarantine INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )?;
+                }
+                if !columns.contains("purged_at") {
+                    connection.execute("ALTER TABLE gc_queue ADD COLUMN purged_at TEXT", [])?;
+                }
             }
             connection.execute_batch(
                 "BEGIN;
@@ -330,12 +360,14 @@ impl MetadataStore {
                      state TEXT NOT NULL,
                      created_at TEXT NOT NULL,
                      quarantined_at TEXT,
+                     delete_after_quarantine INTEGER NOT NULL DEFAULT 0,
+                     purged_at TEXT,
                      last_error TEXT
                  );
                  CREATE INDEX IF NOT EXISTS gc_queue_state_idx ON gc_queue(state, created_at);
                  CREATE INDEX IF NOT EXISTS revisions_namespace_id_idx
                      ON revisions(namespace_id, created_at, id);
-                 PRAGMA user_version = 5;
+                 PRAGMA user_version = 6;
                  COMMIT;",
             )?;
             Ok(())
@@ -849,7 +881,14 @@ impl MetadataStore {
                  FROM revision_trash_operations WHERE id = ?1 AND namespace_id = ?2",
                 params![operation_id.to_string(), namespace_text], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, i64>(6)?, row.get::<_, String>(7)?)),
             ).optional()?.ok_or_else(|| not_found("history trash operation", operation_id))?;
-            if operation.7 != "active" || operation.1 != current_head { return Err(conflict(&operation_id.to_string())); }
+            let expires_at = DateTime::parse_from_rfc3339(&operation.5)
+                .map_err(|_| conflict(&operation_id.to_string()))?;
+            if operation.7 != "active"
+                || operation.1 != current_head
+                || expires_at <= Utc::now()
+            {
+                return Err(conflict(&operation_id.to_string()));
+            }
             transaction.execute(
                 "UPDATE revisions SET state = 'active', trash_operation_id = NULL WHERE trash_operation_id = ?1",
                 [operation_id.to_string()],
@@ -865,6 +904,64 @@ impl MetadataStore {
                 epoch_before: operation.2 as u64, epoch_after: operation.3 as u64, created_at: operation.4,
                 expires_at: operation.5, revision_count: operation.6 as usize, state: "restored".to_string() })
         }).await
+    }
+
+    pub async fn plan_history_trash_purge(
+        &self,
+        namespace_id: Uuid,
+        operation_ids: Vec<Uuid>,
+        purge_all: bool,
+    ) -> Result<HistoryTrashPurgePlan, MetadataError> {
+        self.with_connection(move |connection| {
+            build_history_trash_purge_plan(connection, namespace_id, &operation_ids, purge_all)
+        })
+        .await
+    }
+
+    pub async fn commit_history_trash_purge(
+        &self,
+        namespace_id: Uuid,
+        expected: HistoryTrashPurgePlan,
+    ) -> Result<(HistoryTrashPurgePlan, Vec<GcQueueEntry>), MetadataError> {
+        self.with_connection(move |connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = build_history_trash_purge_plan(
+                &transaction,
+                namespace_id,
+                &expected.operation_ids,
+                false,
+            )?;
+            if current != expected {
+                return Err(conflict("stale-history-trash-purge"));
+            }
+            for operation_id in &current.operation_ids {
+                let operation_id = operation_id.to_string();
+                transaction.execute(
+                    "DELETE FROM revision_roots WHERE revision_id IN
+                     (SELECT id FROM revisions WHERE namespace_id = ?1 AND trash_operation_id = ?2 AND state = 'trashed')",
+                    params![namespace_id.to_string(), operation_id],
+                )?;
+                transaction.execute(
+                    "UPDATE revisions SET state = 'purged'
+                     WHERE namespace_id = ?1 AND trash_operation_id = ?2 AND state = 'trashed'",
+                    params![namespace_id.to_string(), operation_id],
+                )?;
+                transaction.execute(
+                    "UPDATE revision_trash_operations SET state = 'purged'
+                     WHERE namespace_id = ?1 AND id = ?2 AND state = 'active'",
+                    params![namespace_id.to_string(), operation_id],
+                )?;
+            }
+            let entries = enqueue_gc_objects_for_purge_in_connection(
+                &transaction,
+                Uuid::now_v7(),
+                current.candidate_objects.clone(),
+            )?;
+            transaction.commit()?;
+            Ok((current, entries))
+        })
+        .await
     }
 
     pub async fn plan_gc(&self) -> Result<ServerGcPlan, MetadataError> {
@@ -905,6 +1002,7 @@ impl MetadataStore {
                     operation_id,
                     object,
                     state: "pending".to_string(),
+                    delete_after_quarantine: false,
                 });
             }
             transaction.commit()?;
@@ -916,7 +1014,8 @@ impl MetadataStore {
     pub async fn pending_gc_entries(&self) -> Result<Vec<GcQueueEntry>, MetadataError> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, operation_id, object_kind, object_sha256, expected_length, state
+                "SELECT id, operation_id, object_kind, object_sha256, expected_length, state,
+                        delete_after_quarantine
                  FROM gc_queue WHERE state = 'pending' ORDER BY created_at, id",
             )?;
             let rows = statement.query_map([], |row| {
@@ -940,6 +1039,44 @@ impl MetadataStore {
                         byte_length: row.get::<_, i64>(4)? as u64,
                     },
                     state: row.get(5)?,
+                    delete_after_quarantine: row.get::<_, i64>(6)? != 0,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+        .await
+    }
+
+    pub async fn quarantined_gc_entries_for_purge(
+        &self,
+    ) -> Result<Vec<GcQueueEntry>, MetadataError> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, operation_id, object_kind, object_sha256, expected_length, state,
+                        delete_after_quarantine
+                 FROM gc_queue
+                 WHERE state = 'quarantined' AND delete_after_quarantine = 1
+                 ORDER BY quarantined_at, id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                let kind_text: String = row.get(2)?;
+                let kind = kind_text.parse::<StorageObjectKind>().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        2,
+                        "object_kind".to_string(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?;
+                Ok(GcQueueEntry {
+                    id: parse_uuid(row.get::<_, String>(0)?, 0)?,
+                    operation_id: parse_uuid(row.get::<_, String>(1)?, 1)?,
+                    object: StorageObjectRef {
+                        kind,
+                        sha256: row.get(3)?,
+                        byte_length: row.get::<_, i64>(4)? as u64,
+                    },
+                    state: row.get(5)?,
+                    delete_after_quarantine: row.get::<_, i64>(6)? != 0,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -998,6 +1135,18 @@ impl MetadataStore {
         .await
     }
 
+    pub async fn mark_gc_entry_purged(&self, entry_id: Uuid) -> Result<(), MetadataError> {
+        self.with_connection(move |connection| {
+            connection.execute(
+                "UPDATE gc_queue SET state = 'purged', purged_at = ?1, last_error = NULL
+                 WHERE id = ?2 AND state = 'quarantined' AND delete_after_quarantine = 1",
+                params![now_rfc3339(), entry_id.to_string()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn with_connection<T, F>(&self, operation: F) -> Result<T, MetadataError>
     where
         T: Send + 'static,
@@ -1017,6 +1166,203 @@ fn open_connection(db_path: &Path) -> Result<Connection, MetadataError> {
     connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     Ok(connection)
+}
+
+fn build_history_trash_purge_plan(
+    connection: &Connection,
+    namespace_id: Uuid,
+    requested_operation_ids: &[Uuid],
+    purge_all: bool,
+) -> Result<HistoryTrashPurgePlan, MetadataError> {
+    if purge_all && !requested_operation_ids.is_empty() {
+        return Err(conflict("history-purge-selection"));
+    }
+    if !purge_all && requested_operation_ids.is_empty() {
+        return Err(conflict("history-purge-selection"));
+    }
+    let namespace_text = namespace_id.to_string();
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM namespaces WHERE id = ?1)",
+        [&namespace_text],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(not_found("namespace", namespace_id));
+    }
+    let mut statement = connection.prepare(
+        "SELECT id, new_head FROM revision_trash_operations
+         WHERE namespace_id = ?1 AND state = 'active' ORDER BY created_at, id",
+    )?;
+    let active = statement
+        .query_map([&namespace_text], |row| {
+            let id: String = row.get(0)?;
+            Ok((parse_uuid(id, 0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let active_ids = active.iter().map(|(id, _)| *id).collect::<BTreeSet<_>>();
+    let requested = requested_operation_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if requested.len() != requested_operation_ids.len() {
+        return Err(conflict("duplicate-history-purge-operation"));
+    }
+    let selected = if purge_all {
+        active_ids.clone()
+    } else {
+        if !requested.is_subset(&active_ids) {
+            return Err(conflict("history-trash-operation-not-active"));
+        }
+        requested
+    };
+    if selected.is_empty() {
+        return Err(conflict("history-trash-empty"));
+    }
+    let selected_text = selected
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut revision_statement = connection.prepare(
+        "SELECT id, trash_operation_id FROM revisions
+         WHERE namespace_id = ?1 AND state = 'trashed' AND trash_operation_id IS NOT NULL",
+    )?;
+    let selected_revisions = revision_statement
+        .query_map([&namespace_text], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((revision_id, operation_id)) if selected_text.contains(&operation_id) => {
+                Some(Ok(revision_id))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<BTreeSet<_>, rusqlite::Error>>()?;
+    for (operation_id, new_head) in &active {
+        if selected.contains(operation_id) {
+            continue;
+        }
+        if new_head
+            .as_ref()
+            .is_some_and(|head| selected_revisions.contains(head))
+        {
+            return Err(conflict("history-purge-has-dependent-trash"));
+        }
+    }
+
+    let mut roots_statement = connection.prepare(
+        "SELECT rr.root_sha256, r.trash_operation_id
+         FROM revision_roots rr JOIN revisions r ON r.id = rr.revision_id
+         WHERE r.namespace_id = ?1 AND r.state = 'trashed' AND r.trash_operation_id IS NOT NULL",
+    )?;
+    let root_hashes = roots_statement
+        .query_map([&namespace_text], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((root, operation_id)) if selected_text.contains(&operation_id) => Some(Ok(root)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<Result<BTreeSet<_>, rusqlite::Error>>()?;
+    let mut objects = BTreeMap::<(String, String), StorageObjectRef>::new();
+    for root in root_hashes {
+        let mut graph_statement = connection.prepare(
+            "WITH RECURSIVE graph(kind, sha256) AS (
+                 SELECT 'revisionRoot', ?1
+                 UNION
+                 SELECT edges.target_kind, edges.target_sha256
+                 FROM object_edges edges JOIN graph parent
+                   ON parent.kind = edges.owner_kind AND parent.sha256 = edges.owner_sha256
+             )
+             SELECT graph.kind, graph.sha256, storage.byte_length
+             FROM graph JOIN storage_objects storage
+               ON storage.kind = graph.kind AND storage.sha256 = graph.sha256",
+        )?;
+        let rows = graph_statement.query_map([root], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (kind, sha256, byte_length) = row?;
+            let parsed_kind = kind
+                .parse::<StorageObjectKind>()
+                .map_err(|_| conflict(&sha256))?;
+            let object = StorageObjectRef {
+                kind: parsed_kind,
+                sha256: sha256.clone(),
+                byte_length: u64::try_from(byte_length).map_err(|_| conflict(&sha256))?,
+            };
+            objects.insert((kind, sha256), object);
+        }
+    }
+    Ok(HistoryTrashPurgePlan {
+        operation_ids: selected.into_iter().collect(),
+        revision_count: selected_revisions.len(),
+        candidate_objects: objects.into_values().collect(),
+    })
+}
+
+fn enqueue_gc_objects_for_purge_in_connection(
+    connection: &Connection,
+    operation_id: Uuid,
+    objects: Vec<StorageObjectRef>,
+) -> Result<Vec<GcQueueEntry>, MetadataError> {
+    let reachable = reachable_objects(connection)?;
+    let created_at = now_rfc3339();
+    let mut unique = BTreeMap::new();
+    for object in objects {
+        unique.insert(
+            (object.kind.wire_name().to_string(), object.sha256.clone()),
+            object,
+        );
+    }
+    let mut entries = Vec::new();
+    for ((kind, sha256), object) in unique {
+        if reachable.contains(&(kind.clone(), sha256.clone())) {
+            continue;
+        }
+        let stored_length = connection
+            .query_row(
+                "SELECT byte_length FROM storage_objects WHERE kind = ?1 AND sha256 = ?2",
+                params![kind, sha256],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(stored_length) = stored_length else {
+            continue;
+        };
+        if u64::try_from(stored_length).map_err(|_| conflict(&object.sha256))? != object.byte_length
+        {
+            return Err(conflict(&object.sha256));
+        }
+        let id = Uuid::now_v7();
+        connection.execute(
+            "INSERT INTO gc_queue
+             (id, operation_id, object_kind, object_sha256, expected_length, state,
+              created_at, delete_after_quarantine)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, 1)",
+            params![
+                id.to_string(),
+                operation_id.to_string(),
+                object.kind.wire_name(),
+                object.sha256,
+                sql_integer(object.byte_length, &object.sha256)?,
+                created_at,
+            ],
+        )?;
+        entries.push(GcQueueEntry {
+            id,
+            operation_id,
+            object,
+            state: "pending".to_string(),
+            delete_after_quarantine: true,
+        });
+    }
+    Ok(entries)
 }
 
 fn reachable_objects(connection: &Connection) -> Result<BTreeSet<(String, String)>, MetadataError> {
@@ -1591,17 +1937,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumes_a_partially_applied_v6_gc_queue_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("metadata.sqlite");
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE gc_queue (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     operation_id TEXT NOT NULL,
+                     object_kind TEXT NOT NULL,
+                     object_sha256 TEXT NOT NULL,
+                     expected_length INTEGER NOT NULL,
+                     state TEXT NOT NULL,
+                     created_at TEXT NOT NULL,
+                     quarantined_at TEXT,
+                     delete_after_quarantine INTEGER NOT NULL DEFAULT 0,
+                     last_error TEXT
+                 );
+                 PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        drop(connection);
+
+        MetadataStore::new(&db_path).initialize().await.unwrap();
+        let connection = Connection::open(db_path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(gc_queue)").unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<BTreeSet<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(version, 6);
+        assert!(columns.contains("delete_after_quarantine"));
+        assert!(columns.contains("purged_at"));
+    }
+
+    #[tokio::test]
     async fn rejects_a_newer_metadata_schema() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("metadata.sqlite");
         let connection = Connection::open(&db_path).unwrap();
-        connection.pragma_update(None, "user_version", 6).unwrap();
+        connection.pragma_update(None, "user_version", 7).unwrap();
         drop(connection);
 
         let store = MetadataStore::new(db_path);
         assert!(matches!(
             store.initialize().await,
-            Err(MetadataError::UnsupportedSchema { actual: 6 })
+            Err(MetadataError::UnsupportedSchema { actual: 7 })
         ));
     }
 }

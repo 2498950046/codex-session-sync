@@ -250,6 +250,27 @@ export type SnapshotTrashEntry = {
   trashManifestPath: string;
 };
 
+export type LocalTrashPurgePlan = {
+  schemaVersion: number;
+  createdAt: string;
+  operationIds: string[];
+  trashEntryCount: number;
+  candidateObjects: Array<{ kind: string; sha256: string; byteLength: number }>;
+  objectReclaimableBytes: number;
+  trashMetadataBytes: number;
+  retainedSharedBytes: number;
+  planFingerprint: string;
+};
+
+export type LocalTrashPurgeResult = {
+  operationId: string;
+  deletedTrashEntries: number;
+  deletedObjectCount: number;
+  freedBytes: number;
+  retainedSharedBytes: number;
+  journalPath: string;
+};
+
 export type RemoteHistoryTrashOperation = {
   operationId: string;
   namespaceId: string;
@@ -261,6 +282,13 @@ export type RemoteHistoryTrashOperation = {
   expiresAt: string;
   revisionCount: number;
   state: string;
+};
+
+export type RemoteHistoryTrashPurgeResult = {
+  purgedOperationCount: number;
+  purgedRevisionCount: number;
+  deletedObjectCount: number;
+  reclaimedBytes: number;
 };
 
 export type GcPlan = {

@@ -7,11 +7,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sync_core::{
     ContentRefV4, CreateNamespaceRequest, HistoryTrashListResponse, Namespace,
-    ProtocolInfoResponseV4, RestoreHistoryRequest, RevisionCommitRequestV4,
-    RevisionCommitResponseV4, RevisionListResponse, RevisionRootV4, SemanticThreadDescriptorV4,
-    SemanticWorkspaceV4, ServerGcPlan, ServerGcQuarantineRequest, ServerGcQuarantineResponse,
-    StorageObjectKindV4, StorageRefV4, ThreadRefV4, TruncateHistoryRequest, canonical_json_v4,
-    digest_bytes_v4,
+    ProtocolInfoResponseV4, PurgeHistoryTrashRequest, PurgeHistoryTrashResponse,
+    RestoreHistoryRequest, RevisionCommitRequestV4, RevisionCommitResponseV4, RevisionListResponse,
+    RevisionRootV4, SemanticThreadDescriptorV4, SemanticWorkspaceV4, ServerGcPlan,
+    ServerGcQuarantineRequest, ServerGcQuarantineResponse, StorageObjectKindV4, StorageRefV4,
+    ThreadRefV4, TruncateHistoryRequest, canonical_json_v4, digest_bytes_v4,
 };
 use sync_server::{AppState, ServerConfig, build_router};
 use tempfile::TempDir;
@@ -373,6 +373,85 @@ async fn history_truncation_is_recoverable_and_epoch_cas_protected() {
         ))
         .await;
     assert_eq!(restored.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn history_trash_purge_permanently_deletes_only_globally_unreachable_objects() {
+    let app = TestApp::new().await;
+    let namespace = app.create_namespace("Purge").await;
+    let first = app
+        .install_revision(namespace.id, None, b"shared\n", "thread")
+        .await;
+    let first_id = first.revision_id().unwrap();
+    assert_eq!(
+        app.commit(namespace.id, None, 0, &first).await.status(),
+        StatusCode::CREATED
+    );
+    let second = app
+        .install_revision(namespace.id, Some(first_id.clone()), b"shared\n", "thread")
+        .await;
+    let second_id = second.revision_id().unwrap();
+    assert_eq!(
+        app.commit(namespace.id, Some(first_id.clone()), 0, &second)
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let truncated = app
+        .send(json_request(
+            Method::POST,
+            &format!("/api/v4/namespaces/{}/history/truncations", namespace.id),
+            &TruncateHistoryRequest {
+                expected_head: Some(second_id.clone()),
+                expected_namespace_epoch: 0,
+                new_head: Some(first_id.clone()),
+            },
+        ))
+        .await;
+    let operation: sync_core::HistoryTrashOperation = response_json(truncated).await;
+    let purged = app
+        .send(json_request(
+            Method::POST,
+            &format!("/api/v4/namespaces/{}/trash/purge", namespace.id),
+            &PurgeHistoryTrashRequest {
+                operation_ids: vec![operation.operation_id],
+                purge_all: false,
+            },
+        ))
+        .await;
+    assert_eq!(purged.status(), StatusCode::OK);
+    let purged: PurgeHistoryTrashResponse = response_json(purged).await;
+    assert_eq!(
+        (purged.purged_operation_count, purged.purged_revision_count),
+        (1, 1)
+    );
+    assert!(purged.deleted_object_count >= 1);
+
+    let second_digest = second_id.strip_prefix("sha256:").unwrap();
+    assert_eq!(
+        app.send(auth_request(
+            Method::GET,
+            &format!("/api/v4/objects/revisionRoot/{second_digest}"),
+            Body::empty(),
+        ))
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    let shared_descriptor = first.threads[0]
+        .descriptor_sha256
+        .strip_prefix("sha256:")
+        .unwrap();
+    assert_eq!(
+        app.send(auth_request(
+            Method::GET,
+            &format!("/api/v4/objects/thread/{shared_descriptor}"),
+            Body::empty(),
+        ))
+        .await
+        .status(),
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]

@@ -249,6 +249,56 @@ pub struct StorageObjectRefV4 {
     pub byte_length: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTrashPurgePlanV4 {
+    pub schema_version: u32,
+    pub created_at: String,
+    pub operation_ids: Vec<String>,
+    pub trash_entry_count: usize,
+    pub candidate_objects: Vec<StorageObjectRefV4>,
+    pub object_reclaimable_bytes: u64,
+    pub trash_metadata_bytes: u64,
+    pub retained_shared_bytes: u64,
+    pub plan_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTrashPurgeResultV4 {
+    pub operation_id: String,
+    pub deleted_trash_entries: usize,
+    pub deleted_object_count: usize,
+    pub freed_bytes: u64,
+    pub retained_shared_bytes: u64,
+    pub journal_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LocalTrashPurgeStatusV4 {
+    Preparing,
+    EntriesStaged,
+    Committed,
+    ObjectsStaged,
+    Completed,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalTrashPurgeJournalV4 {
+    schema_version: u32,
+    operation_id: String,
+    status: LocalTrashPurgeStatusV4,
+    repository_root: PathBuf,
+    staging_root: PathBuf,
+    plan: LocalTrashPurgePlanV4,
+    created_at: String,
+    updated_at: String,
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FilesystemContentStoreV4 {
     root: PathBuf,
@@ -675,71 +725,200 @@ pub fn typed_object_path_v4(
         .join(&digest[2..]))
 }
 
-/// Build a conservative local GC plan for a v4 repository. Every snapshot,
-/// snapshot-trash root, cached revision root, descriptor, overlay, manifest,
-/// and chunk is treated as reachable; malformed roots fail closed rather than
-/// risking collection of an object that may be needed for recovery.
-pub fn plan_local_gc_v4(repository_root: &Path) -> Result<crate::storage_v3::GcPlan> {
-    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
-    let mut reachable = BTreeSet::<crate::storage_v3::StorageObjectRef>::new();
-    let mut add = |object: StorageObjectRefV4| -> Result<()> {
-        let Some(kind) = storage_kind_v3(object.kind) else {
-            return Ok(());
-        };
-        reachable.insert(crate::storage_v3::StorageObjectRef {
-            kind,
-            sha256: object.sha256,
-            byte_length: object.byte_length,
+fn collect_snapshot_graph_objects_v4(
+    store: &FilesystemContentStoreV4,
+    root: &SnapshotRootV4,
+) -> Result<BTreeSet<StorageObjectRefV4>> {
+    root.validate()?;
+    let mut objects = BTreeSet::new();
+    let overlay_path =
+        store.object_path_by_id(StorageObjectKindV4::SnapshotOverlay, &root.overlay_sha256)?;
+    objects.insert(StorageObjectRefV4 {
+        kind: StorageObjectKindV4::SnapshotOverlay,
+        sha256: root.overlay_sha256.clone(),
+        byte_length: fs::metadata(&overlay_path)
+            .with_context(|| format!("missing snapshot overlay {}", overlay_path.display()))?
+            .len(),
+    });
+    for reference in &root.threads {
+        let descriptor: SemanticThreadDescriptorV4 =
+            store.read_json(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
+        descriptor.validate()?;
+        let descriptor_path =
+            store.object_path_by_id(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
+        objects.insert(StorageObjectRefV4 {
+            kind: StorageObjectKindV4::Thread,
+            sha256: reference.descriptor_sha256.clone(),
+            byte_length: fs::metadata(descriptor_path)?.len(),
         });
-        Ok(())
-    };
-    let mut collect_root = |root: SnapshotRootV4| -> Result<()> {
-        root.validate()?;
-        let overlay_path =
-            store.object_path_by_id(StorageObjectKindV4::SnapshotOverlay, &root.overlay_sha256)?;
-        if overlay_path.is_file() {
-            add(StorageObjectRefV4 {
-                kind: StorageObjectKindV4::SnapshotOverlay,
-                sha256: root.overlay_sha256,
-                byte_length: fs::metadata(overlay_path)?.len(),
-            })?;
+        for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
+            objects.extend(store.content_objects(content)?);
         }
-        for reference in root.threads {
-            let descriptor: SemanticThreadDescriptorV4 =
-                store.read_json(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
-            let descriptor_bytes = canonical_json_v4(&descriptor)?;
-            add(StorageObjectRefV4 {
-                kind: StorageObjectKindV4::Thread,
-                sha256: reference.descriptor_sha256,
-                byte_length: descriptor_bytes.len() as u64,
-            })?;
-            for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter())
-            {
-                for object in store.content_objects(content)? {
-                    add(object)?;
-                }
-            }
+    }
+    Ok(objects)
+}
+
+fn collect_revision_graph_objects_v4(
+    store: &FilesystemContentStoreV4,
+    revision_id: &str,
+) -> Result<BTreeSet<StorageObjectRefV4>> {
+    let root: RevisionRootV4 = store.read_json(StorageObjectKindV4::RevisionRoot, revision_id)?;
+    root.validate()?;
+    let root_path = store.object_path_by_id(StorageObjectKindV4::RevisionRoot, revision_id)?;
+    let mut objects = BTreeSet::from([StorageObjectRefV4 {
+        kind: StorageObjectKindV4::RevisionRoot,
+        sha256: revision_id.to_string(),
+        byte_length: fs::metadata(root_path)?.len(),
+    }]);
+    for reference in &root.threads {
+        let descriptor: SemanticThreadDescriptorV4 =
+            store.read_json(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
+        descriptor.validate()?;
+        let descriptor_path =
+            store.object_path_by_id(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
+        objects.insert(StorageObjectRefV4 {
+            kind: StorageObjectKindV4::Thread,
+            sha256: reference.descriptor_sha256.clone(),
+            byte_length: fs::metadata(descriptor_path)?.len(),
+        });
+        for content in std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter()) {
+            objects.extend(store.content_objects(content)?);
         }
-        Ok(())
-    };
-    for directory in [
-        repository_root.join("snapshots"),
-        repository_root.join("trash/snapshots"),
-    ] {
-        if !directory.exists() {
+    }
+    Ok(objects)
+}
+
+fn enumerate_repository_objects_v4(
+    repository_root: &Path,
+    kinds: impl IntoIterator<Item = StorageObjectKindV4>,
+) -> Result<BTreeSet<StorageObjectRefV4>> {
+    let mut objects = BTreeSet::new();
+    for kind in kinds {
+        let root = repository_root
+            .join("objects")
+            .join(kind.directory())
+            .join("sha256");
+        if !root.exists() {
             continue;
         }
-        let mut pending = vec![directory];
-        while let Some(path) = pending.pop() {
-            for entry in fs::read_dir(path)? {
-                let path = entry?.path();
-                if path.is_dir() {
-                    pending.push(path);
-                } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
-                    let root: SnapshotRootV4 = serde_json::from_slice(&fs::read(&path)?)?;
-                    collect_root(root)?;
-                }
+        for prefix in fs::read_dir(root)? {
+            let prefix = prefix?;
+            if !prefix.file_type()?.is_dir() {
+                continue;
             }
+            let prefix_name = prefix.file_name().to_string_lossy().into_owned();
+            if prefix_name.len() != 2 {
+                bail!("invalid v4 object prefix directory {prefix_name}");
+            }
+            for entry in fs::read_dir(prefix.path())? {
+                let entry = entry?;
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() || !file_type.is_file() {
+                    bail!("v4 object store contains a non-regular object");
+                }
+                let sha256 = format!(
+                    "sha256:{prefix_name}{}",
+                    entry.file_name().to_string_lossy()
+                );
+                validate_sha256_v4(&sha256)?;
+                objects.insert(StorageObjectRefV4 {
+                    kind,
+                    sha256,
+                    byte_length: entry.metadata()?.len(),
+                });
+            }
+        }
+    }
+    Ok(objects)
+}
+
+fn load_local_trash_roots_v4(
+    repository_root: &Path,
+) -> Result<BTreeMap<String, (PathBuf, SnapshotRootV4)>> {
+    let directory = repository_root.join("trash/snapshots");
+    let mut roots = BTreeMap::new();
+    if !directory.exists() {
+        return Ok(roots);
+    }
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let operation_id = entry.file_name().to_string_lossy().into_owned();
+        Uuid::parse_str(&operation_id).context("invalid local trash operation ID")?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            bail!("local trash entry must be a regular directory");
+        }
+        let path = entry.path();
+        let manifest_path = path.join("snapshot.json");
+        let entry_path = path.join("entry.json");
+        let trash_entry: crate::storage_v3::SnapshotTrashEntry =
+            read_bounded_v4(&entry_path, 16 * 1024 * 1024)?;
+        if trash_entry.operation_id != operation_id {
+            bail!("local trash entry operation ID mismatch");
+        }
+        let root: SnapshotRootV4 = read_bounded_v4(&manifest_path, 16 * 1024 * 1024)?;
+        root.validate()?;
+        if root.snapshot_id != trash_entry.snapshot_id {
+            bail!("local trash snapshot ID mismatch");
+        }
+        roots.insert(operation_id, (path, root));
+    }
+    Ok(roots)
+}
+
+fn non_terminal_repository_journals_v4(repository_root: &Path) -> Result<Vec<PathBuf>> {
+    let directory = repository_root.join("journal");
+    let mut journals = Vec::new();
+    if !directory.exists() {
+        return Ok(journals);
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = fs::metadata(&path)?;
+        if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+            continue;
+        }
+        let value: Value = read_bounded_v4(&path, 16 * 1024 * 1024)?;
+        let Some(status) = value.get("status").and_then(Value::as_str) else {
+            continue;
+        };
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.starts_with("local-trash-purge-"))
+        {
+            continue;
+        }
+        let status = status.to_ascii_lowercase();
+        if !matches!(status.as_str(), "completed" | "rolled_back" | "rolledback") {
+            journals.push(path);
+        }
+    }
+    Ok(journals)
+}
+
+fn collect_reachable_objects_v4(
+    repository_root: &Path,
+    excluded_trash_operations: &BTreeSet<String>,
+) -> Result<BTreeSet<StorageObjectRefV4>> {
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let mut reachable = BTreeSet::new();
+    let snapshot_directory = repository_root.join("snapshots");
+    if snapshot_directory.exists() {
+        for entry in fs::read_dir(snapshot_directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                let root: SnapshotRootV4 = read_bounded_v4(&path, 16 * 1024 * 1024)?;
+                reachable.extend(collect_snapshot_graph_objects_v4(&store, &root)?);
+            }
+        }
+    }
+    for (operation_id, (_, root)) in load_local_trash_roots_v4(repository_root)? {
+        if !excluded_trash_operations.contains(&operation_id) {
+            reachable.extend(collect_snapshot_graph_objects_v4(&store, &root)?);
         }
     }
     let revision_dir = repository_root.join("objects/revision-roots/sha256");
@@ -762,67 +941,29 @@ pub fn plan_local_gc_v4(repository_root: &Path) -> Result<crate::storage_v3::GcP
                         .to_string_lossy(),
                     path.file_name().unwrap().to_string_lossy()
                 );
-                let root: RevisionRootV4 =
-                    store.read_json(StorageObjectKindV4::RevisionRoot, &digest)?;
-                add(StorageObjectRefV4 {
-                    kind: StorageObjectKindV4::RevisionRoot,
-                    sha256: digest,
-                    byte_length: fs::metadata(&path)?.len(),
-                })?;
-                for reference in root.threads {
-                    let descriptor: SemanticThreadDescriptorV4 = store
-                        .read_json(StorageObjectKindV4::Thread, &reference.descriptor_sha256)?;
-                    add(StorageObjectRefV4 {
-                        kind: StorageObjectKindV4::Thread,
-                        sha256: reference.descriptor_sha256,
-                        byte_length: canonical_json_v4(&descriptor)?.len() as u64,
-                    })?;
-                    for content in
-                        std::iter::once(&descriptor.rollout).chain(descriptor.attachments.iter())
-                    {
-                        for object in store.content_objects(content)? {
-                            add(object)?;
-                        }
-                    }
-                }
+                reachable.extend(collect_revision_graph_objects_v4(&store, &digest)?);
             }
         }
     }
-    let mut unreachable = Vec::new();
-    for kind in StorageObjectKindV4::REMOTE {
-        let root = repository_root
-            .join("objects")
-            .join(kind.directory())
-            .join("sha256");
-        if !root.exists() {
-            continue;
-        }
-        for prefix in fs::read_dir(root)? {
-            let prefix = prefix?;
-            if !prefix.file_type()?.is_dir() {
-                continue;
-            }
-            let prefix_name = prefix.file_name().to_string_lossy().into_owned();
-            for entry in fs::read_dir(prefix.path())? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let object = crate::storage_v3::StorageObjectRef {
-                    kind: storage_kind_v3(kind).unwrap(),
-                    sha256: format!(
-                        "sha256:{}{}",
-                        prefix_name,
-                        entry.file_name().to_string_lossy()
-                    ),
-                    byte_length: entry.metadata()?.len(),
-                };
-                if !reachable.contains(&object) {
-                    unreachable.push(object);
-                }
-            }
-        }
-    }
+    Ok(reachable)
+}
+
+/// Build a conservative local GC plan for a v4 repository. Snapshot overlays
+/// stay local-only, so the legacy GC response omits them; permanent trash
+/// purge uses the native v4 planner below and includes every v4 object kind.
+pub fn plan_local_gc_v4(repository_root: &Path) -> Result<crate::storage_v3::GcPlan> {
+    let reachable_v4 = collect_reachable_objects_v4(repository_root, &BTreeSet::new())?;
+    let all = enumerate_repository_objects_v4(repository_root, StorageObjectKindV4::REMOTE)?;
+    let mut unreachable = all
+        .difference(&reachable_v4)
+        .filter_map(|object| {
+            storage_kind_v3(object.kind).map(|kind| crate::storage_v3::StorageObjectRef {
+                kind,
+                sha256: object.sha256.clone(),
+                byte_length: object.byte_length,
+            })
+        })
+        .collect::<Vec<_>>();
     unreachable.sort();
     let reclaimable_bytes = unreachable.iter().try_fold(0_u64, |total, object| {
         total
@@ -832,10 +973,299 @@ pub fn plan_local_gc_v4(repository_root: &Path) -> Result<crate::storage_v3::GcP
     Ok(crate::storage_v3::GcPlan {
         schema_version: 4,
         created_at: chrono::Utc::now().to_rfc3339(),
-        reachable_objects: reachable.len(),
+        reachable_objects: reachable_v4.len(),
         unreachable_objects: unreachable,
         reclaimable_bytes,
     })
+}
+
+pub fn plan_local_trash_purge_v4(
+    repository_root: &Path,
+    requested_operation_ids: &[String],
+    purge_all: bool,
+) -> Result<LocalTrashPurgePlanV4> {
+    if !repository_root.join("format.json").is_file() {
+        bail!("permanent local trash deletion requires a v4 repository");
+    }
+    recover_local_trash_purges_v4(repository_root)?;
+    let active_journals = non_terminal_repository_journals_v4(repository_root)?;
+    if !active_journals.is_empty() {
+        bail!(
+            "local trash cannot be permanently deleted while {} recovery operation(s) require attention",
+            active_journals.len()
+        );
+    }
+    if purge_all && !requested_operation_ids.is_empty() {
+        bail!("purge-all cannot be combined with explicit trash operation IDs");
+    }
+    if !purge_all && requested_operation_ids.is_empty() {
+        bail!("at least one local trash operation ID is required");
+    }
+    let trash_roots = load_local_trash_roots_v4(repository_root)?;
+    let mut operation_ids = if purge_all {
+        trash_roots.keys().cloned().collect::<Vec<_>>()
+    } else {
+        requested_operation_ids.to_vec()
+    };
+    operation_ids.sort();
+    operation_ids.dedup();
+    if operation_ids.is_empty() {
+        bail!("local snapshot trash is empty");
+    }
+    let selected = operation_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if selected.len() != requested_operation_ids.len() && !purge_all {
+        bail!("local trash purge request contains duplicate operation IDs");
+    }
+    for operation_id in &selected {
+        Uuid::parse_str(operation_id).context("invalid local trash operation ID")?;
+        if !trash_roots.contains_key(operation_id) {
+            bail!("local trash operation not found: {operation_id}");
+        }
+    }
+
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let mut selected_objects = BTreeSet::new();
+    let mut selected_roots = BTreeMap::new();
+    let mut trash_metadata_bytes = 0_u64;
+    for operation_id in &operation_ids {
+        let (directory, root) = trash_roots
+            .get(operation_id)
+            .context("selected local trash operation disappeared")?;
+        selected_objects.extend(collect_snapshot_graph_objects_v4(&store, root)?);
+        selected_roots.insert(operation_id.clone(), root.clone());
+        trash_metadata_bytes = trash_metadata_bytes
+            .checked_add(directory_bytes_v4(directory)?)
+            .context("local trash metadata byte count overflow")?;
+    }
+    let reachable = collect_reachable_objects_v4(repository_root, &selected)?;
+    let all_objects = enumerate_repository_objects_v4(repository_root, StorageObjectKindV4::ALL)?;
+    let candidate_objects = all_objects
+        .difference(&reachable)
+        .cloned()
+        .collect::<Vec<_>>();
+    let object_reclaimable_bytes = candidate_objects.iter().try_fold(0_u64, |total, object| {
+        total
+            .checked_add(object.byte_length)
+            .context("local purge byte count overflow")
+    })?;
+    let retained_shared_bytes =
+        selected_objects
+            .intersection(&reachable)
+            .try_fold(0_u64, |total, object| {
+                total
+                    .checked_add(object.byte_length)
+                    .context("shared local purge byte count overflow")
+            })?;
+    let plan_fingerprint = digest_bytes_v4(&canonical_json_v4(&(
+        &operation_ids,
+        &selected_roots,
+        &candidate_objects,
+        trash_metadata_bytes,
+        retained_shared_bytes,
+    ))?);
+    Ok(LocalTrashPurgePlanV4 {
+        schema_version: 1,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        operation_ids,
+        trash_entry_count: selected.len(),
+        candidate_objects,
+        object_reclaimable_bytes,
+        trash_metadata_bytes,
+        retained_shared_bytes,
+        plan_fingerprint,
+    })
+}
+
+pub fn purge_local_trash_v4(
+    repository_root: &Path,
+    expected: &LocalTrashPurgePlanV4,
+) -> Result<LocalTrashPurgeResultV4> {
+    recover_local_trash_purges_v4(repository_root)?;
+    let current = plan_local_trash_purge_v4(repository_root, &expected.operation_ids, false)?;
+    if current.plan_fingerprint != expected.plan_fingerprint {
+        bail!("local trash purge plan became stale");
+    }
+    let operation_id = Uuid::now_v7().to_string();
+    let staging_root = repository_root
+        .join("quarantine/trash-purge")
+        .join(&operation_id);
+    let journal_path = repository_root
+        .join("journal")
+        .join(format!("local-trash-purge-{operation_id}.json"));
+    fs::create_dir_all(staging_root.join("entries"))?;
+    fs::create_dir_all(staging_root.join("objects"))?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut journal = LocalTrashPurgeJournalV4 {
+        schema_version: 1,
+        operation_id: operation_id.clone(),
+        status: LocalTrashPurgeStatusV4::Preparing,
+        repository_root: repository_root.to_path_buf(),
+        staging_root: staging_root.clone(),
+        plan: current,
+        created_at: now.clone(),
+        updated_at: now,
+        error: None,
+    };
+    write_v4_root(&journal_path, &journal)?;
+
+    let stage_result = (|| -> Result<()> {
+        for trash_operation_id in &journal.plan.operation_ids {
+            let source = repository_root
+                .join("trash/snapshots")
+                .join(trash_operation_id);
+            let destination = staging_root.join("entries").join(trash_operation_id);
+            fs::rename(&source, &destination).with_context(|| {
+                format!("failed to stage local trash entry {trash_operation_id}")
+            })?;
+        }
+        journal.status = LocalTrashPurgeStatusV4::EntriesStaged;
+        journal.updated_at = chrono::Utc::now().to_rfc3339();
+        write_v4_root(&journal_path, &journal)?;
+        Ok(())
+    })();
+    if let Err(error) = stage_result {
+        rollback_local_trash_purge_v4(repository_root, &journal_path, &mut journal)?;
+        return Err(error);
+    }
+
+    journal.status = LocalTrashPurgeStatusV4::Committed;
+    journal.updated_at = chrono::Utc::now().to_rfc3339();
+    write_v4_root(&journal_path, &journal)?;
+    match finish_local_trash_purge_v4(&journal_path, &mut journal) {
+        Ok((deleted_object_count, freed_object_bytes)) => Ok(LocalTrashPurgeResultV4 {
+            operation_id,
+            deleted_trash_entries: journal.plan.trash_entry_count,
+            deleted_object_count,
+            freed_bytes: freed_object_bytes.saturating_add(journal.plan.trash_metadata_bytes),
+            retained_shared_bytes: journal.plan.retained_shared_bytes,
+            journal_path,
+        }),
+        Err(error) => {
+            journal.error = Some(format!("{error:#}"));
+            journal.updated_at = chrono::Utc::now().to_rfc3339();
+            let _ = write_v4_root(&journal_path, &journal);
+            Err(error)
+        }
+    }
+}
+
+pub fn recover_local_trash_purges_v4(repository_root: &Path) -> Result<()> {
+    let directory = repository_root.join("journal");
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("local-trash-purge-") || !name.ends_with(".json") {
+            continue;
+        }
+        let mut journal: LocalTrashPurgeJournalV4 = read_bounded_v4(&path, 16 * 1024 * 1024)?;
+        if journal.schema_version != 1 || journal.repository_root != repository_root {
+            bail!("invalid local trash purge recovery journal");
+        }
+        match journal.status {
+            LocalTrashPurgeStatusV4::Preparing | LocalTrashPurgeStatusV4::EntriesStaged => {
+                rollback_local_trash_purge_v4(repository_root, &path, &mut journal)?;
+            }
+            LocalTrashPurgeStatusV4::Committed | LocalTrashPurgeStatusV4::ObjectsStaged => {
+                finish_local_trash_purge_v4(&path, &mut journal)?;
+            }
+            LocalTrashPurgeStatusV4::Completed | LocalTrashPurgeStatusV4::RolledBack => {}
+        }
+    }
+    Ok(())
+}
+
+fn rollback_local_trash_purge_v4(
+    repository_root: &Path,
+    journal_path: &Path,
+    journal: &mut LocalTrashPurgeJournalV4,
+) -> Result<()> {
+    for operation_id in journal.plan.operation_ids.iter().rev() {
+        let staged = journal.staging_root.join("entries").join(operation_id);
+        let original = repository_root.join("trash/snapshots").join(operation_id);
+        if staged.exists() && !original.exists() {
+            fs::rename(staged, original)?;
+        } else if staged.exists() && original.exists() {
+            bail!("cannot roll back local trash purge because both entry paths exist");
+        }
+    }
+    journal.status = LocalTrashPurgeStatusV4::RolledBack;
+    journal.updated_at = chrono::Utc::now().to_rfc3339();
+    write_v4_root(journal_path, journal)?;
+    if journal.staging_root.exists() {
+        fs::remove_dir_all(&journal.staging_root)?;
+    }
+    Ok(())
+}
+
+fn finish_local_trash_purge_v4(
+    journal_path: &Path,
+    journal: &mut LocalTrashPurgeJournalV4,
+) -> Result<(usize, u64)> {
+    let repository_root = &journal.repository_root;
+    let reachable = collect_reachable_objects_v4(repository_root, &BTreeSet::new())?;
+    let mut deleted_object_count = 0_usize;
+    let mut freed_object_bytes = 0_u64;
+    for object in &journal.plan.candidate_objects {
+        let source = typed_object_path_v4(repository_root, object.kind, &object.sha256)?;
+        let digest = object
+            .sha256
+            .strip_prefix("sha256:")
+            .expect("validated hash");
+        let destination = journal
+            .staging_root
+            .join("objects")
+            .join(object.kind.directory())
+            .join(digest);
+        if source.exists() {
+            let observed = fs::metadata(&source)?;
+            if !observed.is_file() || observed.len() != object.byte_length {
+                bail!(
+                    "local purge object changed after planning: {}",
+                    object.sha256
+                );
+            }
+            if reachable.contains(object) {
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&source, &destination)?;
+        }
+        if destination.is_file() {
+            let observed = fs::metadata(&destination)?.len();
+            fs::remove_file(&destination)?;
+            deleted_object_count += 1;
+            freed_object_bytes = freed_object_bytes
+                .checked_add(observed)
+                .context("local purge result byte count overflow")?;
+        }
+    }
+    journal.status = LocalTrashPurgeStatusV4::ObjectsStaged;
+    journal.updated_at = chrono::Utc::now().to_rfc3339();
+    write_v4_root(journal_path, journal)?;
+    let entries = journal.staging_root.join("entries");
+    if entries.exists() {
+        fs::remove_dir_all(entries)?;
+    }
+    let objects = journal.staging_root.join("objects");
+    if objects.exists() {
+        fs::remove_dir_all(objects)?;
+    }
+    if journal.staging_root.exists() {
+        fs::remove_dir(&journal.staging_root)?;
+    }
+    crate::local::invalidate_source_object_index(repository_root)?;
+    journal.status = LocalTrashPurgeStatusV4::Completed;
+    journal.updated_at = chrono::Utc::now().to_rfc3339();
+    journal.error = None;
+    write_v4_root(journal_path, journal)?;
+    Ok((deleted_object_count, freed_object_bytes))
 }
 
 pub fn repository_storage_summary_v4(
@@ -2038,5 +2468,251 @@ bad-json
         );
         fs::write(dir.path().join("format.json"), br#"{"format":"codex-session-sync-v3","storageProtocolVersion":3,"normalizationSchemaVersion":1}"#).unwrap();
         assert!(initialize_v4_repository(dir.path()).is_err());
+    }
+
+    #[test]
+    fn permanent_trash_purge_deletes_overlay_but_preserves_shared_content() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_v4_repository(dir.path()).unwrap();
+        let store = FilesystemContentStoreV4::open(dir.path().to_path_buf()).unwrap();
+        let content = store
+            .ingest_chunk_reader(
+                &mut std::io::Cursor::new(b"shared rollout"),
+                "application/x-ndjson".to_string(),
+                None,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        let descriptor = SemanticThreadDescriptorV4 {
+            schema_version: 4,
+            normalization_schema_version: NORMALIZATION_SCHEMA_VERSION_V4,
+            thread_id: "thread".to_string(),
+            title: "Shared".to_string(),
+            archived: false,
+            created_at_ms: None,
+            updated_at_ms: None,
+            semantic_workspace: SemanticWorkspaceV4::default(),
+            rollout: content,
+            related_records: BTreeMap::new(),
+            attachments: Vec::new(),
+        };
+        let descriptor_object = store
+            .store_json(StorageObjectKindV4::Thread, &descriptor)
+            .unwrap();
+        let first_overlay = store
+            .store_overlay(&SnapshotOverlayV4::new(BTreeMap::from([(
+                "thread".to_string(),
+                LocalThreadOverlayV4 {
+                    observed_provider: Some("first".to_string()),
+                    ..LocalThreadOverlayV4::default()
+                },
+            )])))
+            .unwrap();
+        let second_overlay = store
+            .store_overlay(&SnapshotOverlayV4::new(BTreeMap::from([(
+                "thread".to_string(),
+                LocalThreadOverlayV4 {
+                    observed_provider: Some("second".to_string()),
+                    ..LocalThreadOverlayV4::default()
+                },
+            )])))
+            .unwrap();
+        let first_id = Uuid::now_v7().to_string();
+        let second_id = Uuid::now_v7().to_string();
+        let thread = ThreadRefV4 {
+            thread_id: "thread".to_string(),
+            descriptor_sha256: descriptor_object.sha256.clone(),
+        };
+        for (snapshot_id, overlay_sha256) in [
+            (first_id.clone(), first_overlay.sha256.clone()),
+            (second_id.clone(), second_overlay.sha256.clone()),
+        ] {
+            write_v4_root(
+                &dir.path()
+                    .join("snapshots")
+                    .join(format!("{snapshot_id}.json")),
+                &SnapshotRootV4 {
+                    schema_version: 4,
+                    normalization_schema_version: NORMALIZATION_SCHEMA_VERSION_V4,
+                    snapshot_id,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    threads: vec![thread.clone()],
+                    overlay_sha256,
+                    warning_count: 0,
+                },
+            )
+            .unwrap();
+        }
+        let deletion = plan_snapshot_deletion_v4(dir.path(), &first_id).unwrap();
+        let trashed = crate::storage_v3::trash_local_snapshot(dir.path(), &deletion).unwrap();
+        let plan = plan_local_trash_purge_v4(
+            dir.path(),
+            std::slice::from_ref(&trashed.operation_id),
+            false,
+        )
+        .unwrap();
+        assert!(
+            plan.candidate_objects
+                .iter()
+                .any(|object| object.sha256 == first_overlay.sha256)
+        );
+        assert!(
+            !plan
+                .candidate_objects
+                .iter()
+                .any(|object| object.sha256 == descriptor_object.sha256)
+        );
+        let result = purge_local_trash_v4(dir.path(), &plan).unwrap();
+        assert_eq!(result.deleted_trash_entries, 1);
+        assert!(!store.object_path(&first_overlay).unwrap().exists());
+        assert!(store.object_path(&second_overlay).unwrap().is_file());
+        assert!(store.object_path(&descriptor_object).unwrap().is_file());
+        assert!(load_local_trash_roots_v4(dir.path()).unwrap().is_empty());
+        assert!(
+            dir.path()
+                .join("snapshots")
+                .join(format!("{second_id}.json"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn permanent_trash_purge_recovery_rolls_back_before_commit_and_finishes_after_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        initialize_v4_repository(dir.path()).unwrap();
+        let store = FilesystemContentStoreV4::open(dir.path().to_path_buf()).unwrap();
+        let content = store
+            .ingest_chunk_reader(
+                &mut std::io::Cursor::new(b"recoverable rollout"),
+                "application/x-ndjson".to_string(),
+                None,
+                &OperationControl::default(),
+            )
+            .unwrap();
+        let descriptor = store
+            .store_json(
+                StorageObjectKindV4::Thread,
+                &SemanticThreadDescriptorV4 {
+                    schema_version: 4,
+                    normalization_schema_version: NORMALIZATION_SCHEMA_VERSION_V4,
+                    thread_id: "thread".to_string(),
+                    title: "Recovery".to_string(),
+                    archived: false,
+                    created_at_ms: None,
+                    updated_at_ms: None,
+                    semantic_workspace: SemanticWorkspaceV4::default(),
+                    rollout: content,
+                    related_records: BTreeMap::new(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        let overlay = store
+            .store_overlay(&SnapshotOverlayV4::new(BTreeMap::new()))
+            .unwrap();
+        let snapshot_id = Uuid::now_v7().to_string();
+        write_v4_root(
+            &dir.path()
+                .join("snapshots")
+                .join(format!("{snapshot_id}.json")),
+            &SnapshotRootV4 {
+                schema_version: 4,
+                normalization_schema_version: NORMALIZATION_SCHEMA_VERSION_V4,
+                snapshot_id: snapshot_id.clone(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                threads: vec![ThreadRefV4 {
+                    thread_id: "thread".to_string(),
+                    descriptor_sha256: descriptor.sha256.clone(),
+                }],
+                overlay_sha256: overlay.sha256.clone(),
+                warning_count: 0,
+            },
+        )
+        .unwrap();
+        let deletion = plan_snapshot_deletion_v4(dir.path(), &snapshot_id).unwrap();
+        let trashed = crate::storage_v3::trash_local_snapshot(dir.path(), &deletion).unwrap();
+        let plan = plan_local_trash_purge_v4(
+            dir.path(),
+            std::slice::from_ref(&trashed.operation_id),
+            false,
+        )
+        .unwrap();
+
+        let first_id = Uuid::now_v7().to_string();
+        let first_staging = dir.path().join("quarantine/trash-purge").join(&first_id);
+        fs::create_dir_all(first_staging.join("entries")).unwrap();
+        fs::create_dir_all(first_staging.join("objects")).unwrap();
+        let first_journal_path = dir
+            .path()
+            .join("journal")
+            .join(format!("local-trash-purge-{first_id}.json"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let first_journal = LocalTrashPurgeJournalV4 {
+            schema_version: 1,
+            operation_id: first_id,
+            status: LocalTrashPurgeStatusV4::Preparing,
+            repository_root: dir.path().to_path_buf(),
+            staging_root: first_staging.clone(),
+            plan: plan.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            error: None,
+        };
+        write_v4_root(&first_journal_path, &first_journal).unwrap();
+        fs::rename(
+            dir.path()
+                .join("trash/snapshots")
+                .join(&trashed.operation_id),
+            first_staging.join("entries").join(&trashed.operation_id),
+        )
+        .unwrap();
+        recover_local_trash_purges_v4(dir.path()).unwrap();
+        assert!(
+            dir.path()
+                .join("trash/snapshots")
+                .join(&trashed.operation_id)
+                .is_dir()
+        );
+        let recovered: LocalTrashPurgeJournalV4 =
+            read_bounded_v4(&first_journal_path, 16 * 1024 * 1024).unwrap();
+        assert_eq!(recovered.status, LocalTrashPurgeStatusV4::RolledBack);
+
+        let second_id = Uuid::now_v7().to_string();
+        let second_staging = dir.path().join("quarantine/trash-purge").join(&second_id);
+        fs::create_dir_all(second_staging.join("entries")).unwrap();
+        fs::create_dir_all(second_staging.join("objects")).unwrap();
+        let second_journal_path = dir
+            .path()
+            .join("journal")
+            .join(format!("local-trash-purge-{second_id}.json"));
+        fs::rename(
+            dir.path()
+                .join("trash/snapshots")
+                .join(&trashed.operation_id),
+            second_staging.join("entries").join(&trashed.operation_id),
+        )
+        .unwrap();
+        write_v4_root(
+            &second_journal_path,
+            &LocalTrashPurgeJournalV4 {
+                schema_version: 1,
+                operation_id: second_id,
+                status: LocalTrashPurgeStatusV4::Committed,
+                repository_root: dir.path().to_path_buf(),
+                staging_root: second_staging,
+                plan,
+                created_at: now.clone(),
+                updated_at: now,
+                error: None,
+            },
+        )
+        .unwrap();
+        recover_local_trash_purges_v4(dir.path()).unwrap();
+        assert!(load_local_trash_roots_v4(dir.path()).unwrap().is_empty());
+        assert!(!store.object_path(&overlay).unwrap().exists());
+        assert!(!store.object_path(&descriptor).unwrap().exists());
+        let recovered: LocalTrashPurgeJournalV4 =
+            read_bounded_v4(&second_journal_path, 16 * 1024 * 1024).unwrap();
+        assert_eq!(recovered.status, LocalTrashPurgeStatusV4::Completed);
     }
 }
