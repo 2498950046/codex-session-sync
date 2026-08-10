@@ -231,6 +231,63 @@ pub fn scan_codex_home(codex_home: impl AsRef<Path>) -> Result<ScanReport> {
     scan_codex_home_with_control(codex_home, &OperationControl::default())
 }
 
+/// Mutate one local conversation after the caller has verified that Codex is closed.
+/// Archive/restore moves the rollout between the two session trees and updates the
+/// metadata row; delete removes both the rollout and its metadata row.
+pub fn mutate_local_thread(
+    codex_home: impl AsRef<Path>,
+    thread_id: &str,
+    action: &str,
+) -> Result<()> {
+    let home = fs::canonicalize(codex_home.as_ref())?;
+    let report = scan_codex_home_metadata_with_control(&home, &OperationControl::default())?;
+    let thread = report
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == thread_id)
+        .with_context(|| format!("thread {thread_id} was not found"))?;
+    let source = &thread.rollout.source_path;
+    let database = thread.related_records.source_database.as_ref();
+    match action {
+        "archive" | "restore" => {
+            let (from_dir, to_dir, archived) = if action == "archive" {
+                (home.join("sessions"), home.join("archived_sessions"), true)
+            } else {
+                (home.join("archived_sessions"), home.join("sessions"), false)
+            };
+            let relative = source
+                .strip_prefix(&from_dir)
+                .context("rollout path is outside session tree")?;
+            let target = to_dir.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(source, &target)
+                .with_context(|| format!("failed to move rollout to {}", target.display()))?;
+            if let Some(database) = database {
+                let connection = rusqlite::Connection::open(database)?;
+                connection.execute(
+                    "UPDATE threads SET archived = ?2 WHERE id = ?1",
+                    rusqlite::params![thread_id, archived as i64],
+                )?;
+            }
+        }
+        "delete" => {
+            fs::remove_file(source)
+                .with_context(|| format!("failed to remove rollout {}", source.display()))?;
+            if let Some(database) = database {
+                let connection = rusqlite::Connection::open(database)?;
+                connection.execute(
+                    "DELETE FROM threads WHERE id = ?1",
+                    rusqlite::params![thread_id],
+                )?;
+            }
+        }
+        _ => bail!("unsupported thread action {action}"),
+    }
+    Ok(())
+}
+
 pub fn scan_codex_home_dashboard(codex_home: impl AsRef<Path>) -> Result<ScanDashboardReport> {
     scan_codex_home_dashboard_with_control(codex_home, &OperationControl::default())
 }
@@ -250,7 +307,6 @@ pub fn scan_codex_home_dashboard_with_control(
         threads: report
             .threads
             .iter()
-            .take(8)
             .map(|thread| ThreadPreview {
                 thread_id: thread.thread_id.clone(),
                 title: thread.title.clone(),

@@ -9,11 +9,13 @@ import {
   ArrowRight,
   ArrowUpFromLine,
   Check,
+  ChevronLeft,
   ChevronRight,
   CircleHelp,
   Copy,
   Database,
   FolderCog,
+  Folder,
   KeyRound,
   Moon,
   Plus,
@@ -60,6 +62,7 @@ import type {
   SnapshotTrashEntry,
   SnapshotValidationReport,
   SyncReport,
+  ThreadBundle,
   ThreadConflict,
   ThreadConflictVersion,
   WorkspaceCleanupReport,
@@ -111,6 +114,61 @@ function PageIntro({ title, description, action }: { title: string; description:
 
 function StatusBadge({ tone = "neutral", children }: { tone?: "neutral" | "success" | "warning" | "danger"; children: ReactNode }) {
   return <span className={`status-badge ${tone}`}>{children}</span>;
+}
+
+function FolderPager({ page, pageCount, total, onChange }: { page: number; pageCount: number; total: number; onChange: (page: number) => void }) {
+  return <div className="session-pagination"><button className="button secondary small" onClick={() => onChange(Math.max(1, page - 1))} disabled={page <= 1}>上一页</button><span>第 {page} / {pageCount} 页 · {total} 条</span><button className="button secondary small" onClick={() => onChange(Math.min(pageCount, page + 1))} disabled={page >= pageCount}>下一页</button></div>;
+}
+
+function SessionFolderBrowser({ report, onAction, onProjectAction, mutating }: {
+  report: ScanReport;
+  onAction: (thread: ThreadBundle, action: "archive" | "restore" | "delete") => void;
+  onProjectAction: (threads: ThreadBundle[], action: "archive" | "restore" | "delete") => void;
+  mutating: boolean;
+}) {
+  const [status, setStatus] = useState<"active" | "archived" | null>(null);
+  const [project, setProject] = useState<string | null>(null);
+  const [pages, setPages] = useState({ root: 1, status: 1, project: 1 });
+  const pageSize = 10;
+  const statusThreads = report.threads.filter((thread) => thread.archived === (status === "archived"));
+  const projects = new Map<string, ThreadBundle[]>();
+  statusThreads.forEach((thread) => {
+    const key = thread.workspace.logicalId || thread.workspace.sourcePath || "无项目";
+    projects.set(key, [...(projects.get(key) ?? []), thread]);
+  });
+  const projectThreads = project ? projects.get(project) ?? [] : [];
+  const level = !status ? "root" : !project ? "status" : "project";
+  const page = pages[level];
+  const setPage = (next: number) => setPages((current) => ({ ...current, [level]: next }));
+  const pageCount = Math.max(1, Math.ceil(projectThreads.length / pageSize));
+  const projectEntries = [...projects.entries()];
+  const projectPageCount = Math.max(1, Math.ceil(projectEntries.length / pageSize));
+  const visibleProjects = projectEntries.slice((page - 1) * pageSize, page * pageSize);
+  const rootEntries: Array<["active" | "archived", number]> = [["active", report.activeCount], ["archived", report.archivedCount]];
+  const rootPageCount = Math.max(1, Math.ceil(rootEntries.length / pageSize));
+  const visibleRootEntries = rootEntries.slice((page - 1) * pageSize, page * pageSize);
+  const visibleThreads = projectThreads.slice((page - 1) * pageSize, page * pageSize);
+  const levelSummary = !status
+    ? `${2} 个分类 · 共 ${report.threads.length} 个会话`
+    : !project
+      ? `${projects.size} 个项目 · 共 ${report.threads.length} 个会话`
+      : `${projectThreads.length} 个会话 · 共 ${report.threads.length} 个会话`;
+  const enterStatus = (next: "active" | "archived") => { setStatus(next); setProject(null); };
+  const enterProject = (next: string) => { setProject(next); };
+
+  return <article className={`surface session-folder-browser ${mutating ? "mutating" : ""}`} aria-busy={mutating}>
+    <div className="section-title"><div><h3>会话浏览</h3><p>按文件夹逐级进入</p></div><span>{levelSummary}</span></div>
+    <fieldset className="session-folder-fieldset" disabled={mutating}>
+    <nav className="session-breadcrumb" aria-label="会话层级">
+      <button type="button" onClick={() => { setStatus(null); setProject(null); }}>会话</button>
+      {status && <><ChevronRight size={13} /><button type="button" onClick={() => setProject(null)}>{status === "active" ? "活动" : "归档"}</button></>}
+      {project && <><ChevronRight size={13} /><span>{project}</span></>}
+    </nav>
+    {!status && <><div className="folder-grid">{visibleRootEntries.map(([kind, count]) => <button type="button" className="folder-entry" key={kind} onClick={() => enterStatus(kind)}><Folder size={24} /><span><strong>{kind === "active" ? "活动" : "归档"}</strong><small>{count} 个会话</small></span><ChevronRight size={17} /></button>)}</div><FolderPager page={page} pageCount={rootPageCount} total={rootEntries.length} onChange={setPage} /></>}
+    {status && !project && <><button type="button" className="folder-back" onClick={() => setStatus(null)}><ChevronLeft size={15} />返回上一级</button><div className="folder-grid">{visibleProjects.map(([name, threads]) => <div className="folder-entry" key={name}><button type="button" className="folder-open" onClick={() => enterProject(name)}><Folder size={24} /><span><strong>{name}</strong><small>{threads.length} 个会话</small></span><ChevronRight size={17} /></button><div className="folder-actions"><button className="button secondary small" onClick={() => onProjectAction(threads, status === "active" ? "archive" : "restore")}>{status === "active" ? "归档项目" : "恢复项目"}</button><button className="button danger small" onClick={() => onProjectAction(threads, "delete")}>删除项目</button></div></div>)}{projects.size === 0 && <p className="muted-copy">这一层没有会话。</p>}</div><FolderPager page={page} pageCount={projectPageCount} total={projectEntries.length} onChange={setPage} /></>}
+    {status && project && <><button type="button" className="folder-back" onClick={() => { setProject(null); setPage(1); }}><ChevronLeft size={15} />返回项目列表</button><div className="thread-list folder-thread-list">{visibleThreads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title || "未命名会话"}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span><small>{thread.modelProvider ?? "unknown"}</small></div><div className="thread-actions"><button className="button secondary small" onClick={() => onAction(thread, status === "active" ? "archive" : "restore")}>{status === "active" ? "归档" : "恢复"}</button><button className="button danger small" onClick={() => onAction(thread, "delete")}>删除</button></div></div>)}</div><FolderPager page={page} pageCount={pageCount} total={projectThreads.length} onChange={setPage} /></>}
+    </fieldset>
+  </article>;
 }
 
 type VersionRow = {
@@ -370,6 +428,10 @@ export default function SessionSyncApp() {
   const [processes, setProcesses] = useState<CodexProcess[]>([]);
   const [job, setJob] = useState<JobSnapshot | null>(null);
   const [report, setReport] = useState<ScanReport | null>(null);
+  const [sessionMutating, setSessionMutating] = useState(false);
+  const [sessionActionMessage, setSessionActionMessage] = useState<string | null>(null);
+  const [sessionPage, setSessionPage] = useState(1);
+  const [sessionTab, setSessionTab] = useState<"sessions" | "compatibility">("sessions");
   const [snapshot, setSnapshot] = useState<SnapshotSummary | null>(null);
   const [localSnapshots, setLocalSnapshots] = useState<LocalSnapshotListItem[]>([]);
   const [remoteRevisions, setRemoteRevisions] = useState<RevisionSummary[]>([]);
@@ -442,7 +504,16 @@ export default function SessionSyncApp() {
   const providerPreviewActive = providerPreviewLoading
     || (job?.kind === "provider_sync_preview" && isActive(job));
   const canWrite = processes.length === 0 && isTauriRuntime;
-  const recentThreads = useMemo(() => report?.threads.slice(0, 8) ?? [], [report]);
+  const sessionPageSize = 8;
+  const sessionPageCount = Math.max(1, Math.ceil((report?.threads.length ?? 0) / sessionPageSize));
+  const recentThreads = useMemo(() => {
+    const threads = report?.threads ?? [];
+    return threads.slice((sessionPage - 1) * sessionPageSize, sessionPage * sessionPageSize);
+  }, [report, sessionPage]);
+  useEffect(() => { setSessionPage((page) => Math.min(page, sessionPageCount)); }, [sessionPageCount]);
+  useEffect(() => {
+    if (report) setSessionTab(report.warnings.length > 0 ? "compatibility" : "sessions");
+  }, [report?.codexHome, report?.warnings.length]);
   const allWorkspacePathEntries = useMemo<WorkspacePathEntry[]>(() => {
     if (workspaceCleanupReport) return workspaceCleanupReport.entries;
     return (workspaceMappingState?.mappings ?? []).map((mapping) => ({
@@ -1682,15 +1753,74 @@ export default function SessionSyncApp() {
     </div>}
   </section> : null;
 
+  const requestSessionAction = (thread: ThreadBundle, action: "archive" | "restore" | "delete") => {
+    const deleting = action === "delete";
+    setConfirmation({
+      title: deleting ? "物理删除会话" : action === "archive" ? "归档会话" : "恢复会话",
+      description: deleting
+        ? <p>会话及其本地 rollout、数据库记录将被永久删除，无法恢复。请确认已完全退出 Codex。</p>
+        : <p>将“{thread.title || thread.threadId}”{action === "archive" ? "移入归档" : "恢复为活动会话"}。</p>,
+      confirmLabel: deleting ? "永久删除" : action === "archive" ? "归档" : "恢复",
+      tone: deleting ? "danger" : "warning",
+      onConfirm: async () => {
+        setSessionMutating(true);
+        setSessionActionMessage(null);
+        try {
+          const next = await invoke<ScanReport>("mutate_thread", { codexHome: codexHome.trim(), threadId: thread.threadId, action, confirmedCodexClosed: true });
+          setReport(next);
+          setSessionActionMessage(deleting ? "会话已永久删除。" : action === "archive" ? "会话已归档。" : "会话已恢复。" );
+        } catch (reason) {
+          setError(String(reason));
+        } finally {
+          setSessionMutating(false);
+        }
+      },
+    });
+  };
+
+  const requestProjectAction = (threads: ThreadBundle[], action: "archive" | "restore" | "delete") => {
+    if (threads.length === 0) return;
+    const deleting = action === "delete";
+    setConfirmation({
+      title: deleting ? "物理删除项目" : action === "archive" ? "归档项目" : "恢复项目",
+      description: deleting
+        ? <p>该项目下的 {threads.length} 个会话及其 rollout、数据库记录将被永久删除，无法恢复。</p>
+        : <p>将该项目下的 {threads.length} 个会话{action === "archive" ? "全部移入归档" : "全部恢复为活动会话"}。</p>,
+      confirmLabel: deleting ? "永久删除项目" : action === "archive" ? "归档项目" : "恢复项目",
+      tone: deleting ? "danger" : "warning",
+      onConfirm: async () => {
+        setSessionMutating(true);
+        setSessionActionMessage(null);
+        try {
+          let next: ScanReport | null = null;
+          for (const thread of threads) {
+            next = await invoke<ScanReport>("mutate_thread", { codexHome: codexHome.trim(), threadId: thread.threadId, action, confirmedCodexClosed: true });
+          }
+          if (next) {
+            setReport(next);
+            setSessionActionMessage(deleting ? `已永久删除 ${threads.length} 个会话。` : action === "archive" ? `已归档 ${threads.length} 个会话。` : `已恢复 ${threads.length} 个会话。`);
+          }
+        } catch (reason) {
+          setError(String(reason));
+        } finally {
+          setSessionMutating(false);
+        }
+      },
+    });
+  };
+
   const sessionReportPanel = report ? <>
+    {sessionMutating ? <div className="inline-alert session-action-result" role="status"><RefreshCw size={17} /><span>正在更新会话，请勿重复操作…</span></div> : sessionActionMessage && <div className="inline-alert success session-action-result"><Check size={17} /><span>{sessionActionMessage}</span></div>}
     <section className="metric-grid">
       <article className="metric"><span>活动会话</span><strong>{report.activeCount}</strong></article>
       <article className="metric"><span>已归档</span><strong>{report.archivedCount}</strong></article>
       <article className="metric"><span>Rollout 大小</span><strong>{formatBytes(report.totalRolloutBytes)}</strong></article>
       <article className="metric"><span>扫描警告</span><strong>{report.warnings.length}</strong></article>
     </section>
-    <section className="two-column-grid sessions-grid">
-      <article className="surface"><div className="section-title"><h3>会话预览</h3><span>{report.threads.length} / {report.totalCount}</span></div><div className="thread-list">{recentThreads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title}</strong><span title={thread.workspace.sourcePath ?? undefined}>{thread.workspace.sourcePath ?? "未记录工作目录"}</span></div><small>{thread.modelProvider ?? "unknown"}</small></div>)}{recentThreads.length === 0 && <p className="muted-copy">扫描结果没有返回可预览的会话。</p>}</div></article>
+    <section className={`sessions-workspace ${sessionTab === "compatibility" ? "show-compatibility" : "show-sessions"}`}>
+      <div className="session-tab-rail" role="tablist" aria-label="会话与兼容性"><button type="button" role="tab" aria-selected={sessionTab === "sessions"} className={`session-tab-button ${sessionTab === "sessions" ? "selected" : ""}`} onClick={() => setSessionTab("sessions")}>会话浏览</button><button type="button" role="tab" aria-selected={sessionTab === "compatibility"} className={`session-tab-button ${sessionTab === "compatibility" ? "selected" : ""}`} onClick={() => setSessionTab("compatibility")}>兼容性状态{report.warnings.length > 0 && <b>{report.warnings.length}</b>}</button></div>
+      <SessionFolderBrowser report={report} onAction={requestSessionAction} onProjectAction={requestProjectAction} mutating={sessionMutating} />
+      <article className="surface session-browser"><div className="section-title"><div><h3>会话浏览</h3><p>活动 / 归档 → 项目 / 无项目 → 会话</p></div><span>{report.threads.length} 个会话</span></div><div className="session-tree">{(["active", "archived"] as const).map((status) => { const statusThreads = recentThreads.filter((thread) => thread.archived === (status === "archived")); const projects = new Map<string, typeof statusThreads>(); statusThreads.forEach((thread) => { const key = thread.workspace.logicalId || thread.workspace.sourcePath || "无项目"; projects.set(key, [...(projects.get(key) ?? []), thread]); }); return <section className="session-level-one" key={status}><div className="session-level-title"><strong>{status === "active" ? "活动" : "归档"}</strong><span>{report.threads.filter((thread) => thread.archived === (status === "archived")).length}</span></div>{[...projects.entries()].map(([project, threads]) => <div className="session-project" key={project}><div className="session-level-two"><span>{project === "无项目" ? "无项目" : "项目"}</span><strong title={project}>{project}</strong><small>{threads.length}</small></div><div className="thread-list">{threads.map((thread) => <div className="thread-row" key={thread.threadId}><div><strong>{thread.title || "未命名会话"}</strong><span title={thread.workspace.sourcePath ?? undefined}>{thread.workspace.sourcePath ?? "未记录工作目录"}</span><small>{thread.modelProvider ?? "unknown"}</small></div><div className="thread-actions"><button className="button secondary small" onClick={() => setConfirmation({ title: status === "active" ? "归档会话" : "恢复会话", description: <p>将“{thread.title || thread.threadId}”{status === "active" ? "移入归档" : "恢复为活动会话"}。</p>, confirmLabel: status === "active" ? "归档" : "恢复", onConfirm: async () => { try { const next = await invoke<ScanReport>("mutate_thread", { codexHome: codexHome.trim(), threadId: thread.threadId, action: status === "active" ? "archive" : "restore", confirmedCodexClosed: true }); setReport(next); } catch (reason) { setError(String(reason)); } } })}>{status === "active" ? "归档" : "恢复"}</button><button className="button danger small" onClick={() => setConfirmation({ title: "物理删除会话", description: <p>会话及其本地 rollout、数据库记录将被永久删除，无法恢复。请确认已完全退出 Codex。</p>, confirmLabel: "永久删除", tone: "danger", onConfirm: async () => { try { const next = await invoke<ScanReport>("mutate_thread", { codexHome: codexHome.trim(), threadId: thread.threadId, action: "delete", confirmedCodexClosed: true }); setReport(next); } catch (reason) { setError(String(reason)); } } })}>删除</button></div></div>)}</div></div>)}</section>; })}</div><div className="session-pagination" aria-label="会话分页"><button className="button secondary small" onClick={() => setSessionPage((page) => Math.max(1, page - 1))} disabled={sessionPage <= 1}>上一页</button><span>第 {sessionPage} / {sessionPageCount} 页 · 每页 {sessionPageSize} 条</span><button className="button secondary small" onClick={() => setSessionPage((page) => Math.min(sessionPageCount, page + 1))} disabled={sessionPage >= sessionPageCount}>下一页</button></div>{recentThreads.length === 0 && <p className="muted-copy">扫描结果没有返回可预览的会话。</p>}</article>
       <article className="surface"><div className="section-title"><h3>兼容性状态</h3><span>{report.databasePaths.length} 个数据库</span></div>{quarantineMessage && <div className="inline-alert success"><Check size={17} /><span>{quarantineMessage}</span></div>}{report.warnings.length === 0 ? <div className="inline-alert success"><Check size={17} /><span>扫描完成，没有发现阻塞同步的问题。</span></div> : <div className="warning-list">{report.warnings.map((warning, index) => <div className="warning-row" key={`${warning.path}-${index}`}><div><StatusBadge tone="warning">{warning.kind}</StatusBadge><span>{warning.message}</span><code title={warning.path}>{warning.path}</code></div>{warning.kind === "empty_rollout" && <button type="button" className="button warning small" onClick={() => setConfirmation({ title: "隔离空 Rollout 文件", description: <p>文件会重新校验并移动到隔离目录，不会永久删除。</p>, confirmLabel: "确认隔离", tone: "warning", onConfirm: () => quarantineWarning(warning) })} disabled={busy || !canWrite}>安全清理</button>}</div>)}</div>}</article>
     </section>
   </> : <section className="surface empty-card large"><Database size={30} /><h3>等待首次扫描</h3><p>扫描只读取本机 Codex 会话，不会修改任何数据。</p><button className="button primary" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}>扫描本机会话</button></section>;

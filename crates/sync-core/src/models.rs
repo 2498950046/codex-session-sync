@@ -141,7 +141,6 @@ impl From<&ScanReport> for ScanDashboardReport {
             threads: report
                 .threads
                 .iter()
-                .take(8)
                 .map(|thread| ThreadPreview {
                     thread_id: thread.thread_id.clone(),
                     title: thread.title.clone(),
@@ -286,7 +285,7 @@ mod tests {
         };
 
         let dashboard = ScanDashboardReport::from(&report);
-        assert_eq!(dashboard.threads.len(), 8);
+        assert_eq!(dashboard.threads.len(), 12);
         assert!(serde_json::to_vec(&dashboard).unwrap().len() < 16 * 1024);
         assert!(serde_json::to_vec(&report).unwrap().len() > 3 * 1024 * 1024);
     }
