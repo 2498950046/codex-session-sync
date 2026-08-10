@@ -451,3 +451,19 @@ export type SyncReport = {
     maxConcurrency: number;
   };
 };
+
+export type LocalBackupItem = {
+  id: string;
+  category: "provider_sync" | "import" | "checkout" | "workspace_cleanup" | "other";
+  location: "repository" | "codex_home";
+  path: string;
+  createdAt: string;
+  byteCount: number;
+  fileCount: number;
+  deletable: boolean;
+};
+
+export type LocalBackupDeletionResult = {
+  deletedCount: number;
+  freedBytes: number;
+};

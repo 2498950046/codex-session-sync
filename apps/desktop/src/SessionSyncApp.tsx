@@ -34,6 +34,8 @@ import type {
   CodexProcess,
   ImportReport,
   JobSnapshot,
+  LocalBackupDeletionResult,
+  LocalBackupItem,
   LocalSnapshotListItem,
   LocalTrashPurgePlan,
   LocalTrashPurgeResult,
@@ -329,6 +331,14 @@ function ConflictVersionDetails({ version }: { version: ThreadConflictVersion | 
   </>;
 }
 
+function backupCategoryLabel(category: LocalBackupItem["category"]) {
+  if (category === "provider_sync") return "Provider 同步";
+  if (category === "import") return "快照导入";
+  if (category === "checkout") return "切换与恢复";
+  if (category === "workspace_cleanup") return "项目清理";
+  return "其他备份";
+}
+
 function selectionSourceLabel(source: NamespaceMappingState["selection"]["source"]): string {
   if (source === "mapping") return "自动映射";
   if (source === "manual_override") return "手动覆盖";
@@ -366,7 +376,7 @@ export default function SessionSyncApp() {
   const [snapshotTrash, setSnapshotTrash] = useState<SnapshotTrashEntry[]>([]);
   const [remoteHistoryTrash, setRemoteHistoryTrash] = useState<RemoteHistoryTrashOperation[]>([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
-  const [historySource, setHistorySource] = useState<"local" | "remote" | "recovery" | "trash">("local");
+  const [historySource, setHistorySource] = useState<"local" | "remote" | "recovery" | "trash" | "backup">("local");
   const previewKind = import.meta.env.DEV ? new URLSearchParams(window.location.search).get("preview") : null;
   const [settingsTab, setSettingsTab] = useState<"local" | "remote" | "advanced" | "project" | "provider" | "snapshots">(previewKind === "mapping" ? "advanced" : "local");
   useEffect(() => {
@@ -377,6 +387,8 @@ export default function SessionSyncApp() {
   const [advancedOpen, setAdvancedOpen] = useState(previewKind === "mapping");
   const [storageSummary, setStorageSummary] = useState<RepositoryStorageSummary | null>(null);
   const [recoveryPoints, setRecoveryPoints] = useState<RecoveryPoint[]>([]);
+  const [localBackups, setLocalBackups] = useState<LocalBackupItem[]>([]);
+  const [selectedBackupIds, setSelectedBackupIds] = useState<Set<string>>(new Set());
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyLoadingLabel, setHistoryLoadingLabel] = useState("正在读取快照…");
   const [validation, setValidation] = useState<SnapshotValidationReport | null>(null);
@@ -875,16 +887,19 @@ export default function SessionSyncApp() {
     setHistoryLoading(true);
     setHistoryLoadingLabel(label);
     try {
-      const [local, trash, storage, recovery] = await Promise.all([
+      const [local, trash, storage, recovery, backups] = await Promise.all([
         invoke<LocalSnapshotListItem[]>("list_local_snapshots", { repositoryRoot: repositoryRoot.trim() }),
         invoke<SnapshotTrashEntry[]>("list_local_snapshot_trash", { repositoryRoot: repositoryRoot.trim() }),
         invoke<RepositoryStorageSummary>("get_repository_storage_summary", { repositoryRoot: repositoryRoot.trim() }),
         invoke<RecoveryPoint[]>("list_recovery_points", { repositoryRoot: repositoryRoot.trim() }),
+        invoke<LocalBackupItem[]>("list_local_backups", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim() }),
       ]);
       setLocalSnapshots(local);
       setSnapshotTrash(trash);
       setStorageSummary(storage);
       setRecoveryPoints(recovery);
+      setLocalBackups(backups);
+      setSelectedBackupIds((current) => new Set([...current].filter((id) => backups.some((backup) => backup.id === id && backup.deletable))));
       if (selectedRemoteId && selectedNamespaceId) {
         const [revisions, remoteTrash] = await Promise.all([
           invoke<RevisionSummary[]>("list_remote_revisions", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId }),
@@ -901,6 +916,44 @@ export default function SessionSyncApp() {
     } finally {
       setHistoryLoading(false);
     }
+  }
+
+  function toggleBackupSelection(id: string) {
+    setSelectedBackupIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function requestBackupDeletion() {
+    const selected = localBackups.filter((backup) => selectedBackupIds.has(backup.id));
+    if (selected.length === 0) return;
+    const totalBytes = selected.reduce((total, backup) => total + backup.byteCount, 0);
+    setConfirmation({
+      title: "删除选中的本地备份",
+      description: <p>将永久删除 {selected.length} 个备份，预计释放 {formatBytes(totalBytes)}。删除后对应操作将不能再使用这些文件回滚，此操作不可撤销。</p>,
+      confirmLabel: "永久删除",
+      tone: "danger",
+      onConfirm: async () => {
+        setHistoryLoading(true);
+        setHistoryLoadingLabel("正在删除本地备份…");
+        try {
+          const result = await invoke<LocalBackupDeletionResult>("delete_local_backups", {
+            repositoryRoot: repositoryRoot.trim(),
+            codexHome: codexHome.trim(),
+            backupIds: selected.map((backup) => backup.id),
+          });
+          setSelectedBackupIds(new Set());
+          await refreshHistory(`已删除 ${result.deletedCount} 个备份，释放 ${formatBytes(result.freedBytes)}`);
+        } catch (reason) {
+          setError(String(reason));
+        } finally {
+          setHistoryLoading(false);
+        }
+      },
+    });
   }
 
   async function requestSnapshotTrash(item: LocalSnapshotListItem) {
@@ -1730,6 +1783,7 @@ export default function SessionSyncApp() {
   ].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   const selectedLocalSnapshot = localSnapshots.find((item) => item.snapshotId === selectedHistoryId) ?? null;
   const selectedRemoteRevision = remoteRevisions.find((item) => item.revisionId === selectedHistoryId) ?? null;
+  const backupCategories: LocalBackupItem["category"][] = ["checkout", "import", "workspace_cleanup", "provider_sync", "other"];
   const historyPage = <div className="page-stack history-page">
     <PageIntro title="快照与恢复" description="以版本图方式浏览本地快照和远端命名空间历史；删除先进入回收站，永久删除或清空回收站时释放空间。" action={<div className="button-row"><button className="button secondary" onClick={() => void refreshHistory()} disabled={historyLoading}><RefreshCw size={15} />刷新</button><button className="button primary" onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建快照</button></div>} />
     <section className="history-workbench surface">
@@ -1739,13 +1793,15 @@ export default function SessionSyncApp() {
         <button className={historySource === "remote" ? "active" : ""} onClick={() => { setHistorySource("remote"); setSelectedHistoryId(null); }} disabled={!selectedNamespaceId}><Server size={15} />{selectedNamespace?.displayName ?? "远端命名空间"} <b>{remoteRevisions.length}</b></button>
         <button className={historySource === "recovery" ? "active" : ""} onClick={() => { setHistorySource("recovery"); setSelectedHistoryId(null); }}><RotateCcw size={15} />操作恢复 <b>{recoveryPoints.filter((point) => point.requiresAttention).length}</b></button>
         <button className={historySource === "trash" ? "active" : ""} onClick={() => { setHistorySource("trash"); setSelectedHistoryId(null); }}><Trash2 size={15} />回收站 <b>{snapshotTrash.length + remoteHistoryTrash.filter((entry) => entry.state === "active").length}</b></button>
+        <button className={historySource === "backup" ? "active" : ""} onClick={() => { setHistorySource("backup"); setSelectedHistoryId(null); }}><ArchiveRestore size={15} />备份 <b>{localBackups.length}</b></button>
       </aside>
       <div className="history-main">
-        <div className="history-toolbar"><strong>{historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : "可恢复删除"}</strong>{historySource === "trash" && !historyLoading ? <div className="button-row"><button className="button danger small" onClick={() => void requestLocalTrashPurge([], true)} disabled={snapshotTrash.length === 0}>清空本地</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([], true)} disabled={!selectedNamespaceId || remoteHistoryTrash.every((entry) => entry.state !== "active")}>清空远端</button></div> : <span>{historyLoading ? historyLoadingLabel : "按创建时间倒序"}</span>}</div>
+        <div className="history-toolbar"><strong>{historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : historySource === "trash" ? "可恢复删除" : "本地备份"}</strong>{historySource === "trash" && !historyLoading ? <div className="button-row"><button className="button danger small" onClick={() => void requestLocalTrashPurge([], true)} disabled={snapshotTrash.length === 0}>清空本地</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([], true)} disabled={!selectedNamespaceId || remoteHistoryTrash.every((entry) => entry.state !== "active")}>清空远端</button></div> : historySource === "backup" && !historyLoading ? <div className="button-row"><button className="button secondary small" onClick={() => setSelectedBackupIds(new Set(localBackups.filter((backup) => backup.deletable).map((backup) => backup.id)))} disabled={localBackups.every((backup) => !backup.deletable)}>全选可删除</button><button className="button danger small" onClick={requestBackupDeletion} disabled={selectedBackupIds.size === 0}>删除选中</button></div> : <span>{historyLoading ? historyLoadingLabel : "按创建时间倒序"}</span>}</div>
         {historySource === "local" && <VersionGraphTable rows={localVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "remote" && <VersionGraphTable rows={remoteVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "recovery" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="trash-list">{recoveryPoints.map((point) => <article key={point.operationId} className={point.requiresAttention ? "requires-attention" : ""}><div><strong>{point.kind === "checkout" ? "语义切换" : point.kind === "provider_sync" ? "Provider 同步" : "增量导入"} · {point.status}</strong><span>{point.updatedAt ? new Date(point.updatedAt).toLocaleString("zh-CN") : point.journalPath}</span></div>{point.requiresAttention && <button className="button warning small" onClick={() => { setJournalPath(point.journalPath); setConfirmation({ title: "恢复未完成操作", description: <p>将根据 Journal 和备份重新校验后恢复。Codex 必须完全退出。</p>, confirmLabel: "确认恢复", tone: "warning", onConfirm: () => start("start_recovery_job", { journalPath: point.journalPath, confirmedCodexClosed: true }) }); }} disabled={!canWrite || busy}><RotateCcw size={14} />处理恢复</button>}</article>)}{recoveryPoints.length === 0 && <div className="version-log-empty">没有发现操作恢复点</div>}</div>)}
         {historySource === "trash" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="trash-list">{snapshotTrash.map((entry) => <article key={entry.operationId}><div><strong>本地快照 · {shortHead(entry.snapshotId)}</strong><span>{new Date(entry.trashedAt).toLocaleString("zh-CN")}</span></div><div className="trash-item-actions"><button className="button secondary small" onClick={() => void restoreTrash(entry)}><RotateCcw size={14} />恢复快照</button><button className="button danger small" onClick={() => void requestLocalTrashPurge([entry.operationId], false)}><Trash2 size={14} />永久删除</button></div></article>)}{remoteHistoryTrash.filter((entry) => entry.state === "active").map((entry) => <article key={entry.operationId}><div><strong>远端历史 · {entry.revisionCount} 个版本</strong><span>{shortHead(entry.oldHead)} → {shortHead(entry.newHead)} · 到期 {new Date(entry.expiresAt).toLocaleDateString("zh-CN")}</span></div><div className="trash-item-actions"><button className="button secondary small" onClick={() => void restoreRemoteHistoryTrash(entry)}><RotateCcw size={14} />恢复远端历史</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([entry.operationId], false)}><Trash2 size={14} />永久删除</button></div></article>)}{snapshotTrash.length === 0 && remoteHistoryTrash.every((entry) => entry.state !== "active") && <div className="version-log-empty">回收站为空</div>}</div>)}
+        {historySource === "backup" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="backup-groups">{backupCategories.map((category) => { const entries = localBackups.filter((backup) => backup.category === category); if (entries.length === 0) return null; return <section className="backup-group" key={category}><header><strong>{backupCategoryLabel(category)}</strong><span>{entries.length} 项 · {formatBytes(entries.reduce((total, backup) => total + backup.byteCount, 0))}</span></header><div className="backup-list">{entries.map((backup) => <label className={`backup-item ${backup.deletable ? "" : "protected"}`} key={backup.id}><input type="checkbox" checked={selectedBackupIds.has(backup.id)} onChange={() => toggleBackupSelection(backup.id)} disabled={!backup.deletable || busy} /><div><strong>{backup.path.split(/[\\/]/).pop() ?? backup.id}</strong><span title={backup.path}>{backup.path}</span><small>{backup.location === "repository" ? "同步仓库" : "Codex Home"} · {backup.fileCount} 个文件 · {formatBytes(backup.byteCount)} · {backup.createdAt ? new Date(backup.createdAt).toLocaleString("zh-CN") : "时间未知"}{!backup.deletable ? " · 未完成操作正在使用" : ""}</small></div></label>)}</div></section>; })}{localBackups.length === 0 && <div className="version-log-empty">没有发现本地备份</div>}</div>)}
         {(selectedLocalSnapshot || selectedRemoteRevision) && <section className="version-details">
           <div><span className="overline">选中版本</span><h3>{selectedLocalSnapshot ? (selectedLocalSnapshot.metadata.description || "本地快照") : "远端 Revision"}</h3><CopyCode value={selectedHistoryId ?? ""} /></div>
           <div className="version-detail-metrics"><span>会话 <b>{selectedLocalSnapshot?.threadCount ?? selectedRemoteRevision?.threadCount}</b></span><span>逻辑大小 <b>{formatBytes(selectedLocalSnapshot?.logicalBytes ?? selectedRemoteRevision?.logicalBytes ?? 0)}</b></span><span>物理引用 <b>{formatBytes(selectedLocalSnapshot?.physicalReferencedBytes ?? selectedRemoteRevision?.physicalReferencedBytes ?? 0)}</b></span></div>

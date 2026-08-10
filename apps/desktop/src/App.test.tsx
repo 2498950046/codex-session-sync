@@ -17,6 +17,7 @@ const remoteId = "remote-1";
 const namespaceId = "namespace-1";
 let runningProcesses = false;
 let showTrashEntries = false;
+let showBackups = false;
 let providerPreviewResult = { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
 
 function providerPreviewJob(state: "running" | "completed") {
@@ -46,6 +47,8 @@ function response(command: string) {
   if (command === "list_local_snapshot_trash") return showTrashEntries ? [{ operationId: "01900000-0000-7000-8000-000000000003", snapshotId: "01900000-0000-7000-8000-000000000001", trashedAt: "2026-07-31T11:00:00Z", originalManifestPath: "snapshot.json", trashManifestPath: "trash.json" }] : [];
   if (command === "get_repository_storage_summary") return { logicalBytes: 2048, repositoryPhysicalBytes: 1024, activePhysicalBytes: 1024, sharedPhysicalBytes: 512, exclusivePhysicalBytes: 512, trashBytes: 0, gcQuarantineBytes: 0, reclaimableBytes: 0, protectedByJournalBytes: 0 };
   if (command === "list_recovery_points") return [];
+  if (command === "list_local_backups") return showBackups ? [{ id: "repository:import-op", category: "import", location: "repository", path: "C:/Users/test/.codex-session-sync/backups/import-op", createdAt: "2026-07-31T08:00:00Z", byteCount: 1024, fileCount: 2, deletable: true }] : [];
+  if (command === "delete_local_backups") return { deletedCount: 1, freedBytes: 1024 };
   if (command === "list_remote_revisions") return [{ revisionId: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", namespaceId, parentRevision: null, createdAt: "2026-07-31T09:00:00Z", threadCount: 10, objectCount: 18, logicalBytes: 1800, physicalReferencedBytes: 900, state: "active" }];
   if (command === "list_remote_history_trash") return [];
   if (command === "start_provider_sync_preview_job") return providerPreviewJob("running");
@@ -62,6 +65,7 @@ function response(command: string) {
 beforeEach(() => {
   runningProcesses = false;
   showTrashEntries = false;
+  showBackups = false;
   providerPreviewResult = { provider: "openai", rolloutCount: 12, rolloutBytes: 4096, databaseRowCount: 12, noChanges: false, warnings: [] };
   invokeMock.mockImplementation((command: string) => Promise.resolve(response(command)));
   Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
@@ -143,6 +147,26 @@ test("local recycle bin supports permanent deletion and emptying after confirmat
   await waitFor(() => {
     expect(invokeMock).toHaveBeenCalledWith("purge_local_trash", expect.any(Object));
   });
+});
+
+test("backup manager groups and permanently deletes selected backups", async () => {
+  const user = userEvent.setup();
+  showBackups = true;
+  render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
+
+  await user.click(await screen.findByRole("button", { name: "打开历史与恢复" }));
+  await user.click(await screen.findByRole("button", { name: /备份 1/ }));
+  expect(await screen.findByText("快照导入")).toBeInTheDocument();
+  await user.click(screen.getByRole("checkbox"));
+  await user.click(screen.getByRole("button", { name: "删除选中" }));
+  expect(await screen.findByText("删除选中的本地备份")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "永久删除" }));
+
+  await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("delete_local_backups", {
+    repositoryRoot: "C:/Users/test/.codex-session-sync",
+    codexHome: "C:/Users/test/.codex",
+    backupIds: ["repository:import-op"],
+  }));
 });
 
 test("provider preview runs as a progress job and disables the write action", async () => {

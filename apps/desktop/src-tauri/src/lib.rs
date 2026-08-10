@@ -5,8 +5,8 @@ mod remote_config;
 mod remote_sync;
 mod workspace_mapping;
 
-use std::collections::BTreeSet;
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -136,6 +136,26 @@ struct RecoveryPoint {
     started_at: Option<String>,
     updated_at: Option<String>,
     requires_attention: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalBackupItem {
+    id: String,
+    category: String,
+    location: String,
+    path: String,
+    created_at: String,
+    byte_count: u64,
+    file_count: u64,
+    deletable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalBackupDeletionResult {
+    deleted_count: usize,
+    freed_bytes: u64,
 }
 
 #[tauri::command]
@@ -425,6 +445,48 @@ async fn list_recovery_points(
     tauri::async_runtime::spawn_blocking(move || {
         let _repository_lease = repository_lease;
         discover_recovery_points(&repository)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn list_local_backups(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+) -> Result<Vec<LocalBackupItem>, String> {
+    let repository = resolve_repository_root(repository_root);
+    let home = resolve_codex_home(codex_home);
+    let repository_lease = jobs.try_acquire_repository_shared(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _repository_lease = repository_lease;
+        discover_local_backups(&repository, &home)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_local_backups(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    backup_ids: Vec<String>,
+) -> Result<LocalBackupDeletionResult, String> {
+    if backup_ids.is_empty() {
+        return Err("at least one backup must be selected".to_string());
+    }
+    let repository = resolve_repository_root(repository_root);
+    let home = resolve_codex_home(codex_home);
+    let home_lease = jobs.try_acquire_codex_home(&home)?;
+    let repository_lease = jobs.try_acquire_repository_exclusive(&repository)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _home_lease = home_lease;
+        let _repository_lease = repository_lease;
+        delete_selected_local_backups(&repository, &home, &backup_ids)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1770,6 +1832,231 @@ fn inspect_recovery_journal(journal_path: &Path) -> anyhow::Result<RecoveryJourn
     bail!("unsupported recovery journal type")
 }
 
+fn backup_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+}
+
+fn backup_stats(path: &Path) -> anyhow::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok((0, 1));
+    }
+    if metadata.is_file() {
+        return Ok((metadata.len(), 1));
+    }
+    let mut bytes = 0_u64;
+    let mut files = 0_u64;
+    for entry in fs::read_dir(path)? {
+        let (entry_bytes, entry_files) = backup_stats(&entry?.path())?;
+        bytes = bytes
+            .checked_add(entry_bytes)
+            .context("backup byte count overflow")?;
+        files = files
+            .checked_add(entry_files)
+            .context("backup file count overflow")?;
+    }
+    Ok((bytes, files))
+}
+
+fn discover_local_backups(
+    repository_root: &Path,
+    codex_home: &Path,
+) -> anyhow::Result<Vec<LocalBackupItem>> {
+    let repository_backup_root = repository_root.join("backups");
+    let home_backup_root = codex_home.join(".codex-session-sync").join("backups");
+    let mut classifications = BTreeMap::<String, (String, bool)>::new();
+    let journal_root = repository_root.join("journal");
+    if journal_root.is_dir() {
+        for entry in fs::read_dir(&journal_root)? {
+            let path = entry?.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file()
+                || metadata.len() > sync_core::MAX_STRUCTURED_OBJECT_BYTES
+                || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Ok(value) =
+                serde_json::from_reader::<_, serde_json::Value>(BufReader::new(File::open(&path)?))
+            else {
+                continue;
+            };
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            let status = object
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+                .to_ascii_lowercase();
+            let terminal = matches!(
+                status.as_str(),
+                "completed" | "failed" | "rolled_back" | "rolledback"
+            );
+            let operation_id = object
+                .get("operationId")
+                .and_then(serde_json::Value::as_str);
+            for (field, category) in [
+                ("backupDir", "import"),
+                ("repositoryBackupDir", "checkout"),
+                ("globalStateBackup", "workspace_cleanup"),
+            ] {
+                if let Some(value) = object.get(field).and_then(serde_json::Value::as_str) {
+                    let mut backup_path = PathBuf::from(value);
+                    if field == "globalStateBackup" {
+                        backup_path.pop();
+                    }
+                    classifications.insert(
+                        backup_path_key(&backup_path),
+                        (category.to_string(), terminal),
+                    );
+                }
+            }
+            if object.contains_key("directorySwaps")
+                && let Some(operation_id) = operation_id
+            {
+                classifications.insert(
+                    backup_path_key(&home_backup_root.join(operation_id)),
+                    ("checkout".to_string(), terminal),
+                );
+            }
+            if object.contains_key("targetProvider")
+                && let Some(operation_id) = operation_id
+            {
+                classifications.insert(
+                    backup_path_key(
+                        &repository_backup_root
+                            .join("provider-sync")
+                            .join(operation_id),
+                    ),
+                    ("provider_sync".to_string(), terminal),
+                );
+            }
+        }
+    }
+
+    let mut items = Vec::new();
+    let mut add_item = |path: PathBuf, id: String, location: &str, fallback_category: &str| {
+        let metadata = fs::symlink_metadata(&path)?;
+        let (byte_count, file_count) = backup_stats(&path)?;
+        let (category, deletable) = classifications
+            .get(&backup_path_key(&path))
+            .cloned()
+            .unwrap_or_else(|| (fallback_category.to_string(), true));
+        let created_at = metadata
+            .modified()
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default();
+        items.push(LocalBackupItem {
+            id,
+            category,
+            location: location.to_string(),
+            path: path.to_string_lossy().into_owned(),
+            created_at,
+            byte_count,
+            file_count,
+            deletable,
+        });
+        Ok::<(), anyhow::Error>(())
+    };
+
+    if repository_backup_root.is_dir() {
+        for entry in fs::read_dir(&repository_backup_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let metadata = fs::symlink_metadata(&path)?;
+            if name == "provider-sync" && metadata.is_dir() && !metadata.file_type().is_symlink() {
+                for operation in fs::read_dir(&path)? {
+                    let operation = operation?;
+                    let operation_name = operation.file_name().to_string_lossy().into_owned();
+                    add_item(
+                        operation.path(),
+                        format!("repository:provider-sync/{operation_name}"),
+                        "repository",
+                        "provider_sync",
+                    )?;
+                }
+            } else {
+                let fallback = if name.starts_with("workspace-cleanup-") {
+                    "workspace_cleanup"
+                } else {
+                    "other"
+                };
+                add_item(path, format!("repository:{name}"), "repository", fallback)?;
+            }
+        }
+    }
+    if home_backup_root.is_dir() {
+        for entry in fs::read_dir(&home_backup_root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            add_item(
+                entry.path(),
+                format!("codex-home:{name}"),
+                "codex_home",
+                "checkout",
+            )?;
+        }
+    }
+    items.sort_by(|left, right| {
+        left.category
+            .cmp(&right.category)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(items)
+}
+
+fn delete_selected_local_backups(
+    repository_root: &Path,
+    codex_home: &Path,
+    backup_ids: &[String],
+) -> anyhow::Result<LocalBackupDeletionResult> {
+    let requested = backup_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if requested.len() != backup_ids.len() {
+        bail!("backup selection contains duplicate IDs");
+    }
+    let available = discover_local_backups(repository_root, codex_home)?
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = Vec::new();
+    for id in requested {
+        let item = available
+            .get(&id)
+            .with_context(|| format!("backup no longer exists: {id}"))?;
+        if !item.deletable {
+            bail!("backup is still required by an incomplete operation: {id}");
+        }
+        selected.push(item.clone());
+    }
+    let mut freed_bytes = 0_u64;
+    for item in &selected {
+        let path = PathBuf::from(&item.path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+        freed_bytes = freed_bytes
+            .checked_add(item.byte_count)
+            .context("deleted backup byte count overflow")?;
+    }
+    let provider_root = repository_root.join("backups").join("provider-sync");
+    if provider_root.is_dir() && fs::read_dir(&provider_root)?.next().is_none() {
+        fs::remove_dir(&provider_root)?;
+    }
+    Ok(LocalBackupDeletionResult {
+        deleted_count: selected.len(),
+        freed_bytes,
+    })
+}
+
 fn discover_recovery_points(repository_root: &Path) -> anyhow::Result<Vec<RecoveryPoint>> {
     let journal_directory = repository_root.join("journal");
     if !journal_directory.exists() {
@@ -1992,6 +2279,8 @@ pub fn run() {
             plan_local_gc,
             get_repository_storage_summary,
             list_recovery_points,
+            list_local_backups,
+            delete_local_backups,
             quarantine_local_gc,
             start_snapshot_restore_job,
             list_remote_revisions,
@@ -2056,6 +2345,102 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn local_backups_are_grouped_across_repository_and_codex_home() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let home = directory.path().join("home");
+        let import_backup = repository.join("backups/import-op");
+        let checkout_backup = home.join(".codex-session-sync/backups/checkout-op");
+        std::fs::create_dir_all(&import_backup).unwrap();
+        std::fs::create_dir_all(&checkout_backup).unwrap();
+        std::fs::create_dir_all(repository.join("journal")).unwrap();
+        std::fs::write(import_backup.join("threads.sqlite"), b"1234").unwrap();
+        std::fs::write(checkout_backup.join("sessions.jsonl"), b"123456").unwrap();
+        std::fs::write(
+            repository.join("journal/import-op.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "operationId": "import-op",
+                "status": "completed",
+                "backupDir": import_backup,
+                "targetCodexHome": home,
+                "plannedRollouts": [],
+                "importedThreadIds": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let items = discover_local_backups(&repository, &home).unwrap();
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.category == "import" && item.byte_count == 4)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.category == "checkout" && item.byte_count == 6)
+        );
+    }
+
+    #[test]
+    fn local_backup_deletion_revalidates_ids_and_rejects_incomplete_operations() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let home = directory.path().join("home");
+        let backup = repository.join("backups/import-op");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::create_dir_all(repository.join("journal")).unwrap();
+        std::fs::write(backup.join("threads.sqlite"), b"1234").unwrap();
+        std::fs::write(
+            repository.join("journal/import-op.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "operationId": "import-op",
+                "status": "applying",
+                "backupDir": backup,
+                "targetCodexHome": home,
+                "plannedRollouts": [],
+                "importedThreadIds": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = delete_selected_local_backups(
+            &repository,
+            &home,
+            &["repository:import-op".to_string()],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("incomplete operation"));
+        assert!(backup.exists());
+
+        let value = serde_json::json!({
+            "operationId": "import-op",
+            "status": "completed",
+            "backupDir": backup,
+            "targetCodexHome": home,
+            "plannedRollouts": [],
+            "importedThreadIds": []
+        });
+        std::fs::write(
+            repository.join("journal/import-op.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let result = delete_selected_local_backups(
+            &repository,
+            &home,
+            &["repository:import-op".to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.deleted_count, 1);
+        assert_eq!(result.freed_bytes, 4);
+        assert!(!backup.exists());
+    }
 
     #[test]
     fn checkout_journal_is_dispatched_to_checkout_recovery() {

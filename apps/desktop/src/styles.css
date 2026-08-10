@@ -276,6 +276,20 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .trash-list article > div { display: grid; gap: 3px; }
 .trash-list span { color: var(--text-muted); font-size: 9px; }
 .trash-list article > .trash-item-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.backup-groups { display: grid; gap: 14px; padding: 14px; }
+.backup-group { overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+.backup-group > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--border); background: var(--surface-subtle); }
+.backup-group > header span { color: var(--text-muted); font-size: 10px; }
+.backup-list { display: grid; }
+.backup-item { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 10px; padding: 11px 12px; border-bottom: 1px solid var(--border); cursor: pointer; }
+.backup-item:last-child { border-bottom: 0; }
+.backup-item:hover { background: var(--surface-subtle); }
+.backup-item.protected { cursor: not-allowed; opacity: .7; }
+.backup-item input { margin-top: 3px; }
+.backup-item > div { min-width: 0; display: grid; gap: 3px; }
+.backup-item strong, .backup-item span, .backup-item small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.backup-item span { color: var(--text-secondary); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; }
+.backup-item small { color: var(--text-muted); font-size: 9px; }
 .storage-summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; overflow: hidden; padding: 0; background: var(--border); }
 .storage-summary > div { display: grid; gap: 4px; min-width: 0; padding: 13px 15px; background: var(--surface); }
 .storage-summary span { color: var(--text-muted); font-size: 10px; }
