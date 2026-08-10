@@ -14,8 +14,8 @@ pub mod workspace;
 
 pub use checkout::*;
 pub use codex::{
-    default_codex_home, mutate_local_thread, quarantine_empty_rollout, scan_codex_home,
-    scan_codex_home_dashboard, scan_codex_home_dashboard_with_control,
+    default_codex_home, load_thread_messages, mutate_local_thread, quarantine_empty_rollout,
+    scan_codex_home, scan_codex_home_dashboard, scan_codex_home_dashboard_with_control,
     scan_codex_home_with_control, scan_codex_home_workspace_paths, scan_codex_home_workspace_usage,
 };
 pub use local::{

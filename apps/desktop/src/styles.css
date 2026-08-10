@@ -469,6 +469,19 @@ body[data-settings-tab="snapshots"] .advanced-fold > summary { display: none; }
 .session-folder-browser.mutating .folder-actions button,
 .session-folder-browser.mutating .thread-actions button { pointer-events: none; opacity: .55; }
 .session-folder-fieldset { min-width: 0; margin: 0; border: 0; padding: 0; }
+.thread-detail-modal { width: min(920px, calc(100vw - 32px)); max-height: calc(100vh - 32px); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 12px; padding: 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); box-shadow: 0 24px 80px rgb(0 0 0 / 30%); }
+.thread-detail-modal > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.thread-detail-modal > header > div { min-width: 0; }
+.thread-detail-modal h2 { margin: 2px 0 4px; }
+.thread-detail-modal header small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+.thread-detail-loading { min-height: 260px; display: flex; align-items: center; justify-content: center; gap: 9px; color: var(--text-muted); }
+.message-list { min-height: 0; overflow: auto; display: grid; align-content: start; gap: 10px; padding: 2px; }
+.message-card { max-width: 88%; display: grid; gap: 7px; padding: 11px 13px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-raised); }
+.message-card.role-user { margin-left: auto; border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.message-card.role-assistant { margin-right: auto; }
+.message-card > div { display: flex; justify-content: space-between; gap: 16px; color: var(--text-muted); font-size: 10px; }
+.message-card pre { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; color: var(--text-primary); font: inherit; font-size: 12px; line-height: 1.65; }
+@media (max-width: 720px) { .message-card { max-width: 100%; } }
 .folder-back { display: flex; align-items: center; gap: 5px; margin-bottom: 10px; border: 0; padding: 0; color: var(--accent); background: transparent; cursor: pointer; }
 .folder-thread-list { border-top: 1px solid var(--border); }
 @media (max-width: 720px) {

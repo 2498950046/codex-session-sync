@@ -129,6 +129,26 @@ pub struct ScanDashboardReport {
     pub warnings: Vec<ScanWarning>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessage {
+    pub index: usize,
+    pub role: String,
+    pub text: String,
+    pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMessagesPage {
+    pub thread_id: String,
+    pub page: usize,
+    pub page_size: usize,
+    pub total_count: usize,
+    pub messages: Vec<ThreadMessage>,
+    pub warnings: Vec<String>,
+}
+
 impl From<&ScanReport> for ScanDashboardReport {
     fn from(report: &ScanReport) -> Self {
         Self {

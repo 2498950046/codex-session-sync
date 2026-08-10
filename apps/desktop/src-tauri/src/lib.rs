@@ -34,10 +34,11 @@ use sync_core::{
     SnapshotTrashEntry, SnapshotValidationReport, ThreadConflictResolution, TrackingStore,
     create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
     default_repository_root, detect_codex_processes, import_local_snapshot,
-    import_local_snapshot_with_control, mutate_local_thread, preview_provider_sync,
-    quarantine_empty_rollout, recover_checkout_operation, recover_incomplete_operation,
-    scan_codex_home_dashboard, scan_codex_home_dashboard_with_control, synchronize_local_provider,
-    validate_local_snapshot, validate_local_snapshot_with_control,
+    import_local_snapshot_with_control, load_thread_messages, mutate_local_thread,
+    preview_provider_sync, quarantine_empty_rollout, recover_checkout_operation,
+    recover_incomplete_operation, scan_codex_home_dashboard,
+    scan_codex_home_dashboard_with_control, synchronize_local_provider, validate_local_snapshot,
+    validate_local_snapshot_with_control,
 };
 use tauri::State;
 use uuid::Uuid;
@@ -197,6 +198,21 @@ async fn mutate_thread(
         let _lease = lease;
         mutate_local_thread(&home, &thread_id, &action).map_err(|error| error.to_string())?;
         scan_codex_home_dashboard(&home).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn get_thread_messages(
+    codex_home: Option<String>,
+    thread_id: String,
+    page: usize,
+    page_size: usize,
+) -> Result<sync_core::ThreadMessagesPage, String> {
+    let home = resolve_codex_home(codex_home);
+    tauri::async_runtime::spawn_blocking(move || {
+        load_thread_messages(home, &thread_id, page, page_size).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -2286,6 +2302,7 @@ pub fn run() {
             get_default_repository_root,
             scan_local_codex,
             mutate_thread,
+            get_thread_messages,
             quarantine_empty_rollout_file,
             create_snapshot,
             validate_snapshot,

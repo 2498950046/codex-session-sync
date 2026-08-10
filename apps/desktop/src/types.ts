@@ -58,6 +58,22 @@ export type ImportReport = {
   journalPath: string;
 };
 
+export type ThreadMessage = {
+  index: number;
+  role: string;
+  text: string;
+  timestamp: string | null;
+};
+
+export type ThreadMessagesPage = {
+  threadId: string;
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  messages: ThreadMessage[];
+  warnings: string[];
+};
+
 export type ProviderSyncPreview = {
   provider: string;
   rolloutCount: number;

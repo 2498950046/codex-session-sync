@@ -288,6 +288,132 @@ pub fn mutate_local_thread(
     Ok(())
 }
 
+pub fn load_thread_messages(
+    codex_home: impl AsRef<Path>,
+    thread_id: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<crate::models::ThreadMessagesPage> {
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 100);
+    let home = fs::canonicalize(codex_home.as_ref())?;
+    let report = scan_codex_home_metadata_with_control(&home, &OperationControl::default())?;
+    let thread = report
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == thread_id)
+        .with_context(|| format!("thread {thread_id} was not found"))?;
+    let file = File::open(&thread.rollout.source_path).with_context(|| {
+        format!(
+            "failed to open rollout {}",
+            thread.rollout.source_path.display()
+        )
+    })?;
+    let start = (page - 1) * page_size;
+    let end = start.saturating_add(page_size);
+    let mut total_count = 0usize;
+    let mut messages = Vec::new();
+    let mut warnings = Vec::new();
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                warnings.push(format!("第 {} 行读取失败：{}", line_number + 1, error));
+                continue;
+            }
+        };
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                warnings.push(format!(
+                    "第 {} 行 JSON 无法解析：{}",
+                    line_number + 1,
+                    error
+                ));
+                continue;
+            }
+        };
+        let Some((role, text)) = extract_thread_message(&value) else {
+            continue;
+        };
+        let index = total_count;
+        total_count += 1;
+        if index >= start && index < end {
+            messages.push(crate::models::ThreadMessage {
+                index,
+                role,
+                text,
+                timestamp: value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+    Ok(crate::models::ThreadMessagesPage {
+        thread_id: thread_id.to_string(),
+        page,
+        page_size,
+        total_count,
+        messages,
+        warnings,
+    })
+}
+
+fn extract_thread_message(value: &Value) -> Option<(String, String)> {
+    let payload = value.get("payload").unwrap_or(value);
+    let record_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let payload_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let role = payload
+        .get("role")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("message")
+                .and_then(Value::as_object)
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| match payload_type {
+            "user_message" => Some("user"),
+            "assistant_message" => Some("assistant"),
+            _ if record_type == "user_message" => Some("user"),
+            _ if record_type == "assistant_message" => Some("assistant"),
+            _ => None,
+        })?;
+    let text = payload
+        .get("text")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("message").and_then(Value::as_str))
+        .or_else(|| {
+            payload
+                .get("message")
+                .and_then(Value::as_object)
+                .and_then(|message| message.get("text"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| content_text(payload.get("content")))?;
+    Some((role.to_string(), text.to_string()))
+}
+
+fn content_text(value: Option<&Value>) -> Option<&str> {
+    match value? {
+        Value::String(text) => Some(text.as_str()),
+        Value::Array(items) => items.iter().find_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("content").and_then(Value::as_str))
+        }),
+        _ => None,
+    }
+}
+
 pub fn scan_codex_home_dashboard(codex_home: impl AsRef<Path>) -> Result<ScanDashboardReport> {
     scan_codex_home_dashboard_with_control(codex_home, &OperationControl::default())
 }
@@ -991,6 +1117,24 @@ fn sha256_reader(reader: &mut impl Read, control: &OperationControl) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_user_and_assistant_messages_from_rollout_records() {
+        let user = json!({
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"}
+        });
+        let assistant = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "world"}]
+            }
+        });
+        assert_eq!(extract_thread_message(&user), Some(("user".to_string(), "hello".to_string())));
+        assert_eq!(extract_thread_message(&assistant), Some(("assistant".to_string(), "world".to_string())));
+    }
     use rusqlite::Connection;
     use std::sync::{
         Arc, Mutex,
