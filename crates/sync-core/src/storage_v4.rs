@@ -2203,8 +2203,20 @@ pub fn collect_revision_graph_v4(
         sha256: root_id,
         byte_length: fs::metadata(&root_path)?.len(),
     }]);
-    let mut references = 1_usize;
-    for thread_ref in &root.threads {
+    graph.extend(collect_thread_graph_v4(&root.threads, store)?);
+    Ok(graph)
+}
+
+/// Collect just the descriptor/content objects for a subset of a revision.
+/// This supports staged Push: unchanged remote `ThreadRef`s can stay in the
+/// new root without being downloaded, revalidated, or uploaded locally.
+pub fn collect_thread_graph_v4(
+    thread_refs: &[ThreadRefV4],
+    store: &FilesystemContentStoreV4,
+) -> Result<BTreeSet<StorageObjectRefV4>> {
+    let mut graph = BTreeSet::new();
+    let mut references = 0_usize;
+    for thread_ref in thread_refs {
         references += 1;
         if references > 500_000 {
             bail!("v4 revision graph exceeds object-reference limit");

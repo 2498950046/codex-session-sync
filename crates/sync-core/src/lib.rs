@@ -7,6 +7,7 @@ pub mod process;
 pub mod protocol;
 pub mod provider;
 pub mod provider_sync;
+pub mod staging;
 pub mod storage_v3;
 pub mod storage_v4;
 pub mod sync;
@@ -21,9 +22,9 @@ pub use codex::{
 pub use local::{
     collect_object_descriptors, create_local_snapshot, create_local_snapshot_with_control,
     default_repository_root, import_local_snapshot, import_local_snapshot_with_control,
-    install_repository_object, load_local_snapshot, recover_incomplete_operation,
-    repository_object_path, store_local_snapshot, validate_local_snapshot,
-    validate_local_snapshot_with_control, validate_repository_object,
+    install_repository_object, load_local_snapshot, prepare_workspace_snapshot_with_control,
+    recover_incomplete_operation, repository_object_path, store_local_snapshot,
+    validate_local_snapshot, validate_local_snapshot_with_control, validate_repository_object,
 };
 pub use models::*;
 pub use operation::{OperationControl, OperationProgress};
@@ -31,6 +32,7 @@ pub use process::{CodexProcess, CodexProcessKind, detect_codex_processes};
 pub use protocol::*;
 pub use provider::*;
 pub use provider_sync::*;
+pub use staging::*;
 pub use storage_v3::*;
 pub use storage_v4::*;
 pub use sync::*;

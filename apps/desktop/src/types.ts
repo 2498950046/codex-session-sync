@@ -121,7 +121,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "provider_sync_preview" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "pull" | "resolve" | "switch" | "remap";
+  kind: "scan" | "snapshot" | "validate" | "import" | "provider_sync_preview" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "staging-plan" | "staged-push" | "staged-snapshot" | "pull" | "resolve" | "switch" | "remap";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;
@@ -220,6 +220,10 @@ export type SnapshotMetadata = {
   tags: string[];
   pinned: boolean;
   automatic: boolean;
+  scope?: "full" | "selection";
+  baseRevisionId?: string | null;
+  selectedThreadIds?: string[];
+  deletedThreadIds?: string[];
 };
 
 export type LocalSnapshotListItem = {
@@ -263,6 +267,24 @@ export type SnapshotTrashEntry = {
   trashedAt: string;
   originalManifestPath: string;
   trashManifestPath: string;
+};
+
+export type ChangeKind = "added" | "modified" | "archive_changed" | "deleted" | "unchanged";
+
+export type StagingCandidatePreview = {
+  threadId: string;
+  kind: ChangeKind;
+  archived: boolean;
+  title: string;
+  workspace: ThreadBundle["workspace"];
+  modelProvider: string | null;
+  byteLength: number;
+};
+
+export type StagingPlanReport = {
+  baseRevisionId: string | null;
+  candidates: StagingCandidatePreview[];
+  warningCount: number;
 };
 
 export type LocalTrashPurgePlan = {

@@ -32,6 +32,7 @@ import { AppShell } from "./AppShell";
 import { useTheme } from "./theme";
 import type {
   AutomaticWorkspaceMappingResult,
+  ChangeKind,
   CheckoutReport,
   CodexProcess,
   ImportReport,
@@ -61,6 +62,8 @@ import type {
   SnapshotDeletionPlan,
   SnapshotTrashEntry,
   SnapshotValidationReport,
+  StagingCandidatePreview,
+  StagingPlanReport,
   SyncReport,
   ThreadBundle,
   ThreadMessagesPage,
@@ -271,6 +274,74 @@ function ConfirmDialog({ request, onClose }: { request: ConfirmationRequest | nu
   </div>;
 }
 
+function StagingDialog({ plan, selected, showAll, busy, actionLabel, onToggle, onSetAll, onShowAll, onClose, onPush }: {
+  plan: StagingPlanReport | null;
+  selected: Set<string>;
+  showAll: boolean;
+  busy: boolean;
+  actionLabel: string;
+  onToggle: (ids: string[], checked: boolean) => void;
+  onSetAll: (checked: boolean) => void;
+  onShowAll: (value: boolean) => void;
+  onClose: () => void;
+  onPush: () => void;
+}) {
+  const [status, setStatus] = useState<"active" | "archived" | "deleted" | null>(null);
+  const [project, setProject] = useState<string | null>(null);
+  const [pages, setPages] = useState({ root: 1, status: 1, project: 1 });
+  if (!plan) return null;
+  const candidates = plan.candidates.filter((candidate) => showAll || candidate.kind !== "unchanged");
+  const visibleForStatus = (candidate: StagingCandidatePreview) => status === "deleted"
+    ? candidate.kind === "deleted"
+    : candidate.kind !== "deleted" && candidate.archived === (status === "archived");
+  const statusCandidates = status ? candidates.filter(visibleForStatus) : [];
+  const projects = new Map<string, StagingCandidatePreview[]>();
+  statusCandidates.forEach((candidate) => {
+    const key = candidate.workspace.logicalId || candidate.workspace.sourcePath || "无项目";
+    projects.set(key, [...(projects.get(key) ?? []), candidate]);
+  });
+  const projectCandidates = project ? projects.get(project) ?? [] : [];
+  const level = !status ? "root" : !project ? "status" : "project";
+  const page = pages[level];
+  const setPage = (next: number) => setPages((current) => ({ ...current, [level]: next }));
+  const pageSize = 10;
+  const pageItems = <T,>(items: T[]) => items.slice((page - 1) * pageSize, page * pageSize);
+  const pager = (total: number) => <FolderPager page={page} pageCount={Math.max(1, Math.ceil(total / pageSize))} total={total} onChange={setPage} />;
+  const changed = plan.candidates.filter((candidate) => candidate.kind !== "unchanged");
+  const selectedChanged = changed.filter((candidate) => selected.has(candidate.threadId));
+  const selectedBytes = selectedChanged.reduce((total, candidate) => total + candidate.byteLength, 0);
+  const label = (kind: ChangeKind) => ({ added: "新增", modified: "修改", archive_changed: "归档/恢复", deleted: "待删除", unchanged: "未变化" })[kind];
+  const toggle = (items: StagingCandidatePreview[], checked: boolean) => onToggle(items.filter((item) => item.kind !== "unchanged").map((item) => item.threadId), checked);
+  const checkState = (items: StagingCandidatePreview[]) => {
+    const changeable = items.filter((item) => item.kind !== "unchanged");
+    const count = changeable.filter((item) => selected.has(item.threadId)).length;
+    return { checked: changeable.length > 0 && count === changeable.length, partial: count > 0 && count < changeable.length, count, total: changeable.length };
+  };
+  const Check = ({ items }: { items: StagingCandidatePreview[] }) => {
+    const state = checkState(items);
+    return <label className="staging-check" title={state.partial ? `已选 ${state.count}/${state.total}` : undefined}><input type="checkbox" checked={state.checked} ref={(element) => { if (element) element.indeterminate = state.partial; }} onChange={(event) => toggle(items, event.target.checked)} disabled={busy || state.total === 0} /><span>{state.partial ? `${state.count}/${state.total}` : ""}</span></label>;
+  };
+  const root = [
+    { key: "active" as const, title: "活动", items: candidates.filter((item) => item.kind !== "deleted" && !item.archived) },
+    { key: "archived" as const, title: "归档", items: candidates.filter((item) => item.kind !== "deleted" && item.archived) },
+    { key: "deleted" as const, title: "待删除", items: candidates.filter((item) => item.kind === "deleted") },
+  ].filter((entry) => entry.items.length > 0);
+
+  return <div className="dialog-backdrop" role="presentation">
+    <section className="staging-dialog" role="dialog" aria-modal="true" aria-labelledby="staging-dialog-title">
+      <header><div><span className="overline">Git 式暂存区</span><h2 id="staging-dialog-title">选择要推送的变化</h2><p>未勾选的远端会话会保留在完整 Revision 中，不会被删除。</p></div><button type="button" className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭"><X size={18} /></button></header>
+      {plan.warningCount > 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><span>本地扫描发现 {plan.warningCount} 个兼容性警告，无法安全推送。</span></div>}
+      <div className="staging-toolbar"><label><input type="checkbox" checked={showAll} onChange={(event) => onShowAll(event.target.checked)} disabled={busy} />显示全部（含未变化）</label><div><button type="button" className="button secondary small" onClick={() => onSetAll(true)} disabled={busy || changed.length === 0}>全选变化</button><button type="button" className="button secondary small" onClick={() => onSetAll(false)} disabled={busy || selected.size === 0}>清空</button></div></div>
+      <div className="staging-summary"><span>已暂存 <b>{selectedChanged.length}</b> 项</span><span>预计上传 ≤ <b>{formatBytes(selectedBytes)}</b></span><span>新增 {selectedChanged.filter((item) => item.kind === "added").length} · 修改 {selectedChanged.filter((item) => item.kind === "modified").length} · 删除 {selectedChanged.filter((item) => item.kind === "deleted").length}</span></div>
+      <nav className="session-breadcrumb" aria-label="暂存层级"><button type="button" onClick={() => { setStatus(null); setProject(null); }}>变化</button>{status && <><ChevronRight size={13} /><button type="button" onClick={() => setProject(null)}>{status === "active" ? "活动" : status === "archived" ? "归档" : "待删除"}</button></>}{project && <><ChevronRight size={13} /><span>{project}</span></>}</nav>
+      {!status && <div className="staging-body"><div className="folder-grid">{pageItems(root).map((entry) => <div className="folder-entry" key={entry.key}><Check items={entry.items} /><button type="button" className="folder-open" onClick={() => { setStatus(entry.key); setProject(null); }}><Folder size={24} /><span><strong>{entry.title}</strong><small>{entry.items.length} 项变化</small></span><ChevronRight size={17} /></button></div>)}</div>{pager(root.length)}</div>}
+      {status && !project && <div className="staging-body"><button type="button" className="folder-back" onClick={() => setStatus(null)}><ChevronLeft size={15} />返回上一级</button><div className="folder-grid">{pageItems([...projects.entries()]).map(([name, items]) => <div className="folder-entry" key={name}><Check items={items} /><button type="button" className="folder-open" onClick={() => setProject(name)}><Folder size={24} /><span><strong>{name}</strong><small>{items.length} 项变化</small></span><ChevronRight size={17} /></button></div>)}</div>{pager(projects.size)}</div>}
+      {status && project && <div className="staging-body"><button type="button" className="folder-back" onClick={() => setProject(null)}><ChevronLeft size={15} />返回项目列表</button><div className="thread-list folder-thread-list">{pageItems(projectCandidates).map((candidate) => <label className="thread-row staging-thread" key={candidate.threadId}><input type="checkbox" checked={selected.has(candidate.threadId)} onChange={(event) => onToggle([candidate.threadId], event.target.checked)} disabled={busy || candidate.kind === "unchanged"} /><div><strong>{candidate.title || "未命名会话"}</strong><span>{candidate.workspace.sourcePath ?? "未记录工作目录"}</span><small>{label(candidate.kind)} · {candidate.modelProvider ?? "unknown"}</small></div></label>)}</div>{pager(projectCandidates.length)}</div>}
+      <footer><button type="button" className="button secondary" onClick={onClose} disabled={busy}>取消</button><button type="button" className="button primary" onClick={onPush} disabled={busy || selectedChanged.length === 0 || plan.warningCount > 0}><ArrowUpFromLine size={16} />{actionLabel}</button></footer>
+    </section>
+  </div>;
+}
+
 function ErrorDialog({ message, onClose }: { message: string | null; onClose: () => void }) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
@@ -466,6 +537,10 @@ export default function SessionSyncApp() {
   const [recoveredJournal, setRecoveredJournal] = useState<OperationJournal | null>(null);
   const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
   const [syncReportTargetKey, setSyncReportTargetKey] = useState<string | null>(null);
+  const [stagingPlan, setStagingPlan] = useState<StagingPlanReport | null>(null);
+  const [stagedThreadIds, setStagedThreadIds] = useState<Set<string>>(new Set());
+  const [stagingShowAll, setStagingShowAll] = useState(false);
+  const [stagingAction, setStagingAction] = useState<"push" | "snapshot">("push");
   const [conflictChoices, setConflictChoices] = useState<Record<string, "local" | "remote">>({});
   const [error, setError] = useState<string | null>(null);
   const [quarantineMessage, setQuarantineMessage] = useState<string | null>(null);
@@ -861,6 +936,17 @@ export default function SessionSyncApp() {
       await refreshHistory();
     }
     if (completed.kind === "validate") setValidation(result as SnapshotValidationReport);
+    if (completed.kind === "staging-plan") {
+      setStagingPlan(result as StagingPlanReport);
+      setStagedThreadIds(new Set());
+      setStagingShowAll(false);
+    }
+    if (completed.kind === "staged-snapshot") {
+      const summary = result as SnapshotSummary;
+      setSnapshot(summary);
+      setManifestPath(summary.manifestPath);
+      await refreshHistory();
+    }
     if (completed.kind === "provider_sync_preview") setProviderSyncPreview(result as ProviderSyncPreview);
     if (completed.kind === "import") {
       const imported = result as ImportReport;
@@ -897,7 +983,7 @@ export default function SessionSyncApp() {
       await refreshNamespaces();
       await refreshHistory();
     }
-    if (["push", "pull", "resolve", "switch", "remap"].includes(completed.kind)) {
+    if (["push", "staged-push", "pull", "resolve", "switch", "remap"].includes(completed.kind)) {
       const synced = result as SyncReport;
       setSyncReport(synced);
       setSyncReportTargetKey(jobSyncTargets.current.get(completed.jobId) ?? syncTargetKey);
@@ -906,7 +992,7 @@ export default function SessionSyncApp() {
       if (synced.checkout) setJournalPath(synced.checkout.journalPath);
       await refreshNamespaces();
       await refreshNamespaceStatus();
-      if (completed.kind !== "push") {
+      if (completed.kind !== "push" && completed.kind !== "staged-push") {
         const scanned = await invoke<JobSnapshot>("start_scan_job", { codexHome: codexHome.trim() });
         setJob(scanned);
       }
@@ -920,7 +1006,7 @@ export default function SessionSyncApp() {
     try {
       const targetKey = syncTargetKey;
       const started = await invoke<JobSnapshot>(command, payload);
-      if (["start_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job", "start_workspace_remap_job"].includes(command)) {
+      if (["start_push_job", "start_staged_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job", "start_workspace_remap_job"].includes(command)) {
         jobSyncTargets.current.set(started.jobId, targetKey);
       }
       setJob(started);
@@ -1698,6 +1784,40 @@ export default function SessionSyncApp() {
     confirmedCodexClosed: true,
   };
 
+  async function openStaging(action: "push" | "snapshot" = "push") {
+    if (!selectedRemoteId || !selectedNamespaceId) return;
+    setStagingPlan(null);
+    setStagedThreadIds(new Set());
+    setStagingAction(action);
+    await start("start_staging_plan_job", {
+      repositoryRoot: repositoryRoot.trim(),
+      codexHome: codexHome.trim(),
+      remoteId: selectedRemoteId,
+      namespaceId: selectedNamespaceId,
+    });
+  }
+
+  function toggleStaged(ids: string[], checked: boolean) {
+    setStagedThreadIds((current) => {
+      const next = new Set(current);
+      ids.forEach((id) => checked ? next.add(id) : next.delete(id));
+      return next;
+    });
+  }
+
+  function submitStaged() {
+    if (!stagingPlan) return;
+    const selected = [...stagedThreadIds];
+    setStagingPlan(null);
+    void start(stagingAction === "push" ? "start_staged_push_job" : "start_staged_snapshot_job", {
+      request: {
+        ...syncPayload,
+        baseRevisionId: stagingPlan.baseRevisionId,
+        selectedThreadIds: selected,
+      },
+    });
+  }
+
   const setupSteps = [
     { label: "Codex Home", ready: Boolean(codexHome.trim()), detail: codexHome.trim() || "尚未设置", route: "/settings" as AppRoute },
     { label: "远端服务器", ready: profiles.length > 0 && Boolean(selectedRemoteId), detail: selectedProfile?.displayName ?? "尚未配置", route: "/settings" as AppRoute },
@@ -1719,10 +1839,10 @@ export default function SessionSyncApp() {
     {writeBlockedReason && <div className="inline-alert warning"><AlertTriangle size={17} /><div><strong>写操作尚未就绪</strong><span>{writeBlockedReason}</span></div></div>}
     <div className="primary-action-bar">
       {namespaceStatus.active ? <>
-        <button className="button primary action-button" onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />推送</button>
+        <button className="button primary action-button" onClick={() => void openStaging("push")} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />选择并推送</button>
         <button className="button primary action-button" onClick={() => void prepareWorkspacePathsAndStart("start_pull_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowDownToLine size={18} />拉取</button>
       </> : !namespaceStatus.activeNamespaceId && !namespaceStatus.remoteHead ?
-        <div className="button-row sync-initial-push-actions"><button className="button primary action-button" onClick={() => void start("start_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />用本机会话初始化并推送</button><button className="button secondary action-button" onClick={() => void start("start_latest_snapshot_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArchiveRestore size={18} />推送最近一次</button></div> :
+        <div className="button-row sync-initial-push-actions"><button className="button primary action-button" onClick={() => void openStaging("push")} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />选择并初始化推送</button><button className="button secondary action-button" onClick={() => void start("start_latest_snapshot_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArchiveRestore size={18} />推送最近一次</button></div> :
         <button className="button warning action-button wide" onClick={() => setConfirmation({
           title: `切换到“${selectedNamespace.displayName}”`,
           description: <><p>应用会先创建备份，再用目标命名空间完整替换本机会话。</p><dl className="confirmation-details"><div><dt>目标</dt><dd>{selectedNamespace.displayName}</dd></div><div><dt>Codex Home</dt><dd>{codexHome}</dd></div></dl></>,
@@ -1886,7 +2006,7 @@ export default function SessionSyncApp() {
   </> : <section className="surface empty-card"><FolderCog size={28} /><h3>请先选择命名空间</h3><p>项目路径规则按 Home、远端和命名空间隔离。</p></section>;
 
   const snapshotTools = <section className="surface tool-section">
-    <div className="section-title"><div><h3>本地快照与恢复</h3><p>用于诊断、手动导入和未完成操作恢复；所有写入仍遵守 Codex 关闭检查。</p></div><button className="button primary" onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建本地快照</button></div>
+    <div className="section-title"><div><h3>本地快照与恢复</h3><p>用于诊断、手动导入和未完成操作恢复；所有写入仍遵守 Codex 关闭检查。</p></div><button className="button primary" onClick={() => void (selectedRemoteId && selectedNamespaceId ? openStaging("snapshot") : start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }))} disabled={busy || !canWrite}>{selectedRemoteId && selectedNamespaceId ? "选择会话创建快照" : "创建完整本地快照"}</button></div>
     <div className="field"><label htmlFor="manifest-path-new">快照清单路径</label><input id="manifest-path-new" value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} placeholder="~/.codex-session-sync/snapshots/<id>.json" /></div>
     <div className="button-row"><button className="button secondary" onClick={() => void start("start_validation_job", { manifestPath: manifestPath.trim(), repositoryRoot: repositoryRoot.trim() })} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button><button className="button danger" onClick={() => setConfirmation({ title: "增量导入快照", description: <p>导入会先备份当前会话，并在校验失败时自动回滚。请确认 Codex 已完全退出。</p>, confirmLabel: "确认备份并导入", tone: "danger", onConfirm: () => start("start_import_job", { manifestPath: manifestPath.trim(), codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={busy || !manifestPath.trim() || !canWrite}>增量导入</button></div>
     <div className="divider" />
@@ -1953,7 +2073,7 @@ export default function SessionSyncApp() {
         {(selectedLocalSnapshot || selectedRemoteRevision) && <section className="version-details">
           <div><span className="overline">选中版本</span><h3>{selectedLocalSnapshot ? (selectedLocalSnapshot.metadata.description || "本地快照") : "远端 Revision"}</h3><CopyCode value={selectedHistoryId ?? ""} /></div>
           <div className="version-detail-metrics"><span>会话 <b>{selectedLocalSnapshot?.threadCount ?? selectedRemoteRevision?.threadCount}</b></span><span>逻辑大小 <b>{formatBytes(selectedLocalSnapshot?.logicalBytes ?? selectedRemoteRevision?.logicalBytes ?? 0)}</b></span><span>物理引用 <b>{formatBytes(selectedLocalSnapshot?.physicalReferencedBytes ?? selectedRemoteRevision?.physicalReferencedBytes ?? 0)}</b></span></div>
-          {selectedLocalSnapshot && <div className="button-row"><button className="button warning" onClick={() => setConfirmation({ title: "语义恢复本地快照", description: <p>当前 Codex 会话将先完整备份并写入 Journal，再按线程语义恢复所选快照；Provider、工作区路径和 rollout 换行格式会按当前机器物化。失败时会自动回滚。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_snapshot_restore_job", { manifestPath: selectedLocalSnapshot.manifestPath, codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy}>语义恢复</button><button className="button secondary" onClick={async () => { setHistoryLoading(true); setHistoryLoadingLabel("正在更新快照标记…"); try { await invoke("update_snapshot_metadata", { repositoryRoot: repositoryRoot.trim(), snapshotId: selectedLocalSnapshot.snapshotId, metadata: { ...selectedLocalSnapshot.metadata, pinned: !selectedLocalSnapshot.metadata.pinned } }); await refreshHistory("正在更新快照列表…"); } catch (reason) { setError(String(reason)); } finally { setHistoryLoading(false); } }}>{selectedLocalSnapshot.metadata.pinned ? "取消固定" : "固定快照"}</button><button className="button danger" onClick={() => void requestSnapshotTrash(selectedLocalSnapshot)} disabled={selectedLocalSnapshot.metadata.pinned || historyLoading}><Trash2 size={15} />移入回收站</button></div>}
+          {selectedLocalSnapshot && <div className="button-row"><button className="button warning" onClick={() => setConfirmation({ title: selectedLocalSnapshot.metadata.scope === "selection" ? "精确恢复选择快照" : "语义恢复本地快照", description: selectedLocalSnapshot.metadata.scope === "selection" ? <p>当前快照只包含被勾选的变化。精确恢复会以该集合替换本地会话，未包含的会话将丢失；操作仍会先完整备份并可在失败时回滚。</p> : <p>当前 Codex 会话将先完整备份并写入 Journal，再按线程语义恢复所选快照；Provider、工作区路径和 rollout 换行格式会按当前机器物化。失败时会自动回滚。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_snapshot_restore_job", { manifestPath: selectedLocalSnapshot.manifestPath, codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy}>{selectedLocalSnapshot.metadata.scope === "selection" ? "精确恢复（会替换）" : "语义恢复"}</button><button className="button secondary" onClick={async () => { setHistoryLoading(true); setHistoryLoadingLabel("正在更新快照标记…"); try { await invoke("update_snapshot_metadata", { repositoryRoot: repositoryRoot.trim(), snapshotId: selectedLocalSnapshot.snapshotId, metadata: { ...selectedLocalSnapshot.metadata, pinned: !selectedLocalSnapshot.metadata.pinned } }); await refreshHistory("正在更新快照列表…"); } catch (reason) { setError(String(reason)); } finally { setHistoryLoading(false); } }}>{selectedLocalSnapshot.metadata.pinned ? "取消固定" : "固定快照"}</button><button className="button danger" onClick={() => void requestSnapshotTrash(selectedLocalSnapshot)} disabled={selectedLocalSnapshot.metadata.pinned || historyLoading}><Trash2 size={15} />移入回收站</button></div>}
           {selectedRemoteRevision && <div className="button-row"><button className="button secondary" onClick={() => void start("start_remote_revision_download_job", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId })} disabled={busy}>下载为本地快照</button><button className="button secondary" onClick={() => setConfirmation({ title: "恢复为本地待推送状态", description: <p>当前会话会先备份并通过 Journal 精确切换到该远端版本；Tracking 仍保留当前远端 Head，之后可普通 Push 发布。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: false, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复为待 Push</button><button className="button warning" onClick={() => setConfirmation({ title: "恢复并发布为新版本", description: <p>先安全恢复所选历史内容，再以当前远端 Head 为父版本发布新的 Revision；不会改写已有历史。</p>, confirmLabel: "恢复并发布", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: true, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复并发布</button>{remoteRevisions[0]?.revisionId !== selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "回退远端 Head", description: <p>该版本之后的远端历史会进入 30 天可恢复回收站，Namespace Epoch 将递增。对象不会立即删除。</p>, confirmLabel: "确认回退 Head", tone: "danger", onConfirm: () => void truncateRemoteHistory(selectedRemoteRevision.revisionId, "正在回退远端 Head…") })}>回退 Head 到此处</button>}{remoteRevisions[0]?.revisionId === selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "删除当前远端 Head", description: <p>当前 Head 会进入 30 天可恢复回收站，父版本成为新 Head；共享对象和内容不会立即删除。</p>, confirmLabel: "删除当前 Head", tone: "danger", onConfirm: () => void truncateRemoteHistory(selectedRemoteRevision.parentRevision, "正在删除远端 Head…") })}>删除当前 Head</button>}</div>}
         </section>}
       </div>
@@ -1992,6 +2112,18 @@ export default function SessionSyncApp() {
 
     {pendingWorkspaceSync && <div className="dialog-backdrop" role="presentation"><section className="workspace-path-modal" role="dialog" aria-modal="true" aria-label="设置本机项目路径"><div className="workspace-modal-heading"><div><span className="overline">同步前路径检查</span><h2>设置本机项目路径</h2></div><button type="button" className="icon-button" onClick={() => setPendingWorkspaceSync(null)} disabled={busy} aria-label="关闭"><X size={19} /></button></div><p>远端会话引用了当前电脑尚不可用的项目路径。选择统一父目录后仍可逐项修改。</p><div className="migration-summary"><strong>{pendingWorkspaceSync.plan.unmappedPaths.length} 项待设置</strong><span>{pendingWorkspaceSync.plan.mappedPathCount} 项已有映射 · {pendingWorkspaceSync.plan.existingPathCount} 项原路径可用</span></div><WorkspacePathEditor parentDirectory={workspaceEditorParent} drafts={workspaceDrafts} busy={busy} submitLabel="保存路径并继续" onParentChange={(value) => changeEditorParent("sync", value)} onTargetChange={(index, value) => setWorkspaceDrafts((current) => current.map((draft, candidate) => candidate === index ? { ...draft, localPath: value } : draft))} onChooseParent={() => void chooseEditorParent("sync")} onChooseTarget={(index) => void chooseEditorTarget("sync", index)} onSubmit={() => void saveWorkspaceDraftsAndContinue()} onCancel={() => setPendingWorkspaceSync(null)} /></section></div>}
     {selectedThread && <div className="dialog-backdrop" role="presentation"><section className="thread-detail-modal" role="dialog" aria-modal="true" aria-label="完整会话"><header><div><span className="overline">会话详情</span><h2>{selectedThread.title || "未命名会话"}</h2><small>{selectedThread.workspace.sourcePath ?? selectedThread.threadId}</small></div><button type="button" className="icon-button" onClick={() => { setSelectedThread(null); setThreadMessages(null); }} aria-label="关闭"><X size={19} /></button></header>{threadMessagesLoading ? <div className="thread-detail-loading"><RefreshCw size={19} /><span>正在读取会话…</span></div> : threadMessages ? <><div className="message-list">{threadMessages.messages.map((message) => <article className={"message-card role-" + message.role} key={message.index}><div><strong>{message.role === "user" ? "用户" : message.role === "assistant" ? "助手" : message.role}</strong><small>{message.timestamp ? new Date(message.timestamp).toLocaleString("zh-CN") : "#" + (message.index + 1)}</small></div><pre>{message.text}</pre></article>)}{threadMessages.messages.length === 0 && <p className="muted-copy">这一页没有可显示的消息。</p>}</div>{threadMessages.warnings.length > 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><span>有 {threadMessages.warnings.length} 行无法解析，其他消息仍已显示。</span></div>}<FolderPager page={threadMessages.page} pageCount={Math.max(1, Math.ceil(threadMessages.totalCount / threadMessages.pageSize))} total={threadMessages.totalCount} onChange={(page) => void openThread(selectedThread, page)} /></> : null}</section></div>}
+    <StagingDialog
+      plan={stagingPlan}
+      selected={stagedThreadIds}
+      showAll={stagingShowAll}
+      busy={busy}
+      actionLabel={stagingAction === "push" ? "推送已暂存变化" : "创建选择快照"}
+      onToggle={toggleStaged}
+      onSetAll={(checked) => setStagedThreadIds(checked ? new Set((stagingPlan?.candidates ?? []).filter((candidate) => candidate.kind !== "unchanged").map((candidate) => candidate.threadId)) : new Set())}
+      onShowAll={setStagingShowAll}
+      onClose={() => setStagingPlan(null)}
+      onPush={submitStaged}
+    />
     <ConfirmDialog request={confirmation} onClose={() => setConfirmation(null)} />
     <ErrorDialog message={error} onClose={() => setError(null)} />
     {job && <aside className={`task-center ${jobFailure ? "failed" : ""}`} aria-live="polite"><div className="task-center-heading"><div><span className="overline">{job.kind} · {job.state}</span><strong>{jobFailure ? "任务失败" : job.progress.phase.replaceAll("_", " ")}</strong></div>{!isActive(job) && <button className="icon-button" onClick={() => setJob(null)} aria-label="关闭任务"><X size={17} /></button>}</div><p>{jobFailure ?? job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><div className="task-center-footer"><small>{progressDetail}</small>{isActive(job) && <button className="button danger small" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button>}</div></aside>}

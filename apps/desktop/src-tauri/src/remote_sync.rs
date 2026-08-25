@@ -1,6 +1,4 @@
-#[cfg(test)]
-use std::collections::BTreeSet;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -14,14 +12,16 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sync_core::repository_object_path;
 use sync_core::{
-    CheckoutReport, CheckoutTrackingUpdate, FilesystemContentStoreV4, LocalSnapshot,
-    OperationControl, OperationProgress, RevisionCommitRequestV4, StorageObjectKindV4,
-    ThreadBundle, ThreadConflict, ThreadConflictResolution, ThreadMergeOutcome, TrackingRecord,
-    TrackingStore, WorkspacePathMapper, canonicalize_snapshot_provider_metadata,
-    checkout_local_snapshot_with_tracking_and_projects_control, create_local_snapshot_with_control,
-    detect_configured_provider, load_local_snapshot, materialize_snapshot_provider_metadata,
-    merge_thread_sets, remote_thread_view, resolve_thread_sets, semantic_thread_hash,
-    store_local_snapshot,
+    ChangeKind, CheckoutReport, CheckoutTrackingUpdate, FilesystemContentStoreV4, LocalSnapshot,
+    OperationControl, OperationProgress, RevisionCommitRequestV4, SnapshotMetadata, SnapshotScope,
+    StagedChangeSet, StorageObjectKindV4, ThreadBundle, ThreadConflict, ThreadConflictResolution,
+    ThreadMergeOutcome, TrackingRecord, TrackingStore, WorkspacePathMapper, build_change_plan,
+    canonicalize_snapshot_provider_metadata,
+    checkout_local_snapshot_with_tracking_and_projects_control, compose_staged_thread_refs,
+    create_local_snapshot_with_control, detect_configured_provider, load_local_snapshot,
+    materialize_snapshot_provider_metadata, merge_thread_sets,
+    prepare_workspace_snapshot_with_control, remote_thread_view, resolve_thread_sets,
+    semantic_thread_hash, store_local_snapshot, write_v4_snapshot,
 };
 use uuid::Uuid;
 
@@ -45,6 +45,29 @@ pub enum SyncOutcomeKind {
     Remapped,
     NoChanges,
     Conflict,
+}
+
+/// Compact, UI-safe projection of an exact staging plan.  The full local and
+/// baseline bundles never cross IPC; the plan is regenerated and revalidated
+/// immediately before a selected Push.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StagingPlanReport {
+    pub base_revision_id: Option<String>,
+    pub candidates: Vec<StagingCandidatePreview>,
+    pub warning_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StagingCandidatePreview {
+    pub thread_id: String,
+    pub kind: ChangeKind,
+    pub archived: bool,
+    pub title: String,
+    pub workspace: sync_core::WorkspaceRef,
+    pub model_provider: Option<String>,
+    pub byte_length: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +124,7 @@ pub fn download_remote_revision_as_snapshot(
             tags: vec!["remote".to_string()],
             pinned: false,
             automatic: false,
+            ..SnapshotMetadata::default()
         },
     )?;
     Ok(sync_core::SnapshotSummary {
@@ -552,6 +576,374 @@ fn upload_missing_v4_objects(
 
 fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+pub fn prepare_staging_plan(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<StagingPlanReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    client.info()?;
+    let tracking = TrackingStore::open(repository_root)?;
+    let record = tracking.load(codex_home, remote_id, namespace_id)?;
+    let base_revision_id = record
+        .as_ref()
+        .and_then(|record| record.integrated_head.clone());
+    let base = match base_revision_id.as_deref() {
+        Some(revision_id) => {
+            let (root, descriptors, _) =
+                download_revision_descriptors(client, revision_id, repository_root, control)?;
+            validate_revision_root_namespace(&root, namespace_id)?;
+            descriptors
+        }
+        None => Vec::new(),
+    };
+    let prepared = prepare_workspace_snapshot_with_control(codex_home, repository_root, control)?;
+    let mut workspace = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: "staging-preview".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads: prepared.threads,
+        warning_count: prepared.warning_count,
+    };
+    workspace = workspace_mapper.canonicalize_snapshot(&workspace);
+    project_workspace_identities(&mut workspace);
+    let workspace = canonicalize_snapshot_provider_metadata(&workspace);
+    let plan = build_change_plan(base_revision_id.clone(), &base, &workspace.threads)?;
+    let candidates =
+        plan.candidates
+            .into_iter()
+            .map(|candidate| {
+                let thread = candidate.local.as_ref().or(candidate.baseline.as_ref()).expect(
+                "a change candidate always retains either local or baseline display metadata",
+            );
+                StagingCandidatePreview {
+                    thread_id: candidate.thread_id,
+                    kind: candidate.kind,
+                    archived: candidate.archived.unwrap_or(thread.archived),
+                    title: thread.title.clone(),
+                    workspace: thread.workspace.clone(),
+                    model_provider: thread.model_provider.clone(),
+                    byte_length: thread.rollout.byte_length,
+                }
+            })
+            .collect();
+    Ok(StagingPlanReport {
+        base_revision_id,
+        candidates,
+        warning_count: prepared.warning_count,
+    })
+}
+
+/// Create a full remote Revision by applying only explicitly staged local
+/// changes to the current remote Head.  Unselected refs remain remote-only,
+/// so this path never reads or uploads their rollout content.
+pub fn push_staged_namespace(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    selected_thread_ids: BTreeSet<String>,
+    expected_base_revision_id: Option<String>,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    client.info()?;
+    if selected_thread_ids.is_empty() {
+        bail!("select at least one local change before pushing");
+    }
+    let tracking = TrackingStore::open(repository_root)?;
+    let active = tracking.active(codex_home)?;
+    if let Some(active) = &active
+        && (active.remote_id != remote_id || active.namespace_id != namespace_id)
+    {
+        bail!("the selected namespace is not active; switch namespaces before pushing");
+    }
+    let record = tracking.load(codex_home, remote_id, namespace_id)?;
+    let integrated_head = record
+        .as_ref()
+        .and_then(|record| record.integrated_head.clone());
+    if integrated_head != expected_base_revision_id {
+        bail!("the staging plan is stale; regenerate it before pushing");
+    }
+    let remote_state = client.namespace_head_state(namespace_id)?;
+    if let Some(record) = &record
+        && record.remote_epoch != remote_state.namespace_epoch
+    {
+        bail!("remote history epoch changed; regenerate the staging plan");
+    }
+    if remote_state.head != integrated_head {
+        bail!("remote namespace changed after staging; pull or resolve conflicts before pushing");
+    }
+
+    let base = match integrated_head.as_deref() {
+        Some(revision_id) => {
+            let (root, descriptors, _) =
+                download_revision_descriptors(client, revision_id, repository_root, control)?;
+            validate_revision_root_namespace(&root, namespace_id)?;
+            descriptors
+        }
+        None => Vec::new(),
+    };
+    let prepared = prepare_workspace_snapshot_with_control(codex_home, repository_root, control)?;
+    if prepared.warning_count > 0 {
+        bail!(
+            "selected push is blocked because the local workspace contains {} warning(s)",
+            prepared.warning_count
+        );
+    }
+    let mut workspace = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: "staging-push".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads: prepared.threads,
+        warning_count: prepared.warning_count,
+    };
+    workspace = workspace_mapper.canonicalize_snapshot(&workspace);
+    project_workspace_identities(&mut workspace);
+    let workspace = canonicalize_snapshot_provider_metadata(&workspace);
+    let plan = build_change_plan(integrated_head.clone(), &base, &workspace.threads)?;
+    let staged = StagedChangeSet::from_selected(&plan, selected_thread_ids)?;
+
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let mut staged_refs = Vec::new();
+    for candidate in plan
+        .changed()
+        .filter(|candidate| staged.selected_thread_ids.contains(&candidate.thread_id))
+    {
+        if candidate.kind == ChangeKind::Deleted {
+            continue;
+        }
+        let local = candidate
+            .local
+            .as_ref()
+            .context("staged local thread is missing")?;
+        let content = prepared
+            .contents
+            .get(&candidate.thread_id)
+            .context("staged local content reference is missing")?;
+        staged_refs.push(store.store_descriptor(local, content.clone())?);
+    }
+    let remote_refs = match remote_state.head.as_deref() {
+        Some(revision_id) => load_revision_root(client, revision_id, repository_root)?.threads,
+        None => Vec::new(),
+    };
+    let threads = compose_staged_thread_refs(&remote_refs, &plan, &staged, &staged_refs)?;
+    let thread_count = threads.len();
+    let revision_root = sync_core::RevisionRootV4 {
+        schema_version: sync_core::STORAGE_PROTOCOL_VERSION_V4,
+        normalization_schema_version: sync_core::NORMALIZATION_SCHEMA_VERSION_V4,
+        namespace_id,
+        parent_revision: remote_state.head.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        threads,
+        warning_count: 0,
+    };
+    let root_object = store.store_revision_root(&revision_root)?;
+    let revision_id = revision_root.revision_id()?;
+    let mut upload_objects = sync_core::collect_thread_graph_v4(&staged_refs, &store)?;
+    upload_objects.insert(root_object);
+    let missing_query_started = Instant::now();
+    let missing = client.missing_v4_objects(upload_objects.into_iter().collect())?;
+    let missing_query_ms = duration_ms(missing_query_started.elapsed());
+    let upload = upload_missing_v4_objects(client, &store, missing, control)?;
+
+    control.check_cancelled()?;
+    control.report(OperationProgress {
+        phase: "push_commit".to_string(),
+        message: "Committing staged remote revision".to_string(),
+        completed: 0,
+        total: None,
+        unit: "steps".to_string(),
+        cancellable: false,
+    });
+    let commit_started = Instant::now();
+    let commit = client.commit_revision_v4(
+        namespace_id,
+        &RevisionCommitRequestV4 {
+            expected_head: remote_state.head.clone(),
+            expected_namespace_epoch: remote_state.namespace_epoch,
+            revision: revision_root,
+        },
+    )?;
+    let commit_ms = duration_ms(commit_started.elapsed());
+    if commit.namespace_id != namespace_id || commit.head != revision_id {
+        bail!("server committed an unexpected revision");
+    }
+    let updated = tracking.reconcile_checkout(
+        codex_home,
+        remote_id,
+        namespace_id,
+        record.as_ref().map(|record| record.generation),
+        Some(&commit.head),
+        true,
+    )?;
+    let updated = tracking.update_remote_epoch(
+        codex_home,
+        remote_id,
+        namespace_id,
+        updated.generation,
+        commit.namespace_epoch,
+    )?;
+    Ok(SyncReport {
+        kind: SyncOutcomeKind::Pushed,
+        namespace_id,
+        previous_head: remote_state.head,
+        head: updated.integrated_head,
+        revision_id: Some(revision_id),
+        uploaded_objects: upload.created_objects,
+        downloaded_objects: 0,
+        thread_count,
+        conflicts: Vec::new(),
+        checkout: None,
+        push_metrics: Some(PushMetrics {
+            missing_query_ms,
+            upload_ms: upload.elapsed_ms,
+            commit_ms,
+            transferred_objects: upload.transferred_objects,
+            transferred_bytes: upload.transferred_bytes,
+            created_objects: upload.created_objects,
+            max_concurrency: upload.max_concurrency,
+        }),
+    })
+}
+
+/// Persist the selected local additions/modifications as a compact local
+/// Snapshot. Deletions are retained as explicit metadata, never fabricated as
+/// empty rollout objects.
+pub fn create_staged_snapshot(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    selected_thread_ids: BTreeSet<String>,
+    expected_base_revision_id: Option<String>,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<sync_core::SnapshotSummary> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    if selected_thread_ids.is_empty() {
+        bail!("select at least one local change before snapshotting");
+    }
+    let tracking = TrackingStore::open(repository_root)?;
+    let integrated_head = tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .and_then(|record| record.integrated_head);
+    if integrated_head != expected_base_revision_id {
+        bail!("the staging plan is stale; regenerate it before creating a snapshot");
+    }
+    let base = match integrated_head.as_deref() {
+        Some(revision_id) => {
+            let (root, descriptors, _) =
+                download_revision_descriptors(client, revision_id, repository_root, control)?;
+            validate_revision_root_namespace(&root, namespace_id)?;
+            descriptors
+        }
+        None => Vec::new(),
+    };
+    let prepared = prepare_workspace_snapshot_with_control(codex_home, repository_root, control)?;
+    if prepared.warning_count > 0 {
+        bail!(
+            "selected snapshot is blocked because the local workspace contains {} warning(s)",
+            prepared.warning_count
+        );
+    }
+    let mut workspace = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: "staging-snapshot".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads: prepared.threads,
+        warning_count: prepared.warning_count,
+    };
+    workspace = workspace_mapper.canonicalize_snapshot(&workspace);
+    project_workspace_identities(&mut workspace);
+    let workspace = canonicalize_snapshot_provider_metadata(&workspace);
+    let plan = build_change_plan(integrated_head.clone(), &base, &workspace.threads)?;
+    let staged = StagedChangeSet::from_selected(&plan, selected_thread_ids)?;
+    let deleted_thread_ids = plan
+        .changed()
+        .filter(|candidate| {
+            candidate.kind == ChangeKind::Deleted
+                && staged.selected_thread_ids.contains(&candidate.thread_id)
+        })
+        .map(|candidate| candidate.thread_id.clone())
+        .collect::<Vec<_>>();
+    let threads = plan
+        .changed()
+        .filter(|candidate| {
+            candidate.kind != ChangeKind::Deleted
+                && staged.selected_thread_ids.contains(&candidate.thread_id)
+        })
+        .map(|candidate| {
+            candidate
+                .local
+                .clone()
+                .context("staged local thread is missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let contents = threads
+        .iter()
+        .map(|thread| {
+            prepared
+                .contents
+                .get(&thread.thread_id)
+                .cloned()
+                .map(|content| (thread.thread_id.clone(), content))
+                .context("staged local content reference is missing")
+        })
+        .collect::<Result<_>>()?;
+    let snapshot = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: Uuid::now_v7().to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads,
+        warning_count: 0,
+    };
+    let manifest_path = write_v4_snapshot(&snapshot, &contents, repository_root)?;
+    let total_bytes = snapshot
+        .threads
+        .iter()
+        .map(|thread| thread.rollout.byte_length)
+        .sum();
+    sync_core::update_snapshot_metadata(
+        repository_root,
+        &snapshot.snapshot_id,
+        SnapshotMetadata {
+            description: "选择快照".to_string(),
+            tags: vec!["selection".to_string()],
+            pinned: false,
+            automatic: false,
+            scope: SnapshotScope::Selection,
+            base_revision_id: integrated_head,
+            selected_thread_ids: staged.selected_thread_ids.into_iter().collect(),
+            deleted_thread_ids,
+        },
+    )?;
+    Ok(sync_core::SnapshotSummary {
+        snapshot_id: snapshot.snapshot_id,
+        manifest_path,
+        thread_count: snapshot.threads.len(),
+        object_count: contents.len(),
+        total_bytes,
+        warning_count: 0,
+    })
 }
 
 pub fn push_namespace(
@@ -1237,6 +1629,66 @@ fn ensure_active_namespace_clean(
     Ok(())
 }
 
+fn load_revision_root(
+    client: &RemoteClient,
+    revision_id: &str,
+    repository_root: &Path,
+) -> Result<sync_core::RevisionRootV4> {
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let root_path = store.object_path_by_id(StorageObjectKindV4::RevisionRoot, revision_id)?;
+    if root_path.exists() {
+        let root: sync_core::RevisionRootV4 =
+            store.read_json(StorageObjectKindV4::RevisionRoot, revision_id)?;
+        root.validate()?;
+        Ok(root)
+    } else {
+        let root = client.revision_root_v4(revision_id)?;
+        store.store_revision_root(&root)?;
+        Ok(root)
+    }
+}
+
+/// Fetch only immutable revision root and thread descriptors.  In particular,
+/// it does not materialize rollout objects, making it suitable for baseline
+/// comparison and staged Push planning.
+fn download_revision_descriptors(
+    client: &RemoteClient,
+    revision_id: &str,
+    repository_root: &Path,
+    control: &OperationControl,
+) -> Result<(sync_core::RevisionRootV4, Vec<ThreadBundle>, usize)> {
+    let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let root_path = store.object_path_by_id(StorageObjectKindV4::RevisionRoot, revision_id)?;
+    let root_was_cached = root_path.exists();
+    let root = load_revision_root(client, revision_id, repository_root)?;
+    let mut downloaded = usize::from(!root_was_cached);
+    let mut threads = Vec::with_capacity(root.threads.len());
+    for (index, thread_ref) in root.threads.iter().enumerate() {
+        control.check_cancelled()?;
+        control.report(OperationProgress {
+            phase: "staging_baseline".to_string(),
+            message: thread_ref.thread_id.clone(),
+            completed: index as u64,
+            total: Some(root.threads.len() as u64),
+            unit: "threads".to_string(),
+            cancellable: true,
+        });
+        let descriptor_path =
+            store.object_path_by_id(StorageObjectKindV4::Thread, &thread_ref.descriptor_sha256)?;
+        if !descriptor_path.exists() {
+            downloaded += download_unknown_v4_object(
+                client,
+                &store,
+                StorageObjectKindV4::Thread,
+                &thread_ref.descriptor_sha256,
+                control,
+            )? as usize;
+        }
+        threads.push(store.load_descriptor(thread_ref)?.into_bundle(None));
+    }
+    Ok((root, threads, downloaded))
+}
+
 pub(crate) fn download_revision_graph(
     client: &RemoteClient,
     revision_id: &str,
@@ -1244,19 +1696,10 @@ pub(crate) fn download_revision_graph(
     control: &OperationControl,
 ) -> Result<(sync_core::RevisionRootV4, Vec<ThreadBundle>, usize)> {
     let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
-    let mut downloaded = 0;
     let root_path = store.object_path_by_id(StorageObjectKindV4::RevisionRoot, revision_id)?;
-    let root = if root_path.exists() {
-        let root: sync_core::RevisionRootV4 =
-            store.read_json(StorageObjectKindV4::RevisionRoot, revision_id)?;
-        root.validate()?;
-        root
-    } else {
-        let root = client.revision_root_v4(revision_id)?;
-        store.store_revision_root(&root)?;
-        downloaded += 1;
-        root
-    };
+    let root_was_cached = root_path.exists();
+    let root = load_revision_root(client, revision_id, repository_root)?;
+    let mut downloaded = usize::from(!root_was_cached);
     let mut threads = Vec::with_capacity(root.threads.len());
     for (index, thread_ref) in root.threads.iter().enumerate() {
         control.check_cancelled()?;

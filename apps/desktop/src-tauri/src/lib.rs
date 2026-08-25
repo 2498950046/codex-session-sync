@@ -20,10 +20,10 @@ use remote_config::{
     CredentialStore, RemoteProfile, RemoteProfileStore, RemoteProfileSummary, SystemCredentialStore,
 };
 use remote_sync::{
-    LocalSyncContext, download_remote_revision_as_snapshot, download_revision_graph,
-    pull_namespace, push_latest_snapshot_namespace, push_namespace, reapply_workspace_mappings,
-    resolve_pull_conflicts, restore_remote_revision_and_publish, restore_remote_revision_locally,
-    switch_namespace,
+    LocalSyncContext, create_staged_snapshot, download_remote_revision_as_snapshot,
+    download_revision_graph, prepare_staging_plan, pull_namespace, push_latest_snapshot_namespace,
+    push_namespace, push_staged_namespace, reapply_workspace_mappings, resolve_pull_conflicts,
+    restore_remote_revision_and_publish, restore_remote_revision_locally, switch_namespace,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -78,6 +78,18 @@ struct CreateNamespaceMappingRequest {
     match_api_key: bool,
     match_provider: bool,
     match_codex_home: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StagedOperationRequest {
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    base_revision_id: Option<String>,
+    selected_thread_ids: Vec<String>,
+    confirmed_codex_closed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1582,6 +1594,119 @@ fn start_push_job(
 }
 
 #[tauri::command]
+fn start_staging_plan_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+) -> Result<JobSnapshot, String> {
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "staging-plan",
+        true,
+        move |control| {
+            prepare_staging_plan(
+                remote_id,
+                namespace_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
+}
+
+#[tauri::command]
+fn start_staged_push_job(
+    jobs: State<'_, JobManager>,
+    request: StagedOperationRequest,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(request.confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(request.repository_root);
+    let codex_home = resolve_codex_home(request.codex_home);
+    let remote_id = parse_uuid(&request.remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&request.namespace_id).map_err(|error| error.to_string())?;
+    let selected_thread_ids = request
+        .selected_thread_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "staged-push",
+        true,
+        move |control| {
+            push_staged_namespace(
+                remote_id,
+                namespace_id,
+                selected_thread_ids,
+                request.base_revision_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
+}
+
+#[tauri::command]
+fn start_staged_snapshot_job(
+    jobs: State<'_, JobManager>,
+    request: StagedOperationRequest,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(request.confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(request.repository_root);
+    let codex_home = resolve_codex_home(request.codex_home);
+    let remote_id = parse_uuid(&request.remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&request.namespace_id).map_err(|error| error.to_string())?;
+    let selected_thread_ids = request
+        .selected_thread_ids
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "staged-snapshot",
+        true,
+        move |control| {
+            create_staged_snapshot(
+                remote_id,
+                namespace_id,
+                selected_thread_ids,
+                request.base_revision_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
+}
+
+#[tauri::command]
 fn start_latest_snapshot_push_job(
     jobs: State<'_, JobManager>,
     repository_root: Option<String>,
@@ -2363,6 +2488,9 @@ pub fn run() {
             delete_workspace_mapping,
             get_remote_namespace_status,
             start_push_job,
+            start_staging_plan_job,
+            start_staged_push_job,
+            start_staged_snapshot_job,
             start_latest_snapshot_push_job,
             start_pull_job,
             start_conflict_resolution_job,

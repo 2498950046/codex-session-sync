@@ -618,6 +618,20 @@ body[data-settings-tab="snapshots"] .advanced-fold > summary { display: none; }
 .confirmation-details div { min-width: 0; display: grid; grid-template-columns: 75px minmax(0, 1fr); gap: 8px; }
 .confirmation-details dt { color: var(--text-muted); font-size: 9px; }
 .confirmation-details dd { margin: 0; overflow: hidden; font-size: 9px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.staging-dialog { width: min(860px, 100%); max-height: calc(100dvh - 48px); display: grid; gap: 13px; overflow: auto; padding: 21px; border: 1px solid var(--border-strong); border-radius: 16px; color: var(--text); background: var(--surface-raised); box-shadow: var(--shadow-lg); }
+.staging-dialog > header, .staging-dialog > footer, .staging-toolbar, .staging-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.staging-dialog h2 { margin: 2px 0 0; font-size: 18px; }
+.staging-dialog header p { margin: 5px 0 0; color: var(--text-secondary); font-size: 11px; }
+.staging-toolbar { padding: 9px 0; border-block: 1px solid var(--border); font-size: 11px; }
+.staging-toolbar > div { display: flex; gap: 7px; }
+.staging-summary { justify-content: flex-start; flex-wrap: wrap; color: var(--text-secondary); font-size: 10px; }
+.staging-summary b { color: var(--text); }
+.staging-body { display: grid; gap: 10px; min-height: 260px; }
+.staging-dialog .folder-entry { grid-template-columns: auto minmax(0, 1fr); }
+.staging-check { display: flex; align-items: center; min-width: 45px; gap: 4px; padding-left: 2px; color: var(--text-muted); font-size: 9px; }
+.staging-thread { grid-template-columns: auto minmax(0, 1fr); cursor: pointer; }
+.staging-thread > input { align-self: start; margin-top: 4px; }
+.staging-dialog > footer { justify-content: flex-end; padding-top: 4px; }
 .workspace-path-modal { width: min(920px, 100%); max-height: calc(100dvh - 48px); display: grid; gap: 14px; overflow-y: auto; padding: 20px; border: 1px solid var(--border-strong); border-radius: 16px; color: var(--text); background: var(--surface-raised); box-shadow: var(--shadow-lg); }
 .workspace-modal-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
 .workspace-modal-heading h2 { margin: 3px 0 0; font-size: 18px; }

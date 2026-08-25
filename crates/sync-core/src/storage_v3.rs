@@ -1207,6 +1207,25 @@ pub struct SnapshotMetadata {
     pub pinned: bool,
     #[serde(default)]
     pub automatic: bool,
+    /// `full` remains the compatible default for snapshots created before
+    /// staged selection existed.  Selection details live beside the immutable
+    /// root so they can be surfaced in history without changing old roots.
+    #[serde(default)]
+    pub scope: SnapshotScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision_id: Option<String>,
+    #[serde(default)]
+    pub selected_thread_ids: Vec<String>,
+    #[serde(default)]
+    pub deleted_thread_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotScope {
+    #[default]
+    Full,
+    Selection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2492,6 +2511,7 @@ mod tests {
                 tags: vec!["manual".to_string()],
                 pinned: true,
                 automatic: false,
+                ..SnapshotMetadata::default()
             },
         )
         .unwrap();

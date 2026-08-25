@@ -397,6 +397,42 @@ pub fn create_local_snapshot_with_control(
         bail!("snapshot creation requires confirmation that Codex is fully closed");
     }
     let repository_root = repository_root.as_ref();
+    let prepared = prepare_workspace_snapshot_with_control(codex_home, repository_root, control)?;
+    let snapshot_id = Uuid::now_v7().to_string();
+    let snapshot = LocalSnapshot {
+        schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: snapshot_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        threads: prepared.threads,
+        warning_count: prepared.warning_count,
+    };
+    control.check_cancelled()?;
+    control.report(OperationProgress::indeterminate(
+        "snapshot_manifest",
+        "正在写入快照清单",
+    ));
+    let manifest_path = write_v4_snapshot(&snapshot, &prepared.contents, repository_root)?;
+
+    Ok(SnapshotSummary {
+        snapshot_id,
+        manifest_path,
+        thread_count: snapshot.threads.len(),
+        object_count: prepared.object_count,
+        total_bytes: prepared.total_bytes,
+        warning_count: snapshot.warning_count,
+    })
+}
+
+/// Normalizes the local workspace into immutable local objects without
+/// creating a user-visible Snapshot root.  The trusted source-object index is
+/// still refreshed, so unchanged rollout files are not read again by the
+/// staging planner or a later Snapshot/Push.
+pub fn prepare_workspace_snapshot_with_control(
+    codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    control: &OperationControl,
+) -> Result<PreparedWorkspaceSnapshot> {
+    let repository_root = repository_root.as_ref();
     let report = scan_codex_home_metadata_with_control(codex_home, control)?;
     initialize_v4_repository(repository_root)?;
     let index_path = source_object_index_path(repository_root);
@@ -475,34 +511,26 @@ pub fn create_local_snapshot_with_control(
         threads.push(bundle);
     }
 
-    let snapshot_id = Uuid::now_v7().to_string();
-    let snapshot = LocalSnapshot {
-        schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
-        snapshot_id: snapshot_id.clone(),
-        created_at: Utc::now().to_rfc3339(),
-        threads,
-        warning_count: report.warnings.len() + normalization_warning_count,
-    };
-    control.check_cancelled()?;
-    control.report(OperationProgress::indeterminate(
-        "snapshot_manifest",
-        "正在写入快照清单",
-    ));
-    let manifest_path = write_v4_snapshot(&snapshot, &contents, repository_root)?;
     atomic_write_source_index_v4(&index_path, &source_index)?;
-
-    Ok(SnapshotSummary {
-        snapshot_id,
-        manifest_path,
-        thread_count: snapshot.threads.len(),
-        object_count: unique_objects.len(),
-        total_bytes: snapshot
-            .threads
+    Ok(PreparedWorkspaceSnapshot {
+        total_bytes: threads
             .iter()
             .map(|thread| thread.rollout.byte_length)
             .sum(),
-        warning_count: snapshot.warning_count,
+        object_count: unique_objects.len(),
+        threads,
+        contents,
+        warning_count: report.warnings.len() + normalization_warning_count,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedWorkspaceSnapshot {
+    pub threads: Vec<ThreadBundle>,
+    pub contents: BTreeMap<String, ContentRefV4>,
+    pub warning_count: usize,
+    pub object_count: usize,
+    pub total_bytes: u64,
 }
 
 pub fn validate_local_snapshot(

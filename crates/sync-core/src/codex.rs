@@ -1132,8 +1132,14 @@ mod tests {
                 "content": [{"type": "output_text", "text": "world"}]
             }
         });
-        assert_eq!(extract_thread_message(&user), Some(("user".to_string(), "hello".to_string())));
-        assert_eq!(extract_thread_message(&assistant), Some(("assistant".to_string(), "world".to_string())));
+        assert_eq!(
+            extract_thread_message(&user),
+            Some(("user".to_string(), "hello".to_string()))
+        );
+        assert_eq!(
+            extract_thread_message(&assistant),
+            Some(("assistant".to_string(), "world".to_string()))
+        );
     }
     use rusqlite::Connection;
     use std::sync::{
