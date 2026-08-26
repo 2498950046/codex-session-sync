@@ -79,7 +79,7 @@ test("ready sync context exposes both directions and process detection gates wri
   const user = userEvent.setup();
   render(<ThemeProvider><MemoryRouter initialEntries={["/sync"]}><App /></MemoryRouter></ThemeProvider>);
 
-  const push = await screen.findByRole("button", { name: "推送" });
+  const push = await screen.findByRole("button", { name: "选择并推送" });
   const pull = screen.getByRole("button", { name: "拉取" });
   expect(push).toBeEnabled();
   expect(pull).toBeEnabled();

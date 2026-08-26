@@ -62,7 +62,7 @@ jobs:
           # 严格按 package-lock.json 安装依赖，然后检查、测试并打包。
           npm ci
           npm run check
-          npm test -- --run
+          npm test
           npm run tauri -- build
       # 整理安装包并生成下载校验文件。
       - name: Stage release assets and checksums
@@ -78,7 +78,7 @@ jobs:
           "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), $installer.Name |
             Set-Content -NoNewline -Encoding ascii (Join-Path $assets 'SHA256SUMS.txt')
       # 先暂存，最后由 github-release job 统一上传到 Release。
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: desktop-release-assets
           path: ${{ runner.temp }}/release-assets
@@ -125,7 +125,7 @@ jobs:
           Image: ${SERVER_IMAGE}:${GITHUB_REF_NAME#v}
           Digest: ${{ steps.build.outputs.digest }}
           EOF
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: server-release-assets
           path: release-assets
@@ -137,7 +137,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       # 下载并合并客户端、服务端 job 暂存的文件。
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: release-assets
           merge-multiple: true

@@ -17,6 +17,17 @@
 
 发布 tag 必须与下列三个版本号完全相同：根目录 `Cargo.toml`、`apps/desktop/package.json`、`apps/desktop/src-tauri/tauri.conf.json`。例如发布 `0.1.0`：
 
+可先运行统一版本工具；不传参数时会提示输入版本号，`-WhatIf` 只预览不写入文件：
+
+```powershell
+cd F:\codex-session-sync
+.\scripts\set-version.ps1
+# 或 .\scripts\set-version.ps1 -Version 0.1.1
+# 或 .\scripts\set-version.ps1 -Version 0.1.1 -WhatIf
+```
+
+该工具还会同步更新发布附件中的 GHCR 镜像示例版本。
+
 ```powershell
 cd F:\codex-session-sync
 git status

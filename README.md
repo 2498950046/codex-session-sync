@@ -154,6 +154,13 @@ npm run check
 npm run build
 npm test -- --run
 ```
+## 打包本地安装包
+
+```powershell
+npx tauri build
+
+
+```
 
 All automated local-write and HTTP integration tests use temporary Codex
 Homes and temporary server data. They do not modify the current machine's
