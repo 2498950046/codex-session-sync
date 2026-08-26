@@ -26,7 +26,7 @@ cd F:\codex-session-sync
 # 或 .\scripts\set-version.ps1 -Version 0.1.1 -WhatIf
 ```
 
-该工具还会同步更新发布附件中的 GHCR 镜像示例版本。
+该工具还会同步更新 `Cargo.lock` 中三个 workspace package 的记录，以及发布附件中的 GHCR 镜像示例版本。
 
 ```powershell
 cd F:\codex-session-sync

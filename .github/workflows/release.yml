@@ -151,5 +151,6 @@ jobs:
         shell: bash
         run: |
           gh release create "$GITHUB_REF_NAME" release-assets/* release-assets/.env.example \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Codex Session Sync ${GITHUB_REF_NAME#v}" \
             --generate-notes

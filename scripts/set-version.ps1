@@ -23,7 +23,8 @@ function New-VersionChange {
     param(
         [Parameter(Mandatory)] [string]$RelativePath,
         [Parameter(Mandatory)] [string]$Pattern,
-        [Parameter(Mandatory)] [string]$Description
+        [Parameter(Mandatory)] [string]$Description,
+        [int]$ExpectedMatches = 1
     )
 
     $path = Join-Path $repositoryRoot $RelativePath
@@ -34,8 +35,8 @@ function New-VersionChange {
     $original = [System.IO.File]::ReadAllText($path)
     $regex = [regex]::new($Pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
     $matches = $regex.Matches($original)
-    if ($matches.Count -ne 1) {
-        throw "$RelativePath 中应恰好有一个可更新的版本字段，实际找到 $($matches.Count) 个。"
+    if ($matches.Count -ne $ExpectedMatches) {
+        throw "$RelativePath 中应找到 $ExpectedMatches 个可更新的版本字段，实际找到 $($matches.Count) 个。"
     }
 
     $updated = $regex.Replace(
@@ -43,8 +44,7 @@ function New-VersionChange {
         [System.Text.RegularExpressions.MatchEvaluator] {
             param($match)
             "$($match.Groups['prefix'].Value)$Version$($match.Groups['suffix'].Value)"
-        },
-        1
+        }
     )
 
     [pscustomobject]@{
@@ -59,6 +59,7 @@ function New-VersionChange {
 # 每一个替换都先在内存中完成；任何文件不符合预期时不会写入任何文件。
 $changes = @(
     New-VersionChange -RelativePath "Cargo.toml" -Description "Rust workspace" -Pattern '(?s)(?<prefix>^\[workspace\.package\].*?^version\s*=\s*")[^"]+(?<suffix>")'
+    New-VersionChange -RelativePath "Cargo.lock" -Description "Rust lockfile" -ExpectedMatches 3 -Pattern '(?s)(?<prefix>^\[\[package\]\]\r?\nname = "(?:codex-session-sync-desktop|sync-core|sync-server)"\r?\nversion = ")[^"]+(?<suffix>")'
     New-VersionChange -RelativePath "apps/desktop/package.json" -Description "Desktop npm package" -Pattern '(?<prefix>^\s*"version"\s*:\s*")[^"]+(?<suffix>")'
     New-VersionChange -RelativePath "apps/desktop/src-tauri/tauri.conf.json" -Description "Tauri bundle" -Pattern '(?<prefix>^\s*"version"\s*:\s*")[^"]+(?<suffix>")'
     New-VersionChange -RelativePath "deploy/server/.env.ghcr.example" -Description "GHCR deployment example" -Pattern '(?<prefix>^SYNC_SERVER_IMAGE=ghcr\.io/[^/\r\n]+/codex-session-sync-server:)[^\r\n]+(?<suffix>\r?$)'
