@@ -718,6 +718,11 @@ pub fn push_staged_namespace(
     let plan = build_change_plan(integrated_head.clone(), &base, &workspace.threads)?;
     let staged = StagedChangeSet::from_selected(&plan, selected_thread_ids)?;
 
+    // Preserve the exact staged intent before publishing. Unlike the working
+    // object cache, this writes a Snapshot Root that is visible in local
+    // history and remains recoverable if the network commit later fails.
+    store_staged_selection_snapshot(&plan, &staged, &prepared.contents, repository_root)?;
+
     let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
     let mut staged_refs = Vec::new();
     for candidate in plan
@@ -818,6 +823,80 @@ pub fn push_staged_namespace(
             created_objects: upload.created_objects,
             max_concurrency: upload.max_concurrency,
         }),
+    })
+}
+
+fn store_staged_selection_snapshot(
+    plan: &sync_core::ChangePlan,
+    staged: &StagedChangeSet,
+    contents: &BTreeMap<String, sync_core::ContentRefV4>,
+    repository_root: &Path,
+) -> Result<sync_core::SnapshotSummary> {
+    let deleted_thread_ids = plan
+        .changed()
+        .filter(|candidate| {
+            candidate.kind == ChangeKind::Deleted
+                && staged.selected_thread_ids.contains(&candidate.thread_id)
+        })
+        .map(|candidate| candidate.thread_id.clone())
+        .collect::<Vec<_>>();
+    let threads = plan
+        .changed()
+        .filter(|candidate| {
+            candidate.kind != ChangeKind::Deleted
+                && staged.selected_thread_ids.contains(&candidate.thread_id)
+        })
+        .map(|candidate| {
+            candidate
+                .local
+                .clone()
+                .context("staged local thread is missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected_contents = threads
+        .iter()
+        .map(|thread| {
+            contents
+                .get(&thread.thread_id)
+                .cloned()
+                .map(|content| (thread.thread_id.clone(), content))
+                .context("staged local content reference is missing")
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let snapshot = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: Uuid::now_v7().to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads,
+        warning_count: 0,
+    };
+    let manifest_path = write_v4_snapshot(&snapshot, &selected_contents, repository_root)?;
+    let total_bytes = snapshot
+        .threads
+        .iter()
+        .map(|thread| thread.rollout.byte_length)
+        .sum();
+    sync_core::update_snapshot_metadata(
+        repository_root,
+        &snapshot.snapshot_id,
+        SnapshotMetadata {
+            description: "选择推送快照".to_string(),
+            tags: vec!["selection".to_string(), "push".to_string()],
+            pinned: false,
+            automatic: true,
+            scope: SnapshotScope::Selection,
+            base_revision_id: plan.base_revision_id.clone(),
+            selected_thread_ids: staged.selected_thread_ids.iter().cloned().collect(),
+            deleted_thread_ids,
+        },
+    )?;
+    Ok(sync_core::SnapshotSummary {
+        snapshot_id: snapshot.snapshot_id,
+        manifest_path,
+        thread_count: snapshot.threads.len(),
+        object_count: selected_contents.len(),
+        total_bytes,
+        warning_count: 0,
     })
 }
 

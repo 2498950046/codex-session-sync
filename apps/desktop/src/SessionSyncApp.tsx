@@ -120,6 +120,23 @@ function StatusBadge({ tone = "neutral", children }: { tone?: "neutral" | "succe
   return <span className={`status-badge ${tone}`}>{children}</span>;
 }
 
+function syncOutcomeLabel(kind: SyncReport["kind"]): string {
+  return {
+    pushed: "已推送",
+    pulled: "已拉取",
+    merged: "已合并",
+    switched: "已切换",
+    remapped: "已重映射",
+    no_changes: "无需同步",
+    conflict: "需要处理冲突",
+  }[kind];
+}
+
+function syncOutcomeTone(kind: SyncReport["kind"]): "neutral" | "success" | "warning" {
+  if (kind === "conflict") return "warning";
+  return kind === "no_changes" ? "neutral" : "success";
+}
+
 function FolderPager({ page, pageCount, total, onChange }: { page: number; pageCount: number; total: number; onChange: (page: number) => void }) {
   return <div className="session-pagination"><button className="button secondary small" onClick={() => onChange(Math.max(1, page - 1))} disabled={page <= 1}>上一页</button><span>第 {page} / {pageCount} 页 · {total} 条</span><button className="button secondary small" onClick={() => onChange(Math.min(pageCount, page + 1))} disabled={page >= pageCount}>下一页</button></div>;
 }
@@ -514,7 +531,7 @@ export default function SessionSyncApp() {
   const [snapshotTrash, setSnapshotTrash] = useState<SnapshotTrashEntry[]>([]);
   const [remoteHistoryTrash, setRemoteHistoryTrash] = useState<RemoteHistoryTrashOperation[]>([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
-  const [historySource, setHistorySource] = useState<"local" | "remote" | "recovery" | "trash" | "backup">("local");
+  const [historySource, setHistorySource] = useState<"all" | "local" | "remote" | "recovery" | "trash" | "backup">("all");
   const previewKind = import.meta.env.DEV ? new URLSearchParams(window.location.search).get("preview") : null;
   const [settingsTab, setSettingsTab] = useState<"local" | "remote" | "advanced" | "project" | "provider" | "snapshots">(previewKind === "mapping" ? "advanced" : "local");
   useEffect(() => {
@@ -884,6 +901,11 @@ export default function SessionSyncApp() {
   }, [location.pathname, repositoryRoot, selectedRemoteId, selectedNamespaceId]);
 
   useEffect(() => {
+    if (!historyOpen) return;
+    void refreshHistory("正在刷新完整版本图谱…");
+  }, [historyOpen]);
+
+  useEffect(() => {
     setConflictChoices({});
     setPendingWorkspaceSync(null);
     setWorkspaceSetupMessage(null);
@@ -992,6 +1014,7 @@ export default function SessionSyncApp() {
       if (synced.checkout) setJournalPath(synced.checkout.journalPath);
       await refreshNamespaces();
       await refreshNamespaceStatus();
+      if (completed.kind === "push" || completed.kind === "staged-push") await refreshHistory();
       if (completed.kind !== "push" && completed.kind !== "staged-push") {
         const scanned = await invoke<JobSnapshot>("start_scan_job", { codexHome: codexHome.trim() });
         setJob(scanned);
@@ -1854,11 +1877,12 @@ export default function SessionSyncApp() {
   </section> : <section className="surface empty-card"><CircleHelp size={28} /><h3>请选择同步目标</h3><p>先配置远端服务器，然后选择或创建一个命名空间。</p><button className="button primary" onClick={() => navigate("/settings")}>前往设置</button></section>;
 
   const syncResultPanel = syncReport ? <section className="surface sync-result-panel">
-    <div className="section-title"><div><span className="overline">本次运行</span><h3>最近同步结果</h3></div><StatusBadge tone={syncReport.kind === "conflict" ? "warning" : "success"}>{syncReport.kind}</StatusBadge></div>
+    <div className="section-title"><div><span className="overline">本次运行</span><h3>最近同步结果</h3></div><StatusBadge tone={syncOutcomeTone(syncReport.kind)}>{syncOutcomeLabel(syncReport.kind)}</StatusBadge></div>
     <div className="result-summary-grid">
       <article><span>Head</span><CopyCode value={syncReport.head ?? "无 Head"} compact /><small>{syncReport.threadCount} 个会话</small></article>
       <article><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.pushMetrics ? `${formatBytes(syncReport.pushMetrics.transferredBytes)} · ${(syncReport.pushMetrics.uploadMs / 1000).toFixed(1)} 秒 · ${syncReport.pushMetrics.maxConcurrency} 路并发` : syncReport.checkout ? "已创建本地备份" : "无需本地 checkout"}</small></article>
     </div>
+    {syncReport.kind === "no_changes" && <div className="inline-alert"><Check size={17} /><span>本地与远端 Head 的语义内容已经一致；本次没有上传对象，也没有创建新的远端 Revision。</span></div>}
     {syncReport.conflicts.length > 0 && activeConflicts.length === 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><div><strong>冲突上下文已经变化</strong><span>请切回产生冲突的 Home、远端和命名空间后重新拉取。</span></div></div>}
     {activeConflicts.length > 0 && <div className="conflict-workbench modern-conflicts">
       <div className="conflict-summary"><div><strong>需要解决 {activeConflicts.length} 个同线程冲突</strong><span>选择与基础、本地和远端内容指纹绑定；内容改变后旧选择会被拒绝。</span></div><StatusBadge tone="warning">{resolvedConflictCount} / {activeConflicts.length} 已选择</StatusBadge></div>
@@ -2045,10 +2069,11 @@ export default function SessionSyncApp() {
     labels: index === 0 ? ["HEAD"] : [],
     kind: "remote",
   }));
-  const syncVersionRows: VersionRow[] = [
-    ...localVersionRows.slice(0, 3),
+  const allVersionRows: VersionRow[] = [
+    ...localVersionRows,
     ...remoteVersionRows,
   ].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const syncVersionRows = allVersionRows;
   const selectedLocalSnapshot = localSnapshots.find((item) => item.snapshotId === selectedHistoryId) ?? null;
   const selectedRemoteRevision = remoteRevisions.find((item) => item.revisionId === selectedHistoryId) ?? null;
   const backupCategories: LocalBackupItem["category"][] = ["checkout", "import", "workspace_cleanup", "provider_sync", "other"];
@@ -2057,6 +2082,7 @@ export default function SessionSyncApp() {
     <section className="history-workbench surface">
       <aside className="history-tree">
         <strong>来源</strong>
+        <button className={historySource === "all" ? "active" : ""} onClick={() => { setHistorySource("all"); setSelectedHistoryId(null); }}><ArchiveRestore size={15} />所有 <b>{allVersionRows.length}</b></button>
         <button className={historySource === "local" ? "active" : ""} onClick={() => { setHistorySource("local"); setSelectedHistoryId(null); }}><Database size={15} />本机 <b>{localSnapshots.length}</b></button>
         <button className={historySource === "remote" ? "active" : ""} onClick={() => { setHistorySource("remote"); setSelectedHistoryId(null); }} disabled={!selectedNamespaceId}><Server size={15} />{selectedNamespace?.displayName ?? "远端命名空间"} <b>{remoteRevisions.length}</b></button>
         <button className={historySource === "recovery" ? "active" : ""} onClick={() => { setHistorySource("recovery"); setSelectedHistoryId(null); }}><RotateCcw size={15} />操作恢复 <b>{recoveryPoints.filter((point) => point.requiresAttention).length}</b></button>
@@ -2064,7 +2090,8 @@ export default function SessionSyncApp() {
         <button className={historySource === "backup" ? "active" : ""} onClick={() => { setHistorySource("backup"); setSelectedHistoryId(null); }}><ArchiveRestore size={15} />备份 <b>{localBackups.length}</b></button>
       </aside>
       <div className="history-main">
-        <div className="history-toolbar"><strong>{historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : historySource === "trash" ? "可恢复删除" : "本地备份"}</strong>{historySource === "trash" && !historyLoading ? <div className="button-row"><button className="button danger small" onClick={() => void requestLocalTrashPurge([], true)} disabled={snapshotTrash.length === 0}>清空本地</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([], true)} disabled={!selectedNamespaceId || remoteHistoryTrash.every((entry) => entry.state !== "active")}>清空远端</button></div> : historySource === "backup" && !historyLoading ? <div className="button-row"><button className="button secondary small" onClick={() => setSelectedBackupIds(new Set(localBackups.filter((backup) => backup.deletable).map((backup) => backup.id)))} disabled={localBackups.every((backup) => !backup.deletable)}>全选可删除</button><button className="button danger small" onClick={requestBackupDeletion} disabled={selectedBackupIds.size === 0}>删除选中</button></div> : <span>{historyLoading ? historyLoadingLabel : "按创建时间倒序"}</span>}</div>
+        <div className="history-toolbar"><strong>{historySource === "all" ? "全部版本图谱" : historySource === "local" ? "本地快照" : historySource === "remote" ? "远端 Revision" : historySource === "recovery" ? "操作恢复点" : historySource === "trash" ? "可恢复删除" : "本地备份"}</strong>{historySource === "trash" && !historyLoading ? <div className="button-row"><button className="button danger small" onClick={() => void requestLocalTrashPurge([], true)} disabled={snapshotTrash.length === 0}>清空本地</button><button className="button danger small" onClick={() => requestRemoteTrashPurge([], true)} disabled={!selectedNamespaceId || remoteHistoryTrash.every((entry) => entry.state !== "active")}>清空远端</button></div> : historySource === "backup" && !historyLoading ? <div className="button-row"><button className="button secondary small" onClick={() => setSelectedBackupIds(new Set(localBackups.filter((backup) => backup.deletable).map((backup) => backup.id)))} disabled={localBackups.every((backup) => !backup.deletable)}>全选可删除</button><button className="button danger small" onClick={requestBackupDeletion} disabled={selectedBackupIds.size === 0}>删除选中</button></div> : <span>{historyLoading ? historyLoadingLabel : "按创建时间倒序"}</span>}</div>
+        {historySource === "all" && <VersionGraphTable rows={allVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "local" && <VersionGraphTable rows={localVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "remote" && <VersionGraphTable rows={remoteVersionRows} loadingLabel={historyLoading ? historyLoadingLabel : null} selectedId={selectedHistoryId} onSelect={(row) => setSelectedHistoryId(row.id)} />}
         {historySource === "recovery" && (historyLoading ? <HistoryLoading label={historyLoadingLabel} /> : <div className="trash-list">{recoveryPoints.map((point) => <article key={point.operationId} className={point.requiresAttention ? "requires-attention" : ""}><div><strong>{point.kind === "checkout" ? "语义切换" : point.kind === "provider_sync" ? "Provider 同步" : "增量导入"} · {point.status}</strong><span>{point.updatedAt ? new Date(point.updatedAt).toLocaleString("zh-CN") : point.journalPath}</span></div>{point.requiresAttention && <button className="button warning small" onClick={() => { setJournalPath(point.journalPath); setConfirmation({ title: "恢复未完成操作", description: <p>将根据 Journal 和备份重新校验后恢复。Codex 必须完全退出。</p>, confirmLabel: "确认恢复", tone: "warning", onConfirm: () => start("start_recovery_job", { journalPath: point.journalPath, confirmedCodexClosed: true }) }); }} disabled={!canWrite || busy}><RotateCcw size={14} />处理恢复</button>}</article>)}{recoveryPoints.length === 0 && <div className="version-log-empty">没有发现操作恢复点</div>}</div>)}
@@ -2089,7 +2116,7 @@ export default function SessionSyncApp() {
       <Route path="/overview" element={<div className="page-stack">
         <PageIntro title="欢迎使用 Codex Session Sync" description="通过自托管服务器，在多台电脑之间安全同步 Codex 会话。" action={<button className="button primary" onClick={() => navigate(setupComplete ? "/sync" : setupSteps.find((step) => !step.ready)?.route ?? "/sync")}>{setupComplete ? "开始同步" : "继续配置"}<ArrowRight size={16} /></button>} />
         <section className={`surface readiness-card ${setupComplete ? "complete" : ""}`}><div className="readiness-heading"><div><span className="overline">当前状态</span><h3>{setupComplete ? "同步环境已就绪" : "完成以下配置即可开始"}</h3><p>{workflowNextStep}</p></div><StatusBadge tone={setupComplete ? "success" : "warning"}>{setupComplete ? "准备完成" : `${setupSteps.filter((step) => step.ready).length} / ${setupSteps.length}`}</StatusBadge></div><div className="setup-steps">{setupSteps.map((step, index) => <button key={step.label} type="button" onClick={() => navigate(step.route)}><span className={`step-index ${step.ready ? "ready" : ""}`}>{step.ready ? <Check size={15} /> : index + 1}</span><span><strong>{step.label}</strong><small title={step.detail}>{step.detail}</small></span><ChevronRight size={16} /></button>)}</div></section>
-        <section className="overview-grid"><article className="surface overview-card"><div className="section-title"><h3>当前同步上下文</h3><button className="text-button" onClick={() => navigate("/sync")}>查看同步</button></div><dl className="summary-list"><div><dt>Codex Home</dt><dd title={codexHome}>{codexHome || "未设置"}</dd></div><div><dt>远端服务器</dt><dd>{selectedProfile?.displayName ?? "未选择"}</dd></div><div><dt>命名空间</dt><dd>{selectedNamespace?.displayName ?? "未选择"}</dd></div></dl></article><article className="surface overview-card"><div className="section-title"><h3>本机会话</h3><button className="text-button" onClick={() => navigate("/sessions")}>查看会话</button></div>{report ? <div className="overview-metrics"><div><strong>{report.totalCount}</strong><span>总会话</span></div><div><strong>{formatBytes(report.totalRolloutBytes)}</strong><span>Rollout</span></div><div><strong>{report.warnings.length}</strong><span>警告</span></div></div> : <p className="muted-copy">尚未扫描本机会话。</p>}</article><article className="surface overview-card"><div className="section-title"><h3>最近同步</h3>{syncReport && <StatusBadge tone={syncReport.kind === "conflict" ? "warning" : "success"}>{syncReport.kind}</StatusBadge>}</div>{syncReport ? <div className="latest-sync"><strong>{syncReport.threadCount} 个会话</strong><CopyCode value={syncReport.head ?? "无 Head"} compact /><span>↑ {syncReport.uploadedObjects} · ↓ {syncReport.downloadedObjects}</span></div> : <p className="muted-copy">当前运行尚无同步结果。</p>}</article></section>
+        <section className="overview-grid"><article className="surface overview-card"><div className="section-title"><h3>当前同步上下文</h3><button className="text-button" onClick={() => navigate("/sync")}>查看同步</button></div><dl className="summary-list"><div><dt>Codex Home</dt><dd title={codexHome}>{codexHome || "未设置"}</dd></div><div><dt>远端服务器</dt><dd>{selectedProfile?.displayName ?? "未选择"}</dd></div><div><dt>命名空间</dt><dd>{selectedNamespace?.displayName ?? "未选择"}</dd></div></dl></article><article className="surface overview-card"><div className="section-title"><h3>本机会话</h3><button className="text-button" onClick={() => navigate("/sessions")}>查看会话</button></div>{report ? <div className="overview-metrics"><div><strong>{report.totalCount}</strong><span>总会话</span></div><div><strong>{formatBytes(report.totalRolloutBytes)}</strong><span>Rollout</span></div><div><strong>{report.warnings.length}</strong><span>警告</span></div></div> : <p className="muted-copy">尚未扫描本机会话。</p>}</article><article className="surface overview-card"><div className="section-title"><h3>最近同步</h3>{syncReport && <StatusBadge tone={syncOutcomeTone(syncReport.kind)}>{syncOutcomeLabel(syncReport.kind)}</StatusBadge>}</div>{syncReport ? <div className="latest-sync"><strong>{syncReport.threadCount} 个会话</strong><CopyCode value={syncReport.head ?? "无 Head"} compact /><span>↑ {syncReport.uploadedObjects} · ↓ {syncReport.downloadedObjects}</span></div> : <p className="muted-copy">当前运行尚无同步结果。</p>}</article></section>
       </div>} />
       <Route path="/sync" element={<div className="page-stack compact-stack">
         <PageIntro title="同步会话" description="按步骤完成：① 选择同步目标 → ② 选择方向 → ③ 处理冲突 → ④ 需要时查看历史与恢复。" />
