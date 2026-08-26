@@ -139,6 +139,9 @@ jobs:
       # 下载并合并客户端、服务端 job 暂存的文件。
       - uses: actions/download-artifact@v6
         with:
+          # build-push-action 还会创建 *.dockerbuild 构建记录；它们不是
+          # Release 附件，不能让下载动作把它们也下载并解压。
+          pattern: "*-release-assets"
           path: release-assets
           merge-multiple: true
       # 用 GitHub CLI 创建 Release，并上传所有发布附件。
