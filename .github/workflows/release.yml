@@ -1,0 +1,152 @@
+name: Release
+
+# 只有推送以 v 开头的版本 tag 时才发布，例如 v0.1.0。
+on:
+  push:
+    tags:
+      - "v*"
+
+# Release job 创建 GitHub Release；server-image job 发布对应版本的 GHCR 镜像。
+permissions:
+  # 创建 Release 需要写 contents，推送 Docker 镜像需要写 packages。
+  contents: write
+  packages: write
+
+# 服务端镜像的基础地址，版本号会在后面自动追加。
+env:
+  SERVER_IMAGE: ghcr.io/${{ github.repository_owner }}/codex-session-sync-server
+
+jobs:
+  # 发布前确认 tag 与项目中的三个版本号一致。
+  verify-version:
+    runs-on: ubuntu-24.04
+    steps:
+      # 把仓库代码下载到 GitHub runner。
+      - uses: actions/checkout@v4
+      # 版本检查脚本需要 Node.js 读取 JSON 文件。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Require the tag and application versions to match
+        shell: bash
+        run: |
+          set -euo pipefail
+          # v0.1.0 去掉开头的 v，得到 0.1.0。
+          expected="${GITHUB_REF_NAME#v}"
+          # 分别读取 Cargo、前端和 Tauri 配置中的版本号。
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          package_version="$(node -p "require('./apps/desktop/package.json').version")"
+          tauri_version="$(node -p "require('./apps/desktop/src-tauri/tauri.conf.json').version")"
+          # 任意一个版本不一致都会让本 job 失败并停止发布。
+          test "$expected" = "$cargo_version"
+          test "$expected" = "$package_version"
+          test "$expected" = "$tauri_version"
+
+  # 在 Windows runner 上构建 NSIS 安装包。
+  desktop:
+    # 版本校验通过后才开始构建。
+    needs: verify-version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      # 使用项目要求的 Rust 版本。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Install frontend dependencies and build the installer
+        working-directory: apps/desktop
+        run: |
+          # 严格按 package-lock.json 安装依赖，然后检查、测试并打包。
+          npm ci
+          npm run check
+          npm test -- --run
+          npm run tauri -- build
+      # 整理安装包并生成下载校验文件。
+      - name: Stage release assets and checksums
+        shell: pwsh
+        run: |
+          $assets = Join-Path $env:RUNNER_TEMP 'release-assets'
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          # Tauri 的 NSIS 安装包应位于这个目录。
+          $installer = Get-ChildItem 'target\release\bundle\nsis\*-setup.exe' | Select-Object -First 1
+          if ($null -eq $installer) { throw 'NSIS installer was not produced.' }
+          Copy-Item -LiteralPath $installer.FullName -Destination $assets
+          $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
+          "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), $installer.Name |
+            Set-Content -NoNewline -Encoding ascii (Join-Path $assets 'SHA256SUMS.txt')
+      # 先暂存，最后由 github-release job 统一上传到 Release。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+
+  # 在 Linux runner 上构建并推送服务端 Docker 镜像到 GHCR。
+  server-image:
+    needs: verify-version
+    runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      # 使用 GitHub Actions 自动提供的 Token 登录 GHCR。
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # 根据 v0.1.0 自动生成镜像标签 0.1.0 及 OCI 元数据。
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.SERVER_IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+      # 使用服务端 Dockerfile 构建，并直接推送到 GHCR。
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/sync-server/Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+      # Release 附带 Compose、环境变量模板和镜像 digest，便于服务器部署。
+      - name: Stage server deployment assets
+        shell: bash
+        run: |
+          mkdir release-assets
+          cp deploy/server/compose.ghcr.yaml release-assets/compose.yaml
+          cp deploy/server/.env.ghcr.example release-assets/.env.example
+          cat > release-assets/server-image.txt <<EOF
+          Image: ${SERVER_IMAGE}:${GITHUB_REF_NAME#v}
+          Digest: ${{ steps.build.outputs.digest }}
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-release-assets
+          path: release-assets
+          include-hidden-files: true
+
+  # 两个构建 job 都成功后，创建最终的 GitHub Release。
+  github-release:
+    needs: [desktop, server-image]
+    runs-on: ubuntu-24.04
+    steps:
+      # 下载并合并客户端、服务端 job 暂存的文件。
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      # 用 GitHub CLI 创建 Release，并上传所有发布附件。
+      - name: Create the GitHub Release and attach desktop/deployment assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* release-assets/.env.example \
+            --title "Codex Session Sync ${GITHUB_REF_NAME#v}" \
+            --generate-notes

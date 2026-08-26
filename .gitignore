@@ -7,6 +7,7 @@
 .env
 .env.*
 !.env.example
+!deploy/server/.env.ghcr.example
 .idea/
 .vscode/
 .DS_Store
