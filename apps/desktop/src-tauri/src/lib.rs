@@ -2421,6 +2421,8 @@ fn resolve_repository_root(value: Option<String>) -> std::path::PathBuf {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(JobManager::default())
         .invoke_handler(tauri::generate_handler![
             get_default_codex_home,
