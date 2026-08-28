@@ -58,13 +58,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - name: Install frontend dependencies and build the installer
         working-directory: apps/desktop
+        env:
+          # The matching public key is embedded in tauri.conf.json. Store the
+          # private key only in this repository's GitHub Actions secrets.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Omit this Actions secret for a passwordless key.
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           # 严格按 package-lock.json 安装依赖，然后检查、测试并打包。
           npm ci
           npm run check
           npm test
           npm run tauri -- build
-      # 整理安装包并生成下载校验文件。
+      # 整理安装包、更新签名和下载校验文件。
       - name: Stage release assets and checksums
         shell: pwsh
         run: |
@@ -73,10 +79,20 @@ jobs:
           # Tauri 的 NSIS 安装包应位于这个目录。
           $installer = Get-ChildItem 'target\release\bundle\nsis\*-setup.exe' | Select-Object -First 1
           if ($null -eq $installer) { throw 'NSIS installer was not produced.' }
+          $signature = Get-Item -LiteralPath "$($installer.FullName).sig" -ErrorAction SilentlyContinue
+          if ($null -eq $signature) { throw 'Tauri updater signature was not produced. Check TAURI_SIGNING_PRIVATE_KEY.' }
           Copy-Item -LiteralPath $installer.FullName -Destination $assets
+          Copy-Item -LiteralPath $signature.FullName -Destination $assets
           $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
           "{0}  {1}" -f $hash.Hash.ToLowerInvariant(), $installer.Name |
             Set-Content -NoNewline -Encoding ascii (Join-Path $assets 'SHA256SUMS.txt')
+          # github-release reads this private staging file after it has generated
+          # the GitHub release notes, then writes the public latest.json asset.
+          [ordered]@{
+            version = $env:GITHUB_REF_NAME.Substring(1)
+            installer = $installer.Name
+            signature = (Get-Content -LiteralPath $signature.FullName -Raw).Trim()
+          } | ConvertTo-Json -Compress | Set-Content -NoNewline -Encoding utf8 (Join-Path $assets 'updater-metadata.json')
       # 先暂存，最后由 github-release job 统一上传到 Release。
       - uses: actions/upload-artifact@v6
         with:
@@ -150,7 +166,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release create "$GITHUB_REF_NAME" release-assets/* release-assets/.env.example \
+          set -euo pipefail
+          assets=()
+          for asset in release-assets/* release-assets/.env.example; do
+            [[ "$(basename "$asset")" == "updater-metadata.json" ]] && continue
+            assets+=("$asset")
+          done
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Codex Session Sync ${GITHUB_REF_NAME#v}" \
             --generate-notes
+      - name: Publish Tauri update metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          metadata='release-assets/updater-metadata.json'
+          version="$(jq -r '.version' "$metadata")"
+          installer="$(jq -r '.installer' "$metadata")"
+          signature="$(jq -r '.signature' "$metadata")"
+          notes="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${installer}"
+          jq -n \
+            --arg version "$version" \
+            --arg notes "$notes" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg url "$url" \
+            --arg signature "$signature" \
+            '{version: $version, notes: $notes, pub_date: $date, platforms: {"windows-x86_64": {url: $url, signature: $signature}}}' \
+            > release-assets/latest.json
+          gh release upload "$GITHUB_REF_NAME" release-assets/latest.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

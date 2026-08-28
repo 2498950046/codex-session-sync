@@ -14,6 +14,7 @@ import {
   CircleHelp,
   Copy,
   Database,
+  Download,
   FolderCog,
   Folder,
   KeyRound,
@@ -26,8 +27,10 @@ import {
   ShieldAlert,
   Sun,
   Trash2,
+  UserRound,
   X,
 } from "lucide-react";
+import desktopPackage from "../package.json";
 import { AppShell } from "./AppShell";
 import { useTheme } from "./theme";
 import type {
@@ -102,7 +105,57 @@ type WorkspacePathEditorProps = {
   onCancel?: () => void;
 };
 
-export type AppRoute = "/overview" | "/sync" | "/sessions" | "/settings";
+export type AppRoute = "/overview" | "/sync" | "/sessions" | "/settings" | "/me";
+
+type AvailableUpdate = {
+  version: string;
+  date: string | null;
+  notes: string | null;
+};
+
+type RuntimeUpdate = {
+  version: string;
+  date?: string;
+  body?: string;
+  downloadAndInstall: (onEvent?: (event: { event: string; data: { contentLength?: number; chunkLength?: number } }) => void) => Promise<void>;
+};
+
+const UPDATE_DISMISS_STORAGE_KEY = "codex-session-sync.dismissed-update-version";
+const PROJECT_URL = "https://github.com/2498950046/codex-session-sync";
+
+function UpdateDetails({ update, currentVersion, progress, onInstall, installing }: {
+  update: AvailableUpdate | null;
+  currentVersion: string;
+  progress: string | null;
+  onInstall: () => void;
+  installing: boolean;
+}) {
+  if (!update) return <div className="update-empty"><Check size={25} /><strong>已是最新版本</strong><span>当前版本 {currentVersion}</span></div>;
+  return <div className="update-details">
+    <div className="update-version-row"><div><span className="overline">发现新版本</span><h3>v{update.version}</h3><p>当前版本 v{currentVersion}{update.date ? ` · 发布于 ${new Date(update.date).toLocaleString("zh-CN")}` : ""}</p></div><StatusBadge tone="success">可更新</StatusBadge></div>
+    <div className="release-notes"><strong>更新内容</strong><p>{update.notes?.trim() || "此版本未提供更新说明，请前往 GitHub Release 查看详情。"}</p></div>
+    {progress && <div className="inline-alert"><RefreshCw size={17} /><span>{progress}</span></div>}
+    <div className="button-row"><button type="button" className="button primary" onClick={onInstall} disabled={installing}><Download size={16} />{installing ? "正在更新…" : "立即更新并重启"}</button></div>
+  </div>;
+}
+
+function UpdatePrompt({ update, currentVersion, onDismiss, onOpenUpdates, onInstall, installing }: {
+  update: AvailableUpdate | null;
+  currentVersion: string;
+  onDismiss: () => void;
+  onOpenUpdates: () => void;
+  onInstall: () => void;
+  installing: boolean;
+}) {
+  if (!update) return null;
+  return <div className="dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !installing) onDismiss(); }}>
+    <section className="update-prompt" role="dialog" aria-modal="true" aria-labelledby="update-prompt-title">
+      <div className="dialog-icon success"><Download size={22} /></div>
+      <div className="dialog-copy"><span className="overline">软件更新</span><h2 id="update-prompt-title">发现新版本 v{update.version}</h2><p>当前版本为 v{currentVersion}。{update.notes?.trim() || "新版本已在 GitHub Releases 发布。"}</p></div>
+      <div className="dialog-actions"><button type="button" className="button secondary" onClick={onDismiss} disabled={installing}>暂不更新</button><button type="button" className="button secondary" onClick={onOpenUpdates} disabled={installing}>查看详情</button><button type="button" className="button primary" onClick={onInstall} disabled={installing}><Download size={15} />{installing ? "下载中…" : "立即更新"}</button></div>
+    </section>
+  </div>;
+}
 
 type ConfirmationRequest = {
   title: string;
@@ -534,6 +587,13 @@ export default function SessionSyncApp() {
   const [historySource, setHistorySource] = useState<"all" | "local" | "remote" | "recovery" | "trash" | "backup">("all");
   const previewKind = import.meta.env.DEV ? new URLSearchParams(window.location.search).get("preview") : null;
   const [settingsTab, setSettingsTab] = useState<"local" | "remote" | "advanced" | "project" | "provider" | "snapshots">(previewKind === "mapping" ? "advanced" : "local");
+  const [myTab, setMyTab] = useState<"home" | "updates">("home");
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
+  const [updateChecking, setUpdateChecking] = useState(false);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updatePromptOpen, setUpdatePromptOpen] = useState(false);
+  const updateRef = useRef<RuntimeUpdate | null>(null);
   useEffect(() => {
     document.body.dataset.settingsTab = location.pathname === "/settings" ? settingsTab : "";
     return () => { delete document.body.dataset.settingsTab; };
@@ -596,6 +656,81 @@ export default function SessionSyncApp() {
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null);
   const providerPreviewInFlight = useRef(false);
+
+  async function checkForUpdate(manual = false) {
+    if (!isTauriRuntime || isDevelopmentPreview) {
+      if (manual) setUpdateMessage("开发预览模式不会连接 GitHub Releases；请在已安装的软件中检查更新。");
+      return;
+    }
+    setUpdateChecking(true);
+    setUpdateMessage(manual ? "正在检查 GitHub Releases…" : null);
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const candidate = await check() as unknown as RuntimeUpdate | null;
+      updateRef.current = candidate;
+      if (!candidate) {
+        setAvailableUpdate(null);
+        setUpdateMessage(`已是最新版本（v${desktopPackage.version}）。`);
+        return;
+      }
+      const summary: AvailableUpdate = {
+        version: candidate.version,
+        date: candidate.date ?? null,
+        notes: candidate.body ?? null,
+      };
+      setAvailableUpdate(summary);
+      setUpdateMessage(`发现新版本 v${summary.version}。`);
+      if (!manual && window.localStorage.getItem(UPDATE_DISMISS_STORAGE_KEY) !== summary.version) setUpdatePromptOpen(true);
+    } catch (reason) {
+      updateRef.current = null;
+      setUpdateMessage(`检查更新失败：${String(reason)}`);
+    } finally {
+      setUpdateChecking(false);
+    }
+  }
+
+  function dismissUpdatePrompt() {
+    if (availableUpdate) window.localStorage.setItem(UPDATE_DISMISS_STORAGE_KEY, availableUpdate.version);
+    setUpdatePromptOpen(false);
+  }
+
+  function openUpdates() {
+    setUpdatePromptOpen(false);
+    setMyTab("updates");
+    navigate("/me");
+  }
+
+  async function installUpdate() {
+    const candidate = updateRef.current;
+    if (!candidate) {
+      setUpdateMessage("更新信息已过期，请重新检查后再安装。");
+      return;
+    }
+    setUpdateInstalling(true);
+    setUpdateMessage("正在下载更新…");
+    try {
+      let downloaded = 0;
+      let total: number | undefined;
+      await candidate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength;
+          setUpdateMessage(total ? `正在下载更新（0 / ${Math.ceil(total / 1024 / 1024)} MB）…` : "正在下载更新…");
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength ?? 0;
+          setUpdateMessage(total ? `正在下载更新（${Math.min(100, Math.round(downloaded / total * 100))}%）…` : "正在下载更新…");
+        } else if (event.event === "Finished") {
+          setUpdateMessage("更新已验证，正在安装并重启…");
+        }
+      });
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (reason) {
+      setUpdateMessage(`更新未完成：${String(reason)}`);
+      setUpdateInstalling(false);
+    }
+  }
+
+  useEffect(() => { void checkForUpdate(); }, []);
 
   const busy = isActive(job) || remoteLoading || providerPreviewLoading;
   const providerPreviewActive = providerPreviewLoading
@@ -2108,7 +2243,7 @@ export default function SessionSyncApp() {
     {storageSummary && <section className="surface storage-summary" aria-label="仓库存储统计"><div><span>仓库占用</span><strong>{formatBytes(storageSummary.repositoryPhysicalBytes)}</strong></div><div><span>活动可达</span><strong>{formatBytes(storageSummary.activePhysicalBytes)}</strong></div><div><span>共享对象</span><strong>{formatBytes(storageSummary.sharedPhysicalBytes)}</strong></div><div><span>回收站保护</span><strong>{formatBytes(storageSummary.trashBytes)}</strong></div><div><span>可释放</span><strong>{formatBytes(storageSummary.reclaimableBytes)}</strong></div><div><span>待清理</span><strong>{formatBytes(storageSummary.gcQuarantineBytes)}</strong></div></section>}
   </div>;
 
-  return <AppShell processes={processes} busy={busy} onRefreshProcesses={() => void refreshProcesses()}>
+  return <AppShell processes={processes} busy={busy} onRefreshProcesses={() => void refreshProcesses()} updateAvailable={Boolean(availableUpdate)} onOpenUpdates={openUpdates}>
     {processes.length > 0 && <div className="global-process-alert" role="status"><AlertTriangle size={18} /><div><strong>检测到 Codex 正在运行</strong><span>扫描和配置仍可使用；同步、导入、恢复和清理暂时禁用。</span><div className="process-chips">{processes.map((process) => <code key={process.pid}>{process.kind} · {process.name} · PID {process.pid}</code>)}</div></div></div>}
     {location.pathname === "/settings" && <div className="settings-tabbar surface" role="tablist" aria-label="设置分类"><button type="button" role="tab" aria-selected={settingsTab === "local"} className={settingsTab === "local" ? "active" : ""} onClick={() => setSettingsTab("local")}>本机与外观</button><button type="button" role="tab" aria-selected={settingsTab === "remote"} className={settingsTab === "remote" ? "active" : ""} onClick={() => setSettingsTab("remote")}>远端与命名空间</button><button type="button" role="tab" aria-selected={settingsTab === "advanced"} className={settingsTab === "advanced" ? "active" : ""} onClick={() => { setSettingsTab("advanced"); setAdvancedOpen(true); }}>自动选择</button><button type="button" role="tab" aria-selected={settingsTab === "project"} className={settingsTab === "project" ? "active" : ""} onClick={() => { setSettingsTab("project"); setAdvancedOpen(true); }}>项目路径</button><button type="button" role="tab" aria-selected={settingsTab === "provider"} className={settingsTab === "provider" ? "active" : ""} onClick={() => { setSettingsTab("provider"); setAdvancedOpen(true); }}>Provider 同步</button><button type="button" role="tab" aria-selected={settingsTab === "snapshots"} className={settingsTab === "snapshots" ? "active" : ""} onClick={() => { setSettingsTab("snapshots"); setAdvancedOpen(true); }}>快照工具</button></div>}
     <Routes>
@@ -2134,6 +2269,7 @@ export default function SessionSyncApp() {
       </div>} />
       <Route path="/sessions" element={<div className="page-stack"><PageIntro title="本机会话" description="扫描会在后台运行，只读取会话和兼容性信息。" action={<button className="button primary" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}><RefreshCw size={16} />重新扫描</button>} />{sessionReportPanel}</div>} />
       <Route path="/settings" element={<div className="page-stack"><PageIntro title="设置" description="配置本机数据位置、远端服务器、命名空间和高级工具。" /><section className="settings-grid"><article className="surface settings-card"><div className="section-title"><div><h3>本机存储</h3><p>路径变化会刷新对应的远端与同步状态。</p></div><Database size={20} /></div><div className="field"><label htmlFor="codex-home-new">Codex Home</label><input id="codex-home-new" value={codexHome} onChange={(event) => setCodexHome(event.target.value)} disabled={busy} /></div><div className="field"><label htmlFor="repository-root-new">本地同步仓库</label><input id="repository-root-new" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} disabled={busy} /></div></article><article className="surface settings-card"><div className="section-title"><div><h3>外观</h3><p>默认跟随操作系统，也可以固定主题。</p></div>{resolvedTheme === "dark" ? <Moon size={20} /> : <Sun size={20} />}</div><div className="theme-options" role="radiogroup" aria-label="主题"><button role="radio" aria-checked={themePreference === "system"} className={themePreference === "system" ? "selected" : ""} onClick={() => setThemePreference("system")}><RefreshCw size={17} /><span><strong>跟随系统</strong><small>当前为{resolvedTheme === "dark" ? "深色" : "浅色"}</small></span></button><button role="radio" aria-checked={themePreference === "light"} className={themePreference === "light" ? "selected" : ""} onClick={() => setThemePreference("light")}><Sun size={17} /><span><strong>浅色</strong><small>始终使用浅色界面</small></span></button><button role="radio" aria-checked={themePreference === "dark"} className={themePreference === "dark" ? "selected" : ""} onClick={() => setThemePreference("dark")}><Moon size={17} /><span><strong>深色</strong><small>始终使用深色界面</small></span></button></div></article></section><section className="surface settings-card remote-settings"><div className="section-title"><div><h3>远端服务器</h3><p>Bearer Token 只保存到操作系统凭据库，前端不会读回明文。</p></div><StatusBadge>{profiles.length} 个配置</StatusBadge></div><div className="profile-tabs">{profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : ""} onClick={() => setSelectedRemoteId(profile.id)} disabled={busy}>{profile.displayName}</button>)}<button onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); setMappingState(null); setWorkspaceMappingState(null); }} disabled={busy}><Plus size={15} />新建远端</button></div><div className="remote-form"><div className="field"><label htmlFor="remote-name-new">配置名称</label><input id="remote-name-new" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div><div className="field"><label htmlFor="remote-url-new">服务器 URL</label><input id="remote-url-new" value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} /></div><div className="field"><label htmlFor="remote-token-new">Bearer Token</label><input id="remote-token-new" type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder={selectedProfile?.credentialConfigured ? "已保存；留空则不修改" : "至少 16 位可见 ASCII 字符"} /></div></div><div className="button-row"><button className="button primary" onClick={() => void saveRemote()} disabled={busy || !remoteName.trim() || !remoteUrl.trim() || (!selectedRemoteId && !remoteToken.trim())}>保存并验证</button><button className="button secondary" onClick={() => void testConnection()} disabled={busy || !selectedRemoteId}>测试连接</button></div>{(selectedProfile?.insecureHttp || remoteUrl.trim().startsWith("http://")) && <div className="inline-alert warning"><AlertTriangle size={17} /><span>当前连接未使用 HTTPS，仅建议在本机或可信内网使用。</span></div>}{connectionMessage && <div className="inline-alert success"><Check size={17} /><span>{connectionMessage}</span></div>}</section><section className="surface settings-card"><div className="section-title"><div><h3>组织会话</h3><p>创建命名空间来分隔不同电脑或用途的会话集合。</p></div><Settings size={20} /></div>{namespacesPanel}</section>{advancedTools}</div>} />
+      <Route path="/me" element={<div className="page-stack my-page"><PageIntro title="我的" description="项目主页、个人资料模板和应用更新。" /><section className="surface my-tabs" role="tablist" aria-label="我的"><button type="button" role="tab" aria-selected={myTab === "home"} className={myTab === "home" ? "active" : ""} onClick={() => setMyTab("home")}><UserRound size={16} />主页</button><button type="button" role="tab" aria-selected={myTab === "updates"} className={myTab === "updates" ? "active" : ""} onClick={() => setMyTab("updates")}><Download size={16} />更新{availableUpdate && <b>1</b>}</button></section>{myTab === "home" ? <section className="my-home-grid"><article className="surface personal-card"><div className="section-title"><div><span className="overline">个人资料模板</span><h3>关于作者</h3><p>请按需要直接修改本页中的占位内容。</p></div><UserRound size={21} /></div><dl className="profile-template"><div><dt>昵称</dt><dd>待填写</dd></div><div><dt>邮箱</dt><dd>待填写@example.com</dd></div><div><dt>个人简介</dt><dd>在这里介绍你自己、项目目标或联系方式。</dd></div><div><dt>其他链接</dt><dd>待填写</dd></div></dl></article><article className="surface project-card"><div className="section-title"><div><span className="overline">开源项目</span><h3>Codex Session Sync</h3><p>跨设备同步 Codex 会话的个人自托管工具。</p></div><Server size={21} /></div><div className="project-address"><span>GitHub 地址</span><CopyCode value={PROJECT_URL} /></div><p className="muted-copy">Release、更新说明和安装包均通过该 GitHub 仓库发布。</p></article></section> : <section className="surface update-card"><div className="section-title"><div><span className="overline">应用更新</span><h3>GitHub Releases</h3><p>更新包会先完成签名验证，验证通过才会安装。</p></div><button type="button" className="button secondary small" onClick={() => void checkForUpdate(true)} disabled={updateChecking || updateInstalling}><RefreshCw size={14} />{updateChecking ? "检查中…" : "手动检查"}</button></div>{updateMessage && !availableUpdate && <div className="inline-alert"><Check size={17} /><span>{updateMessage}</span></div>}<UpdateDetails update={availableUpdate} currentVersion={desktopPackage.version} progress={availableUpdate ? updateMessage : null} onInstall={() => void installUpdate()} installing={updateInstalling} /><div className="project-address update-source"><span>更新源</span><CopyCode value={`${PROJECT_URL}/releases/latest`} /></div></section>}</div>} />
       <Route path="*" element={<Navigate to="/overview" replace />} />
     </Routes>
 
@@ -2153,6 +2289,7 @@ export default function SessionSyncApp() {
     />
     <ConfirmDialog request={confirmation} onClose={() => setConfirmation(null)} />
     <ErrorDialog message={error} onClose={() => setError(null)} />
+    {updatePromptOpen && <UpdatePrompt update={availableUpdate} currentVersion={desktopPackage.version} onDismiss={dismissUpdatePrompt} onOpenUpdates={openUpdates} onInstall={() => void installUpdate()} installing={updateInstalling} />}
     {job && <aside className={`task-center ${jobFailure ? "failed" : ""}`} aria-live="polite"><div className="task-center-heading"><div><span className="overline">{job.kind} · {job.state}</span><strong>{jobFailure ? "任务失败" : job.progress.phase.replaceAll("_", " ")}</strong></div>{!isActive(job) && <button className="icon-button" onClick={() => setJob(null)} aria-label="关闭任务"><X size={17} /></button>}</div><p>{jobFailure ?? job.progress.message}</p><div className={`progress-track ${progressPercent === null ? "indeterminate" : ""}`}><div className="progress-fill" style={{ width: progressPercent === null ? undefined : `${progressPercent}%` }} /></div><div className="task-center-footer"><small>{progressDetail}</small>{isActive(job) && <button className="button danger small" onClick={() => void cancelCurrentJob()} disabled={!job.cancellable || job.state === "cancelling"}>{job.state === "cancelling" ? "正在安全停止…" : job.cancellable ? "取消任务" : "当前阶段不可取消"}</button>}</div></aside>}
   </AppShell>;
 

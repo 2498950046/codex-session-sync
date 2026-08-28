@@ -165,3 +165,17 @@ npx tauri build
 All automated local-write and HTTP integration tests use temporary Codex
 Homes and temporary server data. They do not modify the current machine's
 real `C:\Users\24989\.codex` directory.
+
+## Desktop releases and in-app updates
+
+Pushing a matching version tag such as `v0.1.4` creates a GitHub Release with
+the Windows installer, its SHA-256 checksum, and `latest.json`. Installed
+clients check `latest.json` when they start and can download, verify, install,
+and restart into the new version.
+
+Before creating the first update-enabled release, add the repository Actions
+secret `TAURI_SIGNING_PRIVATE_KEY` with the private key that corresponds to the
+public updater key in `apps/desktop/src-tauri/tauri.conf.json`. Keep this key
+outside Git and back it up securely: replacing it would prevent existing
+installations from trusting later updates. If the key has a password, also add
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
