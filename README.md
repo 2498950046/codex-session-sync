@@ -1,5 +1,7 @@
 # Codex Session Sync
 
+中文文档：[README.zh-CN.md](README.zh-CN.md)
+
 Personal, self-hosted synchronization for Codex conversation data. The
 desktop client is Tauri 2 + React + TypeScript, the local core and server are
 Rust, and the server uses Axum, SQLite metadata, and filesystem object
@@ -154,6 +156,7 @@ npm run check
 npm run build
 npm test -- --run
 ```
+
 ## 打包本地安装包
 
 ```powershell

@@ -34,9 +34,9 @@ use sync_core::{
     SnapshotTrashEntry, SnapshotValidationReport, ThreadConflictResolution, TrackingStore,
     create_local_snapshot, create_local_snapshot_with_control, default_codex_home,
     default_repository_root, detect_codex_processes, import_local_snapshot,
-    import_local_snapshot_with_control, load_thread_messages, mutate_local_thread,
-    preview_provider_sync, quarantine_empty_rollout, recover_checkout_operation,
-    recover_incomplete_operation, scan_codex_home_dashboard,
+    import_local_snapshot_with_control, invalidate_codex_local_thread_catalog,
+    load_thread_messages, mutate_local_thread, preview_provider_sync, quarantine_empty_rollout,
+    recover_checkout_operation, recover_incomplete_operation, scan_codex_home_dashboard,
     scan_codex_home_dashboard_with_control, synchronize_local_provider, validate_local_snapshot,
     validate_local_snapshot_with_control,
 };
@@ -45,7 +45,7 @@ use uuid::Uuid;
 use workspace_mapping::{
     AutomaticWorkspaceMappingResult, WorkspaceCleanupReport, WorkspaceCleanupResult,
     WorkspaceMappingState, WorkspaceMappingStore, WorkspacePathSelection, WorkspacePullPlan,
-    collect_workspace_paths,
+    collect_workspace_paths, remove_empty_codex_projects,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +209,27 @@ async fn mutate_thread(
     tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
         mutate_local_thread(&home, &thread_id, &action).map_err(|error| error.to_string())?;
+        remove_empty_codex_projects(&home).map_err(|error| error.to_string())?;
+        scan_codex_home_dashboard(&home).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn repair_codex_sidebar(
+    jobs: State<'_, JobManager>,
+    codex_home: Option<String>,
+    confirmed_codex_closed: bool,
+) -> Result<ScanDashboardReport, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let home = resolve_codex_home(codex_home);
+    let lease = jobs.try_acquire_codex_home(&home)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        invalidate_codex_local_thread_catalog(&home).map_err(|error| error.to_string())?;
+        remove_empty_codex_projects(&home).map_err(|error| error.to_string())?;
         scan_codex_home_dashboard(&home).map_err(|error| error.to_string())
     })
     .await
@@ -2429,6 +2450,7 @@ pub fn run() {
             get_default_repository_root,
             scan_local_codex,
             mutate_thread,
+            repair_codex_sidebar,
             get_thread_messages,
             quarantine_empty_rollout_file,
             create_snapshot,

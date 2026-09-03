@@ -1110,6 +1110,16 @@ fn replace_databases(
     Ok(())
 }
 
+/// Clear Codex Desktop's rebuildable local sidebar catalogue for one Codex Home.
+///
+/// The catalogue is derived from rollout and thread metadata. It must be
+/// invalidated whenever those authoritative records are changed outside of
+/// Codex Desktop so the next launch does not retain stale sidebar entries.
+pub fn invalidate_codex_local_thread_catalog(codex_home: impl AsRef<Path>) -> Result<()> {
+    let databases = discover_local_thread_catalog_databases(codex_home.as_ref())?;
+    invalidate_local_thread_catalogs(&databases)
+}
+
 pub(crate) fn discover_local_thread_catalog_databases(codex_home: &Path) -> Result<Vec<PathBuf>> {
     let sqlite_home = std::env::var_os("CODEX_SQLITE_HOME")
         .map(PathBuf::from)

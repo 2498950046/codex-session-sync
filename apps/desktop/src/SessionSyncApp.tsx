@@ -2106,8 +2106,31 @@ export default function SessionSyncApp() {
     });
   };
 
+  const requestCodexSidebarRepair = () => {
+    setConfirmation({
+      title: "修复 Codex 侧栏索引",
+      description: <p>会清空 Codex 可自动重建的本机侧栏目录，并移除所有没有活动或归档会话的项目定义；不会删除会话、项目目录或远端数据。请确认已完全退出 Codex。</p>,
+      confirmLabel: "修复侧栏索引",
+      tone: "warning",
+      onConfirm: async () => {
+        setSessionMutating(true);
+        setSessionActionMessage(null);
+        try {
+          const next = await invoke<ScanReport>("repair_codex_sidebar", { codexHome: codexHome.trim(), confirmedCodexClosed: true });
+          setReport(next);
+          setSessionActionMessage("已清空侧栏索引并移除空项目定义；重新打开 Codex 后将显示真实会话。");
+        } catch (reason) {
+          setError(String(reason));
+        } finally {
+          setSessionMutating(false);
+        }
+      },
+    });
+  };
+
   const sessionReportPanel = report ? <>
     {sessionMutating ? <div className="inline-alert session-action-result" role="status"><RefreshCw size={17} /><span>正在更新会话，请勿重复操作…</span></div> : sessionActionMessage && <div className="inline-alert success session-action-result"><Check size={17} /><span>{sessionActionMessage}</span></div>}
+    <div className="button-row"><button className="button secondary small" onClick={requestCodexSidebarRepair} disabled={busy || sessionMutating || !canWrite} title={writeBlockedReason ?? undefined}>修复 Codex 侧栏索引</button></div>
     <section className="metric-grid">
       <article className="metric"><span>活动会话</span><strong>{report.activeCount}</strong></article>
       <article className="metric"><span>已归档</span><strong>{report.archivedCount}</strong></article>

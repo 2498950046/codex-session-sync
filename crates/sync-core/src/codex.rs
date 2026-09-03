@@ -240,6 +240,15 @@ pub fn mutate_local_thread(
     action: &str,
 ) -> Result<()> {
     let home = fs::canonicalize(codex_home.as_ref())?;
+
+    // Codex Desktop keeps a separately rebuilt local-thread catalogue for the
+    // sidebar.  Changing a rollout directly leaves that catalogue pointing at
+    // the old file (or at a now-deleted thread), which makes the sidebar show
+    // a conversation that cannot be opened.  Invalidate it before changing
+    // the authoritative rollout/database state: if invalidation cannot get
+    // the exclusive SQLite lock, no conversation mutation has happened.
+    crate::checkout::invalidate_codex_local_thread_catalog(&home)?;
+
     let report = scan_codex_home_metadata_with_control(&home, &OperationControl::default())?;
     let thread = report
         .threads
@@ -1204,6 +1213,115 @@ mod tests {
         assert_eq!(usage[0].path, "/tmp/db-demo");
         assert_eq!(usage[0].active_count, 1);
         assert_eq!(usage[0].archived_count, 0);
+    }
+
+    #[test]
+    fn local_thread_mutation_invalidates_codex_sidebar_catalog_before_archive() {
+        let temp = tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let thread_id = "thread-1";
+        let rollout = write_rollout(
+            &sessions,
+            "rollout-thread-1.jsonl",
+            json!({"id": thread_id, "cwd": "C:/work/demo"}),
+            "{\"type\":\"event\"}",
+        );
+
+        let source_database = temp.path().join("state_5.sqlite");
+        let connection = Connection::open(&source_database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    archived INTEGER,
+                    rollout_path TEXT,
+                    cwd TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, title, archived, rollout_path, cwd)
+                 VALUES (?1, 'Demo', 0, ?2, 'C:/work/demo')",
+                (thread_id, rollout.to_string_lossy().as_ref()),
+            )
+            .unwrap();
+        drop(connection);
+
+        let catalog_path = temp.path().join("sqlite/codex-dev.db");
+        fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
+        let catalog = Connection::open(&catalog_path).unwrap();
+        catalog
+            .execute_batch(
+                "CREATE TABLE local_thread_catalog (host_id TEXT NOT NULL, thread_id TEXT NOT NULL);
+                 CREATE TABLE local_thread_catalog_sync_state (
+                    host_id TEXT PRIMARY KEY,
+                    watermark_updated_at TEXT,
+                    initial_build_complete INTEGER NOT NULL,
+                    last_full_reconciled_at TEXT
+                 );
+                 CREATE TABLE local_thread_catalog_metadata (
+                    id INTEGER PRIMARY KEY,
+                    catalog_revision INTEGER NOT NULL
+                 );
+                 INSERT INTO local_thread_catalog VALUES ('local', 'thread-1');
+                 INSERT INTO local_thread_catalog VALUES ('ssh-host', 'remote-thread');
+                 INSERT INTO local_thread_catalog_sync_state
+                    VALUES ('local', '2026-08-28T00:00:00Z', 1, '2026-08-28T00:00:00Z');
+                 INSERT INTO local_thread_catalog_metadata VALUES (1, 9);",
+            )
+            .unwrap();
+        drop(catalog);
+
+        mutate_local_thread(temp.path(), thread_id, "archive").unwrap();
+
+        assert!(
+            temp.path()
+                .join("archived_sessions/rollout-thread-1.jsonl")
+                .is_file()
+        );
+        let source = Connection::open(&source_database).unwrap();
+        assert_eq!(
+            source
+                .query_row(
+                    "SELECT archived FROM threads WHERE id = ?1",
+                    [thread_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let catalog = Connection::open(&catalog_path).unwrap();
+        assert_eq!(
+            catalog
+                .query_row(
+                    "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id = 'local'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            catalog
+                .query_row(
+                    "SELECT COUNT(*) FROM local_thread_catalog WHERE host_id = 'ssh-host'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            catalog.query_row(
+                "SELECT initial_build_complete FROM local_thread_catalog_sync_state WHERE host_id = 'local'",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap(),
+            0
+        );
     }
 
     #[test]

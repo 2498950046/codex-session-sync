@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sync_core::{
-    WorkspacePathMapper, WorkspacePathMapping, codex_home_key, scan_codex_home_workspace_usage,
+    WorkspacePathMapper, WorkspacePathMapping, codex_home_key, scan_codex_home,
+    scan_codex_home_workspace_usage,
 };
 use uuid::Uuid;
 
@@ -102,6 +103,50 @@ pub struct WorkspaceCleanupReport {
     pub scanned_roots: Vec<String>,
     pub entries: Vec<WorkspacePathEntry>,
     pub candidates: Vec<WorkspaceCleanupCandidate>,
+}
+
+/// Removes only Codex project definitions whose every configured root has no
+/// active or archived conversation below it. Workspace directories are never
+/// touched by this repair.
+pub fn remove_empty_codex_projects(codex_home: &Path) -> Result<usize> {
+    let Some(global_state) = load_codex_global_state(codex_home)? else {
+        return Ok(0);
+    };
+    // `threads` database rows can outlive their rollout (including after a
+    // failed older cleanup). They are useful diagnostics, but must not keep an
+    // otherwise empty sidebar project alive. Only a valid semantic rollout is
+    // evidence that a project still contains a conversation.
+    let referenced_paths = scan_codex_home(codex_home)?
+        .threads
+        .into_iter()
+        .filter_map(|thread| thread.workspace.source_path)
+        .collect::<Vec<_>>();
+    let selected_paths = global_state
+        .project_paths
+        .iter()
+        .filter(|project| {
+            !referenced_paths
+                .iter()
+                .any(|path| path_is_same_or_child(path, &project.path))
+        })
+        .map(|project| normalize_path_for_match(&project.path))
+        .collect::<BTreeSet<_>>();
+    if selected_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let mut updated = global_state.value.clone();
+    let result = remove_codex_project_paths(&mut updated, &selected_paths)?;
+    if !result.changed {
+        return Ok(0);
+    }
+    let bytes = serde_json::to_vec(&updated)?;
+    replace_file_if_hash_matches(
+        &global_state.path,
+        &sha256_bytes(&global_state.bytes),
+        &bytes,
+    )?;
+    Ok(result.removed_projects)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1547,6 +1592,77 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn empty_project_repair_removes_only_unreferenced_project_definitions() {
+        let directory = tempdir().unwrap();
+        let codex_home = directory.path().join("codex-home");
+        fs::create_dir_all(&codex_home).unwrap();
+        let empty_root = directory.path().join("work/empty");
+        let referenced_root = directory.path().join("work/referenced");
+        let sessions = codex_home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-active-thread.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"active-thread\",\"cwd\":\"{}\"}}}}\n",
+                referenced_root.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let database = Connection::open(codex_home.join("state_5.sqlite")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, archived INTEGER);
+                 INSERT INTO threads VALUES ('stale-thread', 'placeholder', 0);",
+            )
+            .unwrap();
+        database
+            .execute(
+                "UPDATE threads SET cwd = ?1 WHERE id = 'stale-thread'",
+                [empty_root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(database);
+
+        let state = json!({
+            "local-projects": {
+                "empty": { "id": "empty", "name": "empty", "rootPaths": [empty_root] },
+                "referenced": { "id": "referenced", "name": "referenced", "rootPaths": [referenced_root] }
+            },
+            "project-order": ["empty", "referenced"],
+            "selected-project": { "type": "local", "projectId": "empty" },
+            "thread-project-assignments": {
+                "stale-thread": { "projectId": "empty", "cwd": empty_root },
+                "active-thread": { "projectId": "referenced", "cwd": referenced_root }
+            }
+        });
+        fs::write(
+            codex_home.join(".codex-global-state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(remove_empty_codex_projects(&codex_home).unwrap(), 1);
+
+        let updated: Value =
+            serde_json::from_slice(&fs::read(codex_home.join(".codex-global-state.json")).unwrap())
+                .unwrap();
+        assert!(updated["local-projects"].get("empty").is_none());
+        assert!(updated["local-projects"].get("referenced").is_some());
+        assert_eq!(updated["project-order"], json!(["referenced"]));
+        assert!(updated.get("selected-project").is_none());
+        assert!(
+            updated["thread-project-assignments"]
+                .get("stale-thread")
+                .is_none()
+        );
+        assert!(
+            updated["thread-project-assignments"]
+                .get("active-thread")
+                .is_some()
+        );
+    }
 
     #[test]
     fn mappings_are_scoped_and_build_a_bidirectional_mapper() {
