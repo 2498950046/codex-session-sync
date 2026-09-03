@@ -39,6 +39,7 @@ import type {
   CheckoutReport,
   CodexProcess,
   ImportReport,
+  InitialNamespaceMergePlanReport,
   JobSnapshot,
   LocalBackupDeletionResult,
   LocalBackupItem,
@@ -81,7 +82,7 @@ import type {
 } from "./types";
 
 type PendingWorkspaceSync = {
-  command: "start_pull_job" | "start_namespace_switch_job" | "start_workspace_remap_job";
+  command: "start_pull_job" | "start_namespace_switch_job" | "start_initial_namespace_merge_plan_job" | "start_workspace_remap_job";
   payload: Record<string, unknown>;
   plan: WorkspacePullPlan;
 };
@@ -162,6 +163,7 @@ type ConfirmationRequest = {
   description: ReactNode;
   confirmLabel: string;
   tone?: "warning" | "danger";
+  confirmDisabled?: boolean;
   onConfirm: () => void | Promise<void>;
 };
 
@@ -334,7 +336,7 @@ function ConfirmDialog({ request, onClose }: { request: ConfirmationRequest | nu
       <div className="dialog-copy"><h2 id="confirm-dialog-title">{request.title}</h2><div>{request.description}</div></div>
       <div className="dialog-actions">
         <button ref={cancelRef} type="button" className="button secondary" onClick={onClose}>取消</button>
-        <button type="button" className={`button ${request.tone === "danger" ? "danger" : "warning"}`} onClick={() => {
+        <button type="button" className={`button ${request.tone === "danger" ? "danger" : "warning"}`} disabled={request.confirmDisabled} onClick={() => {
           const action = request.onConfirm;
           onClose();
           void action();
@@ -618,6 +620,10 @@ export default function SessionSyncApp() {
   const [stagedThreadIds, setStagedThreadIds] = useState<Set<string>>(new Set());
   const [stagingShowAll, setStagingShowAll] = useState(false);
   const [stagingAction, setStagingAction] = useState<"push" | "snapshot">("push");
+  const [initialMergePlan, setInitialMergePlan] = useState<InitialNamespaceMergePlanReport | null>(null);
+  const [initialMergePlanTargetKey, setInitialMergePlanTargetKey] = useState<string | null>(null);
+  const [retainRecoveryBackup, setRetainRecoveryBackup] = useState<boolean | null>(null);
+  const retainRecoveryBackupRef = useRef<boolean | null>(null);
   const [conflictChoices, setConflictChoices] = useState<Record<string, "local" | "remote">>({});
   const [error, setError] = useState<string | null>(null);
   const [quarantineMessage, setQuarantineMessage] = useState<string | null>(null);
@@ -846,6 +852,10 @@ export default function SessionSyncApp() {
   const activeConflicts = syncReport?.kind === "conflict" && syncReportTargetKey === syncTargetKey
     ? syncReport.conflicts
     : [];
+  const activeInitialMergePlan = initialMergePlanTargetKey === syncTargetKey ? initialMergePlan : null;
+  const initialMergeResolved = activeInitialMergePlan
+    ? activeInitialMergePlan.conflicts.every((conflict) => Boolean(conflictChoices[conflict.conflictId]))
+    : false;
   const resolvedConflictCount = activeConflicts.filter((conflict) => conflictChoices[conflict.conflictId]).length;
   const allConflictsResolved = activeConflicts.length > 0
     && resolvedConflictCount === activeConflicts.length;
@@ -1020,6 +1030,9 @@ export default function SessionSyncApp() {
 
   useEffect(() => {
     setConfirmedReplaceTarget(null);
+    setInitialMergePlan(null);
+    setInitialMergePlanTargetKey(null);
+    setConflictChoices({});
     setWorkspaceCleanupReport(null);
     setWorkspaceCleanupMessage(null);
   }, [codexHome, selectedRemoteId, selectedNamespaceId]);
@@ -1098,6 +1111,12 @@ export default function SessionSyncApp() {
       setStagedThreadIds(new Set());
       setStagingShowAll(false);
     }
+    if (completed.kind === "initial-merge-plan") {
+      setInitialMergePlan(result as InitialNamespaceMergePlanReport);
+      setInitialMergePlanTargetKey(jobSyncTargets.current.get(completed.jobId) ?? syncTargetKey);
+      jobSyncTargets.current.delete(completed.jobId);
+      setConflictChoices({});
+    }
     if (completed.kind === "staged-snapshot") {
       const summary = result as SnapshotSummary;
       setSnapshot(summary);
@@ -1140,12 +1159,16 @@ export default function SessionSyncApp() {
       await refreshNamespaces();
       await refreshHistory();
     }
-    if (["push", "staged-push", "pull", "resolve", "switch", "remap"].includes(completed.kind)) {
+    if (["push", "staged-push", "pull", "resolve", "switch", "initial-merge-apply", "remap"].includes(completed.kind)) {
       const synced = result as SyncReport;
       setSyncReport(synced);
       setSyncReportTargetKey(jobSyncTargets.current.get(completed.jobId) ?? syncTargetKey);
       jobSyncTargets.current.delete(completed.jobId);
       setConflictChoices({});
+      if (completed.kind === "initial-merge-apply") {
+        setInitialMergePlan(null);
+        setInitialMergePlanTargetKey(null);
+      }
       if (synced.checkout) setJournalPath(synced.checkout.journalPath);
       await refreshNamespaces();
       await refreshNamespaceStatus();
@@ -1164,7 +1187,7 @@ export default function SessionSyncApp() {
     try {
       const targetKey = syncTargetKey;
       const started = await invoke<JobSnapshot>(command, payload);
-      if (["start_push_job", "start_staged_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job", "start_workspace_remap_job"].includes(command)) {
+      if (["start_push_job", "start_staged_push_job", "start_pull_job", "start_conflict_resolution_job", "start_namespace_switch_job", "start_initial_namespace_merge_plan_job", "start_initial_namespace_merge_apply_job", "start_workspace_remap_job"].includes(command)) {
         jobSyncTargets.current.set(started.jobId, targetKey);
       }
       setJob(started);
@@ -1416,7 +1439,7 @@ export default function SessionSyncApp() {
   }
 
   async function prepareWorkspacePathsAndStart(
-    command: "start_pull_job" | "start_namespace_switch_job",
+    command: "start_pull_job" | "start_namespace_switch_job" | "start_initial_namespace_merge_plan_job",
     payload: Record<string, unknown>,
   ) {
     if (busy || !selectedRemoteId || !selectedNamespaceId) return;
@@ -1955,6 +1978,36 @@ export default function SessionSyncApp() {
     });
   }
 
+  function chooseRecoveryBackup(value: boolean) {
+    retainRecoveryBackupRef.current = value;
+    setRetainRecoveryBackup(value);
+    setConfirmation((current) => current ? { ...current, confirmDisabled: false } : current);
+  }
+
+  function requestInitialMergeApply() {
+    if (!activeInitialMergePlan || !initialMergeResolved) return;
+    retainRecoveryBackupRef.current = null;
+    setRetainRecoveryBackup(null);
+    setConfirmation({
+      title: `接入并合并“${selectedNamespace?.displayName ?? "目标命名空间"}”`,
+      description: <><p>这会把预览中的合并结果写入本机，并将本机 Tracking 对齐到当前远端 Head。不会创建或修改远端版本；以后需由你单独点击“推送”发布。</p><fieldset><legend>完成后保留可恢复备份？</legend><label><input type="radio" name="initial-merge-backup" onChange={() => chooseRecoveryBackup(true)} /> 是，保留备份</label><label><input type="radio" name="initial-merge-backup" onChange={() => chooseRecoveryBackup(false)} /> 否，完成后不保留备份</label></fieldset></>,
+      confirmLabel: "确认仅合并到本机",
+      tone: "warning",
+      confirmDisabled: retainRecoveryBackup === null,
+      onConfirm: () => void start("start_initial_namespace_merge_apply_job", {
+        ...syncPayload,
+        expectedRemoteHead: activeInitialMergePlan.remoteHead,
+        expectedFingerprint: activeInitialMergePlan.fingerprint,
+        resolutions: activeInitialMergePlan.conflicts.map((conflict) => ({
+          conflictId: conflict.conflictId,
+          threadId: conflict.threadId,
+          choice: conflictChoices[conflict.conflictId],
+        })),
+        retainRecoveryBackup: retainRecoveryBackupRef.current === true,
+      }),
+    });
+  }
+
   function toggleStaged(ids: string[], checked: boolean) {
     setStagedThreadIds((current) => {
       const next = new Set(current);
@@ -2001,21 +2054,27 @@ export default function SessionSyncApp() {
         <button className="button primary action-button" onClick={() => void prepareWorkspacePathsAndStart("start_pull_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowDownToLine size={18} />拉取</button>
       </> : !namespaceStatus.activeNamespaceId && !namespaceStatus.remoteHead ?
         <div className="button-row sync-initial-push-actions"><button className="button primary action-button" onClick={() => void openStaging("push")} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArrowUpFromLine size={18} />选择并初始化推送</button><button className="button secondary action-button" onClick={() => void start("start_latest_snapshot_push_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArchiveRestore size={18} />推送最近一次</button></div> :
-        <button className="button warning action-button wide" onClick={() => setConfirmation({
-          title: `切换到“${selectedNamespace.displayName}”`,
-          description: <><p>应用会先创建备份，再用目标命名空间完整替换本机会话。</p><dl className="confirmation-details"><div><dt>目标</dt><dd>{selectedNamespace.displayName}</dd></div><div><dt>Codex Home</dt><dd>{codexHome}</dd></div></dl></>,
-          confirmLabel: "确认备份并切换",
+        <div className="button-row sync-initial-push-actions"><button className="button warning action-button" onClick={() => {
+          retainRecoveryBackupRef.current = null;
+          setRetainRecoveryBackup(null);
+          setConfirmation({
+            title: `切换到“${selectedNamespace.displayName}”`,
+            description: <><p>目标命名空间会完整替换本机会话；远端不会改动。</p><fieldset><legend>完成后保留可恢复备份？</legend><label><input type="radio" name="switch-backup" onChange={() => chooseRecoveryBackup(true)} /> 是，保留备份</label><label><input type="radio" name="switch-backup" onChange={() => chooseRecoveryBackup(false)} /> 否，完成后不保留备份</label></fieldset><dl className="confirmation-details"><div><dt>目标</dt><dd>{selectedNamespace.displayName}</dd></div><div><dt>Codex Home</dt><dd>{codexHome}</dd></div></dl></>,
+          confirmLabel: "确认并切换",
           tone: "warning",
-          onConfirm: () => prepareWorkspacePathsAndStart("start_namespace_switch_job", { ...syncPayload, confirmedReplaceLocal: true }),
-        })} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><RefreshCw size={18} />切换到此命名空间</button>}
+          confirmDisabled: retainRecoveryBackup === null,
+            onConfirm: () => prepareWorkspacePathsAndStart("start_namespace_switch_job", { ...syncPayload, confirmedReplaceLocal: true, retainRecoveryBackup: retainRecoveryBackupRef.current === true }),
+        });
+        }} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><RefreshCw size={18} />与远端保持一致</button>{!namespaceStatus.activeNamespaceId && namespaceStatus.remoteHead && <button className="button primary action-button" onClick={() => void prepareWorkspacePathsAndStart("start_initial_namespace_merge_plan_job", syncPayload)} disabled={busy || !canWrite} title={writeBlockedReason ?? undefined}><ArchiveRestore size={18} />接入并合并本地会话</button>}</div>}
     </div>
+    {activeInitialMergePlan && <div className="conflict-workbench modern-conflicts initial-merge-preview"><div className="conflict-summary"><div><strong>首次接入合并预览</strong><span>本机 {activeInitialMergePlan.localThreadCount} 个会话 + 远端 {activeInitialMergePlan.remoteThreadCount} 个会话；{activeInitialMergePlan.automaticallyMergedCount} 个无需选择。此操作只改本机。</span></div><StatusBadge tone={activeInitialMergePlan.conflicts.length ? "warning" : "success"}>{activeInitialMergePlan.conflicts.length ? `${activeInitialMergePlan.conflicts.length} 个冲突` : "可直接应用"}</StatusBadge></div>{activeInitialMergePlan.conflicts.length > 0 && <div className="conflict-list">{activeInitialMergePlan.conflicts.map((conflict, index) => { const choice = conflictChoices[conflict.conflictId]; return <article className="conflict-item" key={conflict.conflictId}><header><div><span>冲突 {index + 1}</span><h3>{conflict.title}</h3></div><StatusBadge tone="warning">同 UUID 内容不同</StatusBadge></header><CopyCode value={conflict.threadId} /><div className="conflict-version-grid"><button type="button" className={`version-card selectable-version ${choice === "local" ? "chosen-version" : ""}`} onClick={() => setConflictChoices((current) => ({ ...current, [conflict.conflictId]: "local" }))} aria-pressed={choice === "local"} disabled={busy}><span className="version-label">本地版本</span><ConflictVersionDetails version={conflict.local} /><b>保留本地</b></button><button type="button" className={`version-card selectable-version ${choice === "remote" ? "chosen-version" : ""}`} onClick={() => setConflictChoices((current) => ({ ...current, [conflict.conflictId]: "remote" }))} aria-pressed={choice === "remote"} disabled={busy}><span className="version-label">远端版本</span><ConflictVersionDetails version={conflict.remote} /><b>保留远端</b></button></div></article>; })}</div>}<div className="sticky-submit"><div><strong>{initialMergeResolved ? "预览已确认，可以仅应用到本机" : `还需选择 ${activeInitialMergePlan.conflicts.length - activeInitialMergePlan.conflicts.filter((conflict) => conflictChoices[conflict.conflictId]).length} 项`}</strong><span>远端 Head 不会改变；应用完成后可再单独 Push。</span></div><button className="button primary" onClick={requestInitialMergeApply} disabled={busy || !canWrite || !initialMergeResolved}>应用合并到本机</button></div></div>}
   </section> : <section className="surface empty-card"><CircleHelp size={28} /><h3>请选择同步目标</h3><p>先配置远端服务器，然后选择或创建一个命名空间。</p><button className="button primary" onClick={() => navigate("/settings")}>前往设置</button></section>;
 
   const syncResultPanel = syncReport ? <section className="surface sync-result-panel">
     <div className="section-title"><div><span className="overline">本次运行</span><h3>最近同步结果</h3></div><StatusBadge tone={syncOutcomeTone(syncReport.kind)}>{syncOutcomeLabel(syncReport.kind)}</StatusBadge></div>
     <div className="result-summary-grid">
       <article><span>Head</span><CopyCode value={syncReport.head ?? "无 Head"} compact /><small>{syncReport.threadCount} 个会话</small></article>
-      <article><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.pushMetrics ? `${formatBytes(syncReport.pushMetrics.transferredBytes)} · ${(syncReport.pushMetrics.uploadMs / 1000).toFixed(1)} 秒 · ${syncReport.pushMetrics.maxConcurrency} 路并发` : syncReport.checkout ? "已创建本地备份" : "无需本地 checkout"}</small></article>
+      <article><span>对象传输</span><strong>↑ {syncReport.uploadedObjects} / ↓ {syncReport.downloadedObjects}</strong><small>{syncReport.pushMetrics ? `${formatBytes(syncReport.pushMetrics.transferredBytes)} · ${(syncReport.pushMetrics.uploadMs / 1000).toFixed(1)} 秒 · ${syncReport.pushMetrics.maxConcurrency} 路并发` : syncReport.checkout ? syncReport.checkout.backupRetained ? "已保留本地恢复备份" : "未保留恢复备份" : "无需本地 checkout"}</small></article>
     </div>
     {syncReport.kind === "no_changes" && <div className="inline-alert"><Check size={17} /><span>本地与远端 Head 的语义内容已经一致；本次没有上传对象，也没有创建新的远端 Revision。</span></div>}
     {syncReport.conflicts.length > 0 && activeConflicts.length === 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><div><strong>冲突上下文已经变化</strong><span>请切回产生冲突的 Home、远端和命名空间后重新拉取。</span></div></div>}

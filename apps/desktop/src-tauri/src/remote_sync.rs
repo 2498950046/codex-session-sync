@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use sync_core::repository_object_path;
 use sync_core::{
@@ -17,9 +18,10 @@ use sync_core::{
     StagedChangeSet, StorageObjectKindV4, ThreadBundle, ThreadConflict, ThreadConflictResolution,
     ThreadMergeOutcome, TrackingRecord, TrackingStore, WorkspacePathMapper, build_change_plan,
     canonicalize_snapshot_provider_metadata,
-    checkout_local_snapshot_with_tracking_and_projects_control, compose_staged_thread_refs,
-    create_local_snapshot_with_control, detect_configured_provider, load_local_snapshot,
-    materialize_snapshot_provider_metadata, merge_thread_sets,
+    checkout_local_snapshot_with_tracking_and_projects_control,
+    checkout_local_snapshot_with_tracking_and_projects_control_with_backup_retention,
+    compose_staged_thread_refs, create_local_snapshot_with_control, detect_configured_provider,
+    load_local_snapshot, materialize_snapshot_provider_metadata, merge_thread_sets,
     prepare_workspace_snapshot_with_control, remote_thread_view, resolve_thread_sets,
     semantic_thread_hash, store_local_snapshot, write_v4_snapshot,
 };
@@ -301,6 +303,32 @@ pub struct SyncReport {
     pub checkout: Option<CheckoutReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_metrics: Option<PushMetrics>,
+}
+
+/// A read-only preview used when a Codex Home joins a populated namespace for
+/// the first time.  It deliberately has no common base: absence on either
+/// side is never interpreted as a deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialNamespaceMergePlanReport {
+    pub namespace_id: Uuid,
+    pub remote_head: String,
+    pub local_thread_count: usize,
+    pub remote_thread_count: usize,
+    pub merged_thread_count: usize,
+    pub automatically_merged_count: usize,
+    pub conflicts: Vec<ThreadConflict>,
+    pub fingerprint: String,
+}
+
+struct InitialNamespaceMergePreparation {
+    remote_head: String,
+    remote_epoch: u64,
+    local: LocalSnapshot,
+    remote_threads: Vec<ThreadBundle>,
+    merged: ThreadMergeOutcome,
+    downloaded: usize,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1548,12 +1576,228 @@ fn apply_prepared_pull(
     )
 }
 
+/// Preview a first attachment without changing the Codex Home or the remote.
+/// A target with prior Tracking is intentionally rejected: that case has a
+/// known common base and must use the ordinary Pull/switch workflow instead.
+pub fn prepare_initial_namespace_merge(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<InitialNamespaceMergePlanReport> {
+    let prepared =
+        prepare_initial_namespace_merge_internal(remote_id, namespace_id, client, context)?;
+    Ok(InitialNamespaceMergePlanReport {
+        namespace_id,
+        remote_head: prepared.remote_head,
+        local_thread_count: prepared.local.threads.len(),
+        remote_thread_count: prepared.remote_threads.len(),
+        merged_thread_count: prepared.merged.threads.len() + prepared.merged.conflicts.len(),
+        automatically_merged_count: prepared.merged.threads.len(),
+        conflicts: prepared.merged.conflicts,
+        fingerprint: prepared.fingerprint,
+    })
+}
+
+/// Rebuild the read-only preview inputs, validate every displayed choice, and
+/// then apply only the local merged result.  This function never commits a
+/// remote Revision.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_initial_namespace_merge(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    expected_remote_head: &str,
+    expected_fingerprint: &str,
+    resolutions: &[ThreadConflictResolution],
+    retain_recovery_backup: bool,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<SyncReport> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    let prepared =
+        prepare_initial_namespace_merge_internal(remote_id, namespace_id, client, context)?;
+    if prepared.remote_head != expected_remote_head || prepared.fingerprint != expected_fingerprint
+    {
+        bail!("the initial merge preview is stale; preview it again before applying");
+    }
+    let threads = resolve_thread_sets(
+        &[],
+        &prepared.local.threads,
+        &prepared.remote_threads,
+        resolutions,
+    )?;
+    let thread_count = threads.len();
+    let snapshot = materialize_snapshot_provider_metadata(
+        &LocalSnapshot {
+            schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+            snapshot_id: Uuid::now_v7().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            threads,
+            warning_count: 0,
+        },
+        &detect_configured_provider(codex_home)?,
+    )?;
+    let snapshot = workspace_mapper.materialize_snapshot(&snapshot);
+    let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let project_roots = workspace_mapper.local_prefixes();
+    ensure_codex_closed()?;
+    let checkout =
+        checkout_local_snapshot_with_tracking_and_projects_control_with_backup_retention(
+            manifest,
+            codex_home,
+            repository_root,
+            true,
+            CheckoutTrackingUpdate {
+                remote_id,
+                namespace_id,
+                expected_generation: None,
+                integrated_head: Some(prepared.remote_head.clone()),
+                activate_namespace: true,
+            },
+            &project_roots,
+            retain_recovery_backup,
+            control,
+        )?;
+    let tracking = TrackingStore::open(repository_root)?;
+    let applied = tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .context("initial namespace merge completed without tracking state")?;
+    tracking.update_remote_epoch(
+        codex_home,
+        remote_id,
+        namespace_id,
+        applied.generation,
+        prepared.remote_epoch,
+    )?;
+    Ok(SyncReport {
+        kind: SyncOutcomeKind::Merged,
+        namespace_id,
+        previous_head: None,
+        head: Some(prepared.remote_head),
+        revision_id: None,
+        uploaded_objects: 0,
+        downloaded_objects: prepared.downloaded,
+        thread_count,
+        conflicts: Vec::new(),
+        checkout: Some(checkout),
+        push_metrics: None,
+    })
+}
+
+fn prepare_initial_namespace_merge_internal(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    client: &RemoteClient,
+    context: LocalSyncContext<'_>,
+) -> Result<InitialNamespaceMergePreparation> {
+    let LocalSyncContext {
+        codex_home,
+        repository_root,
+        workspace_mapper,
+        control,
+    } = context;
+    ensure_codex_closed()?;
+    client.info()?;
+    let tracking = TrackingStore::open(repository_root)?;
+    if tracking.active(codex_home)?.is_some() {
+        bail!("initial namespace merge requires a Codex Home without an active namespace");
+    }
+    if tracking
+        .load(codex_home, remote_id, namespace_id)?
+        .is_some()
+    {
+        bail!(
+            "the selected namespace has existing tracking; use Pull or exact namespace switch instead"
+        );
+    }
+    let remote_state = client.namespace_head_state(namespace_id)?;
+    let remote_head = remote_state
+        .head
+        .context("the selected namespace is empty; use initial Push instead")?;
+    let (remote_root, remote_threads, downloaded) =
+        download_revision_graph(client, &remote_head, repository_root, control)?;
+    validate_revision_root_namespace(&remote_root, namespace_id)?;
+    if remote_root.warning_count > 0 {
+        bail!("remote revision is incomplete and cannot be joined safely");
+    }
+    let prepared = prepare_workspace_snapshot_with_control(codex_home, repository_root, control)?;
+    if prepared.warning_count > 0 {
+        bail!(
+            "initial namespace merge is blocked because the local workspace contains {} warning(s)",
+            prepared.warning_count
+        );
+    }
+    let mut local = LocalSnapshot {
+        schema_version: sync_core::LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: "initial-namespace-merge".to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        threads: prepared.threads,
+        warning_count: 0,
+    };
+    local = workspace_mapper.canonicalize_snapshot(&local);
+    project_workspace_identities(&mut local);
+    let local = canonicalize_snapshot_provider_metadata(&local);
+    let merged = merge_thread_sets(&[], &local.threads, &remote_threads)?;
+    let fingerprint = initial_merge_fingerprint(&remote_head, &local.threads, &remote_threads)?;
+    Ok(InitialNamespaceMergePreparation {
+        remote_head,
+        remote_epoch: remote_state.namespace_epoch,
+        local,
+        remote_threads,
+        merged,
+        downloaded,
+        fingerprint,
+    })
+}
+
+fn initial_merge_fingerprint(
+    remote_head: &str,
+    local: &[ThreadBundle],
+    remote: &[ThreadBundle],
+) -> Result<String> {
+    fn hashes(threads: &[ThreadBundle]) -> Result<BTreeMap<&str, String>> {
+        threads
+            .iter()
+            .map(|thread| Ok((thread.thread_id.as_str(), semantic_thread_hash(thread)?)))
+            .collect()
+    }
+    let bytes = serde_json::to_vec(&(remote_head, hashes(local)?, hashes(remote)?))
+        .context("failed to serialize initial merge fingerprint")?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(bytes))))
+}
+
+#[cfg(test)]
 pub fn switch_namespace(
     remote_id: Uuid,
     namespace_id: Uuid,
     target_client: &RemoteClient,
     current_client: Option<&RemoteClient>,
     current_workspace_mapper: Option<&WorkspacePathMapper>,
+    context: LocalSyncContext<'_>,
+) -> Result<SyncReport> {
+    switch_namespace_with_backup_retention(
+        remote_id,
+        namespace_id,
+        target_client,
+        current_client,
+        current_workspace_mapper,
+        true,
+        context,
+    )
+}
+
+pub fn switch_namespace_with_backup_retention(
+    remote_id: Uuid,
+    namespace_id: Uuid,
+    target_client: &RemoteClient,
+    current_client: Option<&RemoteClient>,
+    current_workspace_mapper: Option<&WorkspacePathMapper>,
+    retain_recovery_backup: bool,
     context: LocalSyncContext<'_>,
 ) -> Result<SyncReport> {
     let LocalSyncContext {
@@ -1631,21 +1875,23 @@ pub fn switch_namespace(
     let manifest = store_local_snapshot(&snapshot, repository_root)?;
     let project_roots = target_workspace_mapper.local_prefixes();
     ensure_codex_closed()?;
-    let checkout = checkout_local_snapshot_with_tracking_and_projects_control(
-        manifest,
-        codex_home,
-        repository_root,
-        true,
-        CheckoutTrackingUpdate {
-            remote_id,
-            namespace_id,
-            expected_generation: previous.as_ref().map(|record| record.generation),
-            integrated_head: target_head.clone(),
-            activate_namespace: true,
-        },
-        &project_roots,
-        control,
-    )?;
+    let checkout =
+        checkout_local_snapshot_with_tracking_and_projects_control_with_backup_retention(
+            manifest,
+            codex_home,
+            repository_root,
+            true,
+            CheckoutTrackingUpdate {
+                remote_id,
+                namespace_id,
+                expected_generation: previous.as_ref().map(|record| record.generation),
+                integrated_head: target_head.clone(),
+                activate_namespace: true,
+            },
+            &project_roots,
+            retain_recovery_backup,
+            control,
+        )?;
     let applied = tracking
         .load(codex_home, remote_id, namespace_id)?
         .context("namespace switch completed without tracking state")?;
@@ -2001,6 +2247,56 @@ mod tests {
 
     use super::*;
     use crate::remote::SecretToken;
+
+    #[test]
+    fn initial_attachment_unions_distinct_threads_and_requires_same_uuid_choice() {
+        let local_only = test_thread("local-only");
+        let mut local_changed = test_thread("shared");
+        local_changed.title = "local title".to_string();
+        let remote_only = test_thread("remote-only");
+        let mut remote_changed = test_thread("shared");
+        remote_changed.title = "remote title".to_string();
+
+        let outcome = merge_thread_sets(
+            &[],
+            &[local_only.clone(), local_changed.clone()],
+            &[remote_only.clone(), remote_changed.clone()],
+        )
+        .unwrap();
+        assert_eq!(outcome.threads.len(), 2);
+        assert_eq!(outcome.conflicts.len(), 1);
+        assert_eq!(outcome.conflicts[0].thread_id, "shared");
+        let resolved = resolve_thread_sets(
+            &[],
+            &[local_only, local_changed],
+            &[remote_only, remote_changed],
+            &[ThreadConflictResolution {
+                conflict_id: outcome.conflicts[0].conflict_id.clone(),
+                thread_id: "shared".to_string(),
+                choice: sync_core::ThreadResolutionChoice::Local,
+            }],
+        )
+        .unwrap();
+        assert_eq!(resolved.len(), 3);
+        assert!(
+            resolved
+                .iter()
+                .any(|thread| thread.thread_id == "local-only")
+        );
+        assert!(
+            resolved
+                .iter()
+                .any(|thread| thread.thread_id == "remote-only")
+        );
+        assert_eq!(
+            resolved
+                .iter()
+                .find(|thread| thread.thread_id == "shared")
+                .unwrap()
+                .title,
+            "local title"
+        );
+    }
 
     #[test]
     fn upload_progress_reports_bytes_and_object_counts() {

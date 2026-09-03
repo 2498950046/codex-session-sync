@@ -97,7 +97,16 @@ pub struct CheckoutJournal {
     pub expected_thread_hashes: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tracking_update: Option<CheckoutTrackingUpdate>,
+    /// Temporary backups are always retained until a checkout reaches a
+    /// terminal state so a failed write can be rolled back.  When false they
+    /// are removed after a successful checkout and are not a recovery point.
+    #[serde(default = "default_retain_recovery_backup")]
+    pub retain_recovery_backup: bool,
     pub error: Option<String>,
+}
+
+const fn default_retain_recovery_backup() -> bool {
+    true
 }
 
 /// v4 names the checkout journal explicitly. The existing field layout is
@@ -114,6 +123,7 @@ pub struct CheckoutReport {
     pub thread_count: usize,
     pub backup_dir: PathBuf,
     pub local_backup_dir: PathBuf,
+    pub backup_retained: bool,
     pub journal_path: PathBuf,
 }
 
@@ -146,6 +156,7 @@ pub fn checkout_local_snapshot_with_control(
         confirmed_codex_closed,
         None,
         &[],
+        true,
         control,
     )
 }
@@ -164,6 +175,7 @@ pub fn checkout_local_snapshot_with_tracking(
         confirmed_codex_closed,
         Some(tracking_update),
         &[],
+        true,
         &OperationControl::default(),
     )
 }
@@ -183,6 +195,7 @@ pub fn checkout_local_snapshot_with_tracking_control(
         confirmed_codex_closed,
         Some(tracking_update),
         &[],
+        true,
         control,
     )
 }
@@ -196,6 +209,29 @@ pub fn checkout_local_snapshot_with_tracking_and_projects_control(
     workspace_project_roots: &[String],
     control: &OperationControl,
 ) -> Result<CheckoutReport> {
+    checkout_local_snapshot_with_tracking_and_projects_control_with_backup_retention(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        tracking_update,
+        workspace_project_roots,
+        true,
+        control,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn checkout_local_snapshot_with_tracking_and_projects_control_with_backup_retention(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    tracking_update: CheckoutTrackingUpdate,
+    workspace_project_roots: &[String],
+    retain_recovery_backup: bool,
+    control: &OperationControl,
+) -> Result<CheckoutReport> {
     checkout_local_snapshot_internal(
         manifest_path,
         target_codex_home,
@@ -203,10 +239,12 @@ pub fn checkout_local_snapshot_with_tracking_and_projects_control(
         confirmed_codex_closed,
         Some(tracking_update),
         workspace_project_roots,
+        retain_recovery_backup,
         control,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checkout_local_snapshot_internal(
     manifest_path: impl AsRef<Path>,
     target_codex_home: impl AsRef<Path>,
@@ -214,6 +252,7 @@ fn checkout_local_snapshot_internal(
     confirmed_codex_closed: bool,
     tracking_update: Option<CheckoutTrackingUpdate>,
     workspace_project_roots: &[String],
+    retain_recovery_backup: bool,
     control: &OperationControl,
 ) -> Result<CheckoutReport> {
     if !confirmed_codex_closed {
@@ -296,6 +335,7 @@ fn checkout_local_snapshot_internal(
         file_swaps,
         expected_thread_hashes,
         tracking_update,
+        retain_recovery_backup,
         error: None,
     };
     write_checkout_journal(&journal_path, &journal)?;
@@ -376,12 +416,17 @@ fn checkout_local_snapshot_internal(
     journal.updated_at = Utc::now().to_rfc3339();
     write_checkout_journal(&journal_path, &journal)?;
     let _ = fs::remove_dir_all(&staging_root);
+    if !retain_recovery_backup {
+        let _ = fs::remove_dir_all(&repository_backup_dir);
+        let _ = fs::remove_dir_all(&local_backup_dir);
+    }
     Ok(CheckoutReport {
         operation_id,
         snapshot_id: validation.snapshot_id,
         thread_count: snapshot.threads.len(),
         backup_dir: repository_backup_dir,
         local_backup_dir,
+        backup_retained: retain_recovery_backup,
         journal_path,
     })
 }
@@ -1586,6 +1631,46 @@ mod tests {
     }
 
     #[test]
+    fn checkout_can_discard_recovery_backups_after_successful_apply() {
+        let temp = tempdir().unwrap();
+        let codex_home = temp.path().join("codex");
+        let repository = temp.path().join("repository");
+        create_fixture_home(&codex_home, "old", b"old rollout");
+        let target = snapshot_with_object(&repository, "new", b"new rollout");
+        let manifest = store_local_snapshot(&target, &repository).unwrap();
+
+        let report =
+            checkout_local_snapshot_with_tracking_and_projects_control_with_backup_retention(
+                &manifest,
+                &codex_home,
+                &repository,
+                true,
+                CheckoutTrackingUpdate {
+                    remote_id: Uuid::now_v7(),
+                    namespace_id: Uuid::now_v7(),
+                    expected_generation: None,
+                    integrated_head: Some(format!("sha256:{}", "a".repeat(64))),
+                    activate_namespace: true,
+                },
+                &[],
+                false,
+                &OperationControl::default(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            crate::scan_codex_home(&codex_home).unwrap().threads[0].thread_id,
+            "new"
+        );
+        assert!(!report.local_backup_dir.exists());
+        assert!(!report.backup_dir.exists());
+        assert!(!report.backup_retained);
+        let journal: CheckoutJournal = read_json(&report.journal_path).unwrap();
+        assert!(!journal.retain_recovery_backup);
+        assert_eq!(journal.status, CheckoutStatus::Completed);
+    }
+
+    #[test]
     fn checkout_accepts_older_thread_rows_when_newer_schema_adds_defaulted_columns() {
         let temp = tempdir().unwrap();
         let codex_home = temp.path().join("codex");
@@ -2087,6 +2172,7 @@ mod tests {
             file_swaps: Vec::new(),
             expected_thread_hashes: BTreeMap::new(),
             tracking_update: None,
+            retain_recovery_backup: true,
             error: None,
         };
         write_checkout_journal(&journal_path, &journal).unwrap();

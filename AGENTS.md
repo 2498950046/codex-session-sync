@@ -53,7 +53,7 @@ Codex SQLite files.
 ## Delivery Order
 
 1. Shared protocol models and read-only local scanner/exporter.
-2. Tested local backup/import adapter.
+2. Tested local import adapter with user-selected recovery-backup retention.
 3. Server object storage, namespaces, revisions, and fast-forward push/pull.
 4. Tauri desktop GUI for scan, namespaces, and sync status.
 5. Three-way merge and conflict UI.
@@ -80,8 +80,11 @@ Codex SQLite files.
 - Prefer read-only inspection before any destructive or mutating action.
 - Add unit tests for data parsing, hash validation, merge decisions, and
   unsupported-data handling before wiring UI behavior.
-- Do not claim a local import is safe until backup, rollback, and validation
-  paths have automated tests.
+- Before any local replacement, require the user to explicitly choose whether
+  to retain a recoverable backup. Temporary in-operation rollback material,
+  validation, and durable journals still require automated tests; if the user
+  declines retention, successful operations may permanently discard the
+  previous local state.
 
 ## Initial Verification Commands
 
@@ -130,7 +133,10 @@ Implemented:
 - Content-addressed local object storage and immutable snapshot manifests.
 - Explicit closed-Codex safety confirmation for snapshot, import, and recovery.
 - SHA-256 and byte-length validation before any import write.
-- Per-operation SQLite online backups and atomic JSON operation journals.
+- Namespace checkout uses temporary SQLite rollback copies and atomic JSON
+  journals; its completed recovery backup is retained only when the user
+  explicitly chooses to keep it. Applying the same explicit choice to older
+  import/recovery workflows remains follow-up work.
 - Transactional thread-row insertion and temporary-file rollout installation.
 - Pre-write rejection of divergent content for an existing thread UUID.
 - Automatic rollback after apply or post-import validation failure.
@@ -224,9 +230,10 @@ Implemented:
 - Streaming installation of downloaded objects into the local content store,
   with length/hash verification, cancellation cleanup, and atomic immutable
   installation.
-- Exact local checkout with staged rollout directories, online backups of all
-  affected thread databases, same-filesystem directory swaps, post-apply
-  validation, durable journals, rollback, and restart recovery.
+- Exact local checkout with staged rollout directories, temporary online copies
+  of affected thread databases, same-filesystem directory swaps, post-apply
+  validation, durable journals, rollback, and restart recovery. A completed
+  recovery backup is retained only after explicit user confirmation.
 - Checkout journals persist the intended remote, namespace, expected Tracking
   generation, and target revision. After local apply, Tracking CAS and the
   active-namespace binding commit in one SQLite transaction before the journal

@@ -20,10 +20,12 @@ use remote_config::{
     CredentialStore, RemoteProfile, RemoteProfileStore, RemoteProfileSummary, SystemCredentialStore,
 };
 use remote_sync::{
-    LocalSyncContext, create_staged_snapshot, download_remote_revision_as_snapshot,
-    download_revision_graph, prepare_staging_plan, pull_namespace, push_latest_snapshot_namespace,
-    push_namespace, push_staged_namespace, reapply_workspace_mappings, resolve_pull_conflicts,
-    restore_remote_revision_and_publish, restore_remote_revision_locally, switch_namespace,
+    LocalSyncContext, apply_initial_namespace_merge, create_staged_snapshot,
+    download_remote_revision_as_snapshot, download_revision_graph, prepare_initial_namespace_merge,
+    prepare_staging_plan, pull_namespace, push_latest_snapshot_namespace, push_namespace,
+    push_staged_namespace, reapply_workspace_mappings, resolve_pull_conflicts,
+    restore_remote_revision_and_publish, restore_remote_revision_locally,
+    switch_namespace_with_backup_retention,
 };
 use serde::Deserialize;
 use serde::Serialize;
@@ -1848,6 +1850,7 @@ fn start_conflict_resolution_job(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn start_namespace_switch_job(
     jobs: State<'_, JobManager>,
     repository_root: Option<String>,
@@ -1856,6 +1859,7 @@ fn start_namespace_switch_job(
     namespace_id: String,
     confirmed_codex_closed: bool,
     confirmed_replace_local: bool,
+    retain_recovery_backup: Option<bool>,
 ) -> Result<JobSnapshot, String> {
     require_closed_confirmation(confirmed_codex_closed)?;
     if !confirmed_replace_local {
@@ -1900,13 +1904,97 @@ fn start_namespace_switch_job(
         "switch",
         true,
         move |control| {
-            switch_namespace(
+            switch_namespace_with_backup_retention(
                 remote_id,
                 namespace_id,
                 &target_client,
                 current_client.as_ref(),
                 current_workspace_mapper.as_ref(),
+                retain_recovery_backup.unwrap_or(false),
                 LocalSyncContext::new(&codex_home, &repository, &target_workspace_mapper, &control),
+            )
+        },
+    )
+}
+
+#[tauri::command]
+fn start_initial_namespace_merge_plan_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "initial-merge-plan",
+        true,
+        move |control| {
+            prepare_initial_namespace_merge(
+                remote_id,
+                namespace_id,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
+            )
+        },
+    )
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn start_initial_namespace_merge_apply_job(
+    jobs: State<'_, JobManager>,
+    repository_root: Option<String>,
+    codex_home: Option<String>,
+    remote_id: String,
+    namespace_id: String,
+    expected_remote_head: String,
+    expected_fingerprint: String,
+    resolutions: Vec<ThreadConflictResolution>,
+    retain_recovery_backup: bool,
+    confirmed_codex_closed: bool,
+) -> Result<JobSnapshot, String> {
+    require_closed_confirmation(confirmed_codex_closed)?;
+    ensure_codex_closed()?;
+    let repository = resolve_repository_root(repository_root);
+    let codex_home = resolve_codex_home(codex_home);
+    let remote_id = parse_uuid(&remote_id).map_err(|error| error.to_string())?;
+    let namespace_id = parse_uuid(&namespace_id).map_err(|error| error.to_string())?;
+    let (_, client) =
+        load_remote_client(&repository, remote_id).map_err(|error| error.to_string())?;
+    let workspace_mapper = WorkspaceMappingStore::new(&repository)
+        .mapper(&codex_home, remote_id, namespace_id)
+        .map_err(|error| error.to_string())?;
+    let lock_home = codex_home.clone();
+    jobs.start_home_repository_shared(
+        &lock_home,
+        &repository.clone(),
+        "initial-merge-apply",
+        true,
+        move |control| {
+            apply_initial_namespace_merge(
+                remote_id,
+                namespace_id,
+                &expected_remote_head,
+                &expected_fingerprint,
+                &resolutions,
+                retain_recovery_backup,
+                &client,
+                LocalSyncContext::new(&codex_home, &repository, &workspace_mapper, &control),
             )
         },
     )
@@ -2519,6 +2607,8 @@ pub fn run() {
             start_pull_job,
             start_conflict_resolution_job,
             start_namespace_switch_job,
+            start_initial_namespace_merge_plan_job,
+            start_initial_namespace_merge_apply_job,
             start_workspace_remap_job
         ])
         .run(tauri::generate_context!())
@@ -2654,6 +2744,7 @@ mod tests {
             file_swaps: Vec::new(),
             expected_thread_hashes: BTreeMap::new(),
             tracking_update: None,
+            retain_recovery_backup: true,
             error: None,
         };
         std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();

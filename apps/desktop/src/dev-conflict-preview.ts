@@ -79,6 +79,7 @@ const remapReport: SyncReport = {
     threadCount: 418,
     backupDir: "C:/Users/demo/.codex-session-sync/backups/remap",
     localBackupDir: "C:/Users/demo/.codex/.codex-session-sync/backups/remap",
+    backupRetained: true,
     journalPath: "C:/Users/demo/.codex-session-sync/journal/checkout-remap.json",
   },
 };
