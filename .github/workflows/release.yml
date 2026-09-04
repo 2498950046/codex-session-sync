@@ -184,10 +184,15 @@ jobs:
           set -euo pipefail
           metadata='release-assets/updater-metadata.json'
           version="$(jq -r '.version' "$metadata")"
-          installer="$(jq -r '.installer' "$metadata")"
           signature="$(jq -r '.signature' "$metadata")"
           notes="$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${installer}"
+          # GitHub may normalize an uploaded asset's filename (for example,
+          # spaces become dots). Query its final browser URL rather than
+          # constructing a URL from the local build filename.
+          url="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq '
+            [.assets[] | select(.name | endswith("-setup.exe")) | .browser_download_url]
+            | if length == 1 then .[0] else error("expected exactly one NSIS setup asset") end
+          ')"
           jq -n \
             --arg version "$version" \
             --arg notes "$notes" \
