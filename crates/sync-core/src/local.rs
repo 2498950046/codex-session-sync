@@ -423,6 +423,83 @@ pub fn create_local_snapshot_with_control(
     })
 }
 
+/// Creates an immutable local Selection Snapshot from arbitrary current
+/// conversations.  Unlike the sync staging plan this deliberately has no
+/// Tracking or remote dependency: it is a personal preservation feature.
+pub fn create_selection_snapshot_with_control(
+    codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    selected_thread_ids: impl IntoIterator<Item = String>,
+    confirmed_codex_closed: bool,
+    control: &OperationControl,
+) -> Result<SnapshotSummary> {
+    if !confirmed_codex_closed {
+        bail!("snapshot creation requires confirmation that Codex is fully closed");
+    }
+    let repository_root = repository_root.as_ref();
+    let selected = selected_thread_ids.into_iter().collect::<BTreeSet<_>>();
+    if selected.is_empty() {
+        bail!("select at least one conversation before creating a selection snapshot");
+    }
+    let prepared = prepare_workspace_snapshot_with_control(codex_home, repository_root, control)?;
+    let available = prepared
+        .threads
+        .iter()
+        .map(|thread| thread.thread_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let missing = selected
+        .iter()
+        .filter(|thread_id| !available.contains(thread_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "selected conversations no longer exist: {}",
+            missing.join(", ")
+        );
+    }
+    let threads = prepared
+        .threads
+        .into_iter()
+        .filter(|thread| selected.contains(&thread.thread_id))
+        .collect::<Vec<_>>();
+    let contents = prepared
+        .contents
+        .into_iter()
+        .filter(|(thread_id, _)| selected.contains(thread_id))
+        .collect::<BTreeMap<_, _>>();
+    let snapshot_id = Uuid::now_v7().to_string();
+    let snapshot = LocalSnapshot {
+        schema_version: LOCAL_SNAPSHOT_SCHEMA_VERSION,
+        snapshot_id: snapshot_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        threads,
+        warning_count: prepared.warning_count,
+    };
+    let manifest_path = write_v4_snapshot(&snapshot, &contents, repository_root)?;
+    crate::storage_v3::update_snapshot_metadata(
+        repository_root,
+        &snapshot_id,
+        crate::storage_v3::SnapshotMetadata {
+            scope: crate::storage_v3::SnapshotScope::Selection,
+            selected_thread_ids: selected.into_iter().collect(),
+            ..Default::default()
+        },
+    )?;
+    Ok(SnapshotSummary {
+        snapshot_id,
+        manifest_path,
+        thread_count: snapshot.threads.len(),
+        object_count: contents.len(),
+        total_bytes: snapshot
+            .threads
+            .iter()
+            .map(|thread| thread.rollout.byte_length)
+            .sum(),
+        warning_count: snapshot.warning_count,
+    })
+}
+
 /// Normalizes the local workspace into immutable local objects without
 /// creating a user-visible Snapshot root.  The trusted source-object index is
 /// still refreshed, so unchanged rollout files are not read again by the

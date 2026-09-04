@@ -149,6 +149,24 @@ pub fn checkout_local_snapshot_with_control(
     confirmed_codex_closed: bool,
     control: &OperationControl,
 ) -> Result<CheckoutReport> {
+    checkout_local_snapshot_with_control_with_backup_retention(
+        manifest_path,
+        target_codex_home,
+        repository_root,
+        confirmed_codex_closed,
+        true,
+        control,
+    )
+}
+
+pub fn checkout_local_snapshot_with_control_with_backup_retention(
+    manifest_path: impl AsRef<Path>,
+    target_codex_home: impl AsRef<Path>,
+    repository_root: impl AsRef<Path>,
+    confirmed_codex_closed: bool,
+    retain_recovery_backup: bool,
+    control: &OperationControl,
+) -> Result<CheckoutReport> {
     checkout_local_snapshot_internal(
         manifest_path,
         target_codex_home,
@@ -156,7 +174,7 @@ pub fn checkout_local_snapshot_with_control(
         confirmed_codex_closed,
         None,
         &[],
-        true,
+        retain_recovery_backup,
         control,
     )
 }
