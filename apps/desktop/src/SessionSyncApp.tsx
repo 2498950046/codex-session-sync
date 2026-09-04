@@ -17,6 +17,7 @@ import {
   Download,
   FolderCog,
   Folder,
+  Gem,
   KeyRound,
   Moon,
   Plus,
@@ -73,6 +74,11 @@ import type {
   ThreadMessagesPage,
   ThreadConflict,
   ThreadConflictVersion,
+  SnapshotPreview,
+  TreasureExportResult,
+  TreasureImportResult,
+  TreasureListItem,
+  TreasurePreview,
   WorkspaceCleanupReport,
   WorkspaceCleanupResult,
   WorkspaceMappingState,
@@ -620,6 +626,19 @@ export default function SessionSyncApp() {
   const [stagedThreadIds, setStagedThreadIds] = useState<Set<string>>(new Set());
   const [stagingShowAll, setStagingShowAll] = useState(false);
   const [stagingAction, setStagingAction] = useState<"push" | "snapshot">("push");
+  const [snapshotModeOpen, setSnapshotModeOpen] = useState(false);
+  const [selectionSnapshotOpen, setSelectionSnapshotOpen] = useState(false);
+  const [selectionSnapshotIds, setSelectionSnapshotIds] = useState<Set<string>>(new Set());
+  const [snapshotPreview, setSnapshotPreview] = useState<SnapshotPreview | null>(null);
+  const [snapshotPreviewMessages, setSnapshotPreviewMessages] = useState<ThreadMessagesPage | null>(null);
+  const [snapshotPreviewLoading, setSnapshotPreviewLoading] = useState(false);
+  const [snapshotPreviewIsRemote, setSnapshotPreviewIsRemote] = useState(false);
+  const [treasures, setTreasures] = useState<TreasureListItem[]>([]);
+  const [vaultName, setVaultName] = useState("");
+  const [vaultSourceIds, setVaultSourceIds] = useState<Set<string>>(new Set());
+  const [treasurePreview, setTreasurePreview] = useState<TreasurePreview | null>(null);
+  const [treasureChoices, setTreasureChoices] = useState<Record<string, string>>({});
+  const [treasureImportPath, setTreasureImportPath] = useState("");
   const [initialMergePlan, setInitialMergePlan] = useState<InitialNamespaceMergePlanReport | null>(null);
   const [initialMergePlanTargetKey, setInitialMergePlanTargetKey] = useState<string | null>(null);
   const [retainRecoveryBackup, setRetainRecoveryBackup] = useState<boolean | null>(null);
@@ -1049,6 +1068,10 @@ export default function SessionSyncApp() {
   }, [location.pathname, repositoryRoot, selectedRemoteId, selectedNamespaceId]);
 
   useEffect(() => {
+    if (location.pathname === "/vault") void refreshTreasures();
+  }, [location.pathname, repositoryRoot]);
+
+  useEffect(() => {
     if (!historyOpen) return;
     void refreshHistory("正在刷新完整版本图谱…");
   }, [historyOpen]);
@@ -1122,6 +1145,20 @@ export default function SessionSyncApp() {
       setSnapshot(summary);
       setManifestPath(summary.manifestPath);
       await refreshHistory();
+    }
+    if (completed.kind === "selection-snapshot") {
+      const summary = result as SnapshotSummary;
+      setSnapshot(summary);
+      setManifestPath(summary.manifestPath);
+      await refreshHistory();
+    }
+    if (completed.kind === "treasure-export") await refreshTreasures();
+    if (completed.kind === "treasure-import") {
+      const imported = result as TreasureImportResult;
+      setSnapshot(imported.snapshot);
+      setManifestPath(imported.snapshot.manifestPath);
+      await refreshHistory();
+      await refreshTreasures();
     }
     if (completed.kind === "provider_sync_preview") setProviderSyncPreview(result as ProviderSyncPreview);
     if (completed.kind === "import") {
@@ -1259,6 +1296,13 @@ export default function SessionSyncApp() {
     } finally {
       setHistoryLoading(false);
     }
+  }
+
+  async function refreshTreasures() {
+    if (!isTauriRuntime || !repositoryRoot.trim()) return;
+    try {
+      setTreasures(await invoke<TreasureListItem[]>("list_local_treasures", { repositoryRoot: repositoryRoot.trim() }));
+    } catch (reason) { setError(String(reason)); }
   }
 
   function toggleBackupSelection(id: string) {
@@ -1978,6 +2022,55 @@ export default function SessionSyncApp() {
     });
   }
 
+  function openSnapshotMode() {
+    setSnapshotModeOpen(true);
+    setSelectionSnapshotIds(new Set());
+  }
+
+  function openSelectionSnapshot() {
+    setSnapshotModeOpen(false);
+    setSelectionSnapshotOpen(true);
+    setSelectionSnapshotIds(new Set());
+  }
+
+  async function openLocalSnapshotPreview(snapshotId: string) {
+    setSnapshotPreviewLoading(true);
+    setSnapshotPreviewIsRemote(false);
+    setSnapshotPreviewMessages(null);
+    try {
+      setSnapshotPreview(await invoke<SnapshotPreview>("get_snapshot_preview", { repositoryRoot: repositoryRoot.trim(), snapshotId }));
+    } catch (reason) { setError(String(reason)); }
+    finally { setSnapshotPreviewLoading(false); }
+  }
+
+  async function openSnapshotPreviewThread(thread: ThreadBundle, page = 1) {
+    if (!snapshotPreview) return;
+    setSelectedThread(thread);
+    setThreadMessagesLoading(true);
+    try {
+      setSnapshotPreviewMessages(await invoke<ThreadMessagesPage>(snapshotPreviewIsRemote ? "get_remote_revision_thread_messages" : "get_snapshot_thread_messages", snapshotPreviewIsRemote ? { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: snapshotPreview.snapshotId, threadId: thread.threadId, page, pageSize: 50 } : { repositoryRoot: repositoryRoot.trim(), snapshotId: snapshotPreview.snapshotId, threadId: thread.threadId, page, pageSize: 50 }));
+    } catch (reason) { setError(String(reason)); }
+    finally { setThreadMessagesLoading(false); }
+  }
+
+  async function refreshTreasurePreview(ids = [...vaultSourceIds]) {
+    if (ids.length === 0) { setTreasurePreview(null); setTreasureChoices({}); return; }
+    try {
+      const preview = await invoke<TreasurePreview>("plan_treasure_preview", { repositoryRoot: repositoryRoot.trim(), sourceSnapshotIds: ids });
+      setTreasurePreview(preview);
+      setTreasureChoices((current) => Object.fromEntries(preview.conflicts.map((conflict) => [conflict.threadId, current[conflict.threadId] ?? ""])));
+    } catch (reason) { setError(String(reason)); }
+  }
+
+  function toggleVaultSnapshot(snapshotId: string) {
+    setVaultSourceIds((current) => {
+      const next = new Set(current);
+      if (next.has(snapshotId)) next.delete(snapshotId); else next.add(snapshotId);
+      void refreshTreasurePreview([...next]);
+      return next;
+    });
+  }
+
   function chooseRecoveryBackup(value: boolean) {
     retainRecoveryBackupRef.current = value;
     setRetainRecoveryBackup(value);
@@ -2247,7 +2340,7 @@ export default function SessionSyncApp() {
   </> : <section className="surface empty-card"><FolderCog size={28} /><h3>请先选择命名空间</h3><p>项目路径规则按 Home、远端和命名空间隔离。</p></section>;
 
   const snapshotTools = <section className="surface tool-section">
-    <div className="section-title"><div><h3>本地快照与恢复</h3><p>用于诊断、手动导入和未完成操作恢复；所有写入仍遵守 Codex 关闭检查。</p></div><button className="button primary" onClick={() => void (selectedRemoteId && selectedNamespaceId ? openStaging("snapshot") : start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }))} disabled={busy || !canWrite}>{selectedRemoteId && selectedNamespaceId ? "选择会话创建快照" : "创建完整本地快照"}</button></div>
+    <div className="section-title"><div><h3>本地快照与恢复</h3><p>完整或任意选择会话的快照只保存在本机；不会直接推送到远端。</p></div><button className="button primary" onClick={openSnapshotMode} disabled={busy || !canWrite}>创建快照</button></div>
     <div className="field"><label htmlFor="manifest-path-new">快照清单路径</label><input id="manifest-path-new" value={manifestPath} onChange={(event) => setManifestPath(event.target.value)} placeholder="~/.codex-session-sync/snapshots/<id>.json" /></div>
     <div className="button-row"><button className="button secondary" onClick={() => void start("start_validation_job", { manifestPath: manifestPath.trim(), repositoryRoot: repositoryRoot.trim() })} disabled={busy || !manifestPath.trim() || !isTauriRuntime}>验证快照</button><button className="button danger" onClick={() => setConfirmation({ title: "增量导入快照", description: <p>导入会先备份当前会话，并在校验失败时自动回滚。请确认 Codex 已完全退出。</p>, confirmLabel: "确认备份并导入", tone: "danger", onConfirm: () => start("start_import_job", { manifestPath: manifestPath.trim(), codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={busy || !manifestPath.trim() || !canWrite}>增量导入</button></div>
     <div className="divider" />
@@ -2295,7 +2388,7 @@ export default function SessionSyncApp() {
   const selectedRemoteRevision = remoteRevisions.find((item) => item.revisionId === selectedHistoryId) ?? null;
   const backupCategories: LocalBackupItem["category"][] = ["checkout", "import", "workspace_cleanup", "provider_sync", "other"];
   const historyPage = <div className="page-stack history-page">
-    <PageIntro title="快照与恢复" description="以版本图方式浏览本地快照和远端命名空间历史；删除先进入回收站，永久删除或清空回收站时释放空间。" action={<div className="button-row"><button className="button secondary" onClick={() => void refreshHistory()} disabled={historyLoading}><RefreshCw size={15} />刷新</button><button className="button primary" onClick={() => void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true })} disabled={busy || !canWrite}>创建快照</button></div>} />
+    <PageIntro title="快照与恢复" description="以版本图方式浏览本地快照和远端命名空间历史；删除先进入回收站，永久删除或清空回收站时释放空间。" action={<div className="button-row"><button className="button secondary" onClick={() => void refreshHistory()} disabled={historyLoading}><RefreshCw size={15} />刷新</button><button className="button primary" onClick={openSnapshotMode} disabled={busy || !canWrite}>创建快照</button></div>} />
     <section className="history-workbench surface">
       <aside className="history-tree">
         <strong>来源</strong>
@@ -2317,12 +2410,25 @@ export default function SessionSyncApp() {
         {(selectedLocalSnapshot || selectedRemoteRevision) && <section className="version-details">
           <div><span className="overline">选中版本</span><h3>{selectedLocalSnapshot ? (selectedLocalSnapshot.metadata.description || "本地快照") : "远端 Revision"}</h3><CopyCode value={selectedHistoryId ?? ""} /></div>
           <div className="version-detail-metrics"><span>会话 <b>{selectedLocalSnapshot?.threadCount ?? selectedRemoteRevision?.threadCount}</b></span><span>逻辑大小 <b>{formatBytes(selectedLocalSnapshot?.logicalBytes ?? selectedRemoteRevision?.logicalBytes ?? 0)}</b></span><span>物理引用 <b>{formatBytes(selectedLocalSnapshot?.physicalReferencedBytes ?? selectedRemoteRevision?.physicalReferencedBytes ?? 0)}</b></span></div>
-          {selectedLocalSnapshot && <div className="button-row"><button className="button warning" onClick={() => setConfirmation({ title: selectedLocalSnapshot.metadata.scope === "selection" ? "精确恢复选择快照" : "语义恢复本地快照", description: selectedLocalSnapshot.metadata.scope === "selection" ? <p>当前快照只包含被勾选的变化。精确恢复会以该集合替换本地会话，未包含的会话将丢失；操作仍会先完整备份并可在失败时回滚。</p> : <p>当前 Codex 会话将先完整备份并写入 Journal，再按线程语义恢复所选快照；Provider、工作区路径和 rollout 换行格式会按当前机器物化。失败时会自动回滚。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_snapshot_restore_job", { manifestPath: selectedLocalSnapshot.manifestPath, codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy}>{selectedLocalSnapshot.metadata.scope === "selection" ? "精确恢复（会替换）" : "语义恢复"}</button><button className="button secondary" onClick={async () => { setHistoryLoading(true); setHistoryLoadingLabel("正在更新快照标记…"); try { await invoke("update_snapshot_metadata", { repositoryRoot: repositoryRoot.trim(), snapshotId: selectedLocalSnapshot.snapshotId, metadata: { ...selectedLocalSnapshot.metadata, pinned: !selectedLocalSnapshot.metadata.pinned } }); await refreshHistory("正在更新快照列表…"); } catch (reason) { setError(String(reason)); } finally { setHistoryLoading(false); } }}>{selectedLocalSnapshot.metadata.pinned ? "取消固定" : "固定快照"}</button><button className="button danger" onClick={() => void requestSnapshotTrash(selectedLocalSnapshot)} disabled={selectedLocalSnapshot.metadata.pinned || historyLoading}><Trash2 size={15} />移入回收站</button></div>}
-          {selectedRemoteRevision && <div className="button-row"><button className="button secondary" onClick={() => void start("start_remote_revision_download_job", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId })} disabled={busy}>下载为本地快照</button><button className="button secondary" onClick={() => setConfirmation({ title: "恢复为本地待推送状态", description: <p>当前会话会先备份并通过 Journal 精确切换到该远端版本；Tracking 仍保留当前远端 Head，之后可普通 Push 发布。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: false, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复为待 Push</button><button className="button warning" onClick={() => setConfirmation({ title: "恢复并发布为新版本", description: <p>先安全恢复所选历史内容，再以当前远端 Head 为父版本发布新的 Revision；不会改写已有历史。</p>, confirmLabel: "恢复并发布", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: true, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复并发布</button>{remoteRevisions[0]?.revisionId !== selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "回退远端 Head", description: <p>该版本之后的远端历史会进入 30 天可恢复回收站，Namespace Epoch 将递增。对象不会立即删除。</p>, confirmLabel: "确认回退 Head", tone: "danger", onConfirm: () => void truncateRemoteHistory(selectedRemoteRevision.revisionId, "正在回退远端 Head…") })}>回退 Head 到此处</button>}{remoteRevisions[0]?.revisionId === selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "删除当前远端 Head", description: <p>当前 Head 会进入 30 天可恢复回收站，父版本成为新 Head；共享对象和内容不会立即删除。</p>, confirmLabel: "删除当前 Head", tone: "danger", onConfirm: () => void truncateRemoteHistory(selectedRemoteRevision.parentRevision, "正在删除远端 Head…") })}>删除当前 Head</button>}</div>}
+          {selectedLocalSnapshot && <div className="button-row"><button className="button secondary" onClick={() => void openLocalSnapshotPreview(selectedLocalSnapshot.snapshotId)} disabled={busy}>预览会话</button><button className="button secondary" onClick={async () => { const description = window.prompt("本地快照名称", selectedLocalSnapshot.metadata.description); if (description === null) return; try { await invoke("update_snapshot_metadata", { repositoryRoot: repositoryRoot.trim(), snapshotId: selectedLocalSnapshot.snapshotId, metadata: { ...selectedLocalSnapshot.metadata, description } }); await refreshHistory(); } catch (reason) { setError(String(reason)); } }} disabled={busy}>重命名</button><button className="button warning" onClick={() => setConfirmation({ title: selectedLocalSnapshot.metadata.scope === "selection" ? "精确恢复选择快照" : "语义恢复本地快照", description: <p>恢复会替换当前会话；随后会询问是否保留可恢复备份。</p>, confirmLabel: "继续恢复", tone: "warning", onConfirm: () => start("start_snapshot_restore_job", { manifestPath: selectedLocalSnapshot.manifestPath, codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }) })} disabled={!canWrite || busy}>{selectedLocalSnapshot.metadata.scope === "selection" ? "精确恢复（会替换）" : "语义恢复"}</button><button className="button secondary" onClick={async () => { setHistoryLoading(true); setHistoryLoadingLabel("正在更新快照标记…"); try { await invoke("update_snapshot_metadata", { repositoryRoot: repositoryRoot.trim(), snapshotId: selectedLocalSnapshot.snapshotId, metadata: { ...selectedLocalSnapshot.metadata, pinned: !selectedLocalSnapshot.metadata.pinned } }); await refreshHistory("正在更新快照列表…"); } catch (reason) { setError(String(reason)); } finally { setHistoryLoading(false); } }}>{selectedLocalSnapshot.metadata.pinned ? "取消固定" : "固定快照"}</button><button className="button danger" onClick={() => void requestSnapshotTrash(selectedLocalSnapshot)} disabled={selectedLocalSnapshot.metadata.pinned || historyLoading}><Trash2 size={15} />移入回收站</button></div>}
+          {selectedRemoteRevision && <div className="button-row"><button className="button secondary" onClick={async () => { try { setSnapshotPreviewIsRemote(true); setSnapshotPreview(await invoke<SnapshotPreview>("get_remote_revision_preview", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId })); } catch (reason) { setError(String(reason)); } }} disabled={busy}>预览会话</button><button className="button secondary" onClick={() => void start("start_remote_revision_download_job", { repositoryRoot: repositoryRoot.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId })} disabled={busy}>下载为本地快照</button><button className="button secondary" onClick={() => setConfirmation({ title: "恢复为本地待推送状态", description: <p>当前会话会先备份并通过 Journal 精确切换到该远端版本；Tracking 仍保留当前远端 Head，之后可普通 Push 发布。</p>, confirmLabel: "备份并恢复", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: false, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复为待 Push</button><button className="button warning" onClick={() => setConfirmation({ title: "恢复并发布为新版本", description: <p>先安全恢复所选历史内容，再以当前远端 Head 为父版本发布新的 Revision；不会改写已有历史。</p>, confirmLabel: "恢复并发布", tone: "warning", onConfirm: () => start("start_remote_revision_restore_job", { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), remoteId: selectedRemoteId, namespaceId: selectedNamespaceId, revisionId: selectedRemoteRevision.revisionId, publish: true, confirmedCodexClosed: true }) })} disabled={busy || !canWrite}>恢复并发布</button>{remoteRevisions[0]?.revisionId !== selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "回退远端 Head", description: <p>该版本之后的远端历史会进入 30 天可恢复回收站，Namespace Epoch 将递增。对象不会立即删除。</p>, confirmLabel: "确认回退 Head", tone: "danger", onConfirm: () => void truncateRemoteHistory(selectedRemoteRevision.revisionId, "正在回退远端 Head…") })}>回退 Head 到此处</button>}{remoteRevisions[0]?.revisionId === selectedRemoteRevision.revisionId && <button className="button danger" onClick={() => setConfirmation({ title: "删除当前远端 Head", description: <p>当前 Head 会进入 30 天可恢复回收站，父版本成为新 Head；共享对象和内容不会立即删除。</p>, confirmLabel: "删除当前 Head", tone: "danger", onConfirm: () => void truncateRemoteHistory(selectedRemoteRevision.parentRevision, "正在删除远端 Head…") })}>删除当前 Head</button>}</div>}
         </section>}
       </div>
     </section>
     {storageSummary && <section className="surface storage-summary" aria-label="仓库存储统计"><div><span>仓库占用</span><strong>{formatBytes(storageSummary.repositoryPhysicalBytes)}</strong></div><div><span>活动可达</span><strong>{formatBytes(storageSummary.activePhysicalBytes)}</strong></div><div><span>共享对象</span><strong>{formatBytes(storageSummary.sharedPhysicalBytes)}</strong></div><div><span>回收站保护</span><strong>{formatBytes(storageSummary.trashBytes)}</strong></div><div><span>可释放</span><strong>{formatBytes(storageSummary.reclaimableBytes)}</strong></div><div><span>待清理</span><strong>{formatBytes(storageSummary.gcQuarantineBytes)}</strong></div></section>}
+  </div>;
+
+  const vaultPage = <div className="page-stack vault-page">
+    <PageIntro title="宝库" description="宝藏是物理自包含的完整快照文件，可单独保存、发送给他人，并导入为普通本地快照。" action={<button className="button secondary" onClick={() => void refreshTreasures()} disabled={busy}><RefreshCw size={15} />刷新</button>} />
+    <section className="vault-layout">
+      <div className="surface vault-main" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); const id = event.dataTransfer.getData("application/x-codex-snapshot"); if (id) toggleVaultSnapshot(id); }}>
+        <div className="section-title"><div><span className="overline">临时组合预览</span><h3>{vaultName || "未命名宝藏"}</h3><p>拖入仅保留在当前页面内；不会固定或保护来源快照。</p></div><Gem size={22} /></div>
+        {treasurePreview ? <><div className="vault-metrics"><span>来源 {treasurePreview.sourceSnapshotIds.length}</span><span>会话 {treasurePreview.threadCount}</span><span className={treasurePreview.conflictCount ? "warning" : ""}>冲突 {treasurePreview.conflictCount}</span></div>{treasurePreview.conflicts.length > 0 && <div className="vault-conflicts">{treasurePreview.conflicts.map((conflict) => <article key={conflict.threadId}><strong>{conflict.candidates[0]?.title || conflict.threadId}</strong><select value={treasureChoices[conflict.threadId] ?? ""} onChange={(event) => setTreasureChoices((current) => ({ ...current, [conflict.threadId]: event.target.value }))}><option value="">选择要导出的版本</option>{conflict.candidates.map((candidate) => <option key={`${candidate.sourceSnapshotId}:${candidate.semanticHash}`} value={candidate.semanticHash}>{candidate.title || conflict.threadId} · {candidate.sourceSnapshotId.slice(0, 8)}</option>)}</select></article>)}</div>}<div className="thread-list vault-source-list">{localSnapshots.filter((item) => vaultSourceIds.has(item.snapshotId)).map((item) => <div className="thread-row" key={item.snapshotId}><div><strong>{item.metadata.description || "本地快照"}</strong><small>{item.threadCount} 个会话 · {formatBytes(item.logicalBytes)}</small></div><button className="button secondary small" onClick={() => toggleVaultSnapshot(item.snapshotId)}>移除</button></div>)}</div></> : <div className="version-log-empty">从右侧添加一个或多个本地快照，开始临时预览。</div>}
+        <div className="vault-export-row"><div className="field"><label htmlFor="vault-name">宝藏名称</label><input id="vault-name" value={vaultName} onChange={(event) => setVaultName(event.target.value)} placeholder="例如：重要产品决策" /></div><button className="button primary" onClick={() => void start("start_treasure_export_job", { request: { repositoryRoot: repositoryRoot.trim(), displayName: vaultName, sourceSnapshotIds: [...vaultSourceIds], expectedFingerprint: treasurePreview?.fingerprint, resolutions: Object.entries(treasureChoices).filter(([, semanticHash]) => semanticHash).map(([threadId, semanticHash]) => ({ threadId, semanticHash })) } })} disabled={busy || !treasurePreview || !vaultName.trim() || treasurePreview.conflicts.some((conflict) => !treasureChoices[conflict.threadId])}>导出为宝藏</button></div>
+      </div>
+      <aside className="vault-side"><section className="surface vault-info"><strong>已有宝藏</strong><div className="vault-list">{treasures.map((treasure) => <article key={treasure.treasureId}><div><strong>{treasure.displayName}</strong><small>{new Date(treasure.createdAt).toLocaleString("zh-CN")} · {treasure.threadCount} 个会话</small><code title={treasure.path}>{treasure.path}</code></div><div className="button-row"><button className="button secondary small" onClick={() => void start("start_treasure_validation_job", { repositoryRoot: repositoryRoot.trim(), treasurePath: treasure.path })} disabled={busy}>验证</button><button className="button danger small" onClick={() => setConfirmation({ title: "移入宝库回收站", description: <p>将移动唯一的宝藏文件：<code>{treasure.path}</code>。移动后它不再显示在宝库列表，但文件仍可从宝库回收区找回。</p>, confirmLabel: "移入回收站", tone: "danger", onConfirm: async () => { try { await invoke("trash_local_treasure", { repositoryRoot: repositoryRoot.trim(), treasureId: treasure.treasureId }); await refreshTreasures(); } catch (reason) { setError(String(reason)); } } })} disabled={busy}>删除</button></div></article>)}{treasures.length === 0 && <small>尚未导出宝藏。</small>}</div></section><section className="surface vault-snapshots"><strong>本地快照</strong><small>拖到左侧，或点击添加到预览。</small><div className="vault-list">{localSnapshots.map((item) => <article key={item.snapshotId} draggable onDragStart={(event) => event.dataTransfer.setData("application/x-codex-snapshot", item.snapshotId)}><div><strong>{item.metadata.description || "本地快照"}</strong><small>{item.threadCount} 个会话 · {item.metadata.scope === "selection" ? "选择" : "完整"}</small></div><button className="button secondary small" onClick={() => toggleVaultSnapshot(item.snapshotId)}>{vaultSourceIds.has(item.snapshotId) ? "已添加" : "添加"}</button></article>)}</div></section></aside>
+    </section>
+    <section className="surface vault-import"><div className="section-title"><div><h3>接收宝藏</h3><p>外部宝藏会在导入前校验结构、对象数量、大小和哈希；导入后直接出现在本地快照中。</p></div></div><div className="path-picker-row"><input value={treasureImportPath} onChange={(event) => setTreasureImportPath(event.target.value)} placeholder="选择 .codex-treasure 文件" /><button className="button secondary" onClick={async () => { const selected = await open({ multiple: false, filters: [{ name: "Codex Treasure", extensions: ["codex-treasure"] }] }); if (typeof selected === "string") setTreasureImportPath(selected); }} disabled={!isTauriRuntime || busy}>选择文件</button><button className="button primary" onClick={() => void start("start_treasure_import_job", { repositoryRoot: repositoryRoot.trim(), treasurePath: treasureImportPath.trim() })} disabled={busy || !treasureImportPath.trim()}>导入为本地快照</button></div></section>
   </div>;
 
   return <AppShell processes={processes} busy={busy} onRefreshProcesses={() => void refreshProcesses()} updateAvailable={Boolean(availableUpdate)} onOpenUpdates={openUpdates}>
@@ -2350,12 +2456,16 @@ export default function SessionSyncApp() {
         </section>
       </div>} />
       <Route path="/sessions" element={<div className="page-stack"><PageIntro title="本机会话" description="扫描会在后台运行，只读取会话和兼容性信息。" action={<button className="button primary" onClick={() => void start("start_scan_job", { codexHome: codexHome.trim() })} disabled={busy || !codexHome.trim() || !isTauriRuntime}><RefreshCw size={16} />重新扫描</button>} />{sessionReportPanel}</div>} />
+      <Route path="/vault" element={vaultPage} />
       <Route path="/settings" element={<div className="page-stack"><PageIntro title="设置" description="配置本机数据位置、远端服务器、命名空间和高级工具。" /><section className="settings-grid"><article className="surface settings-card"><div className="section-title"><div><h3>本机存储</h3><p>路径变化会刷新对应的远端与同步状态。</p></div><Database size={20} /></div><div className="field"><label htmlFor="codex-home-new">Codex Home</label><input id="codex-home-new" value={codexHome} onChange={(event) => setCodexHome(event.target.value)} disabled={busy} /></div><div className="field"><label htmlFor="repository-root-new">本地同步仓库</label><input id="repository-root-new" value={repositoryRoot} onChange={(event) => setRepositoryRoot(event.target.value)} disabled={busy} /></div></article><article className="surface settings-card"><div className="section-title"><div><h3>外观</h3><p>默认跟随操作系统，也可以固定主题。</p></div>{resolvedTheme === "dark" ? <Moon size={20} /> : <Sun size={20} />}</div><div className="theme-options" role="radiogroup" aria-label="主题"><button role="radio" aria-checked={themePreference === "system"} className={themePreference === "system" ? "selected" : ""} onClick={() => setThemePreference("system")}><RefreshCw size={17} /><span><strong>跟随系统</strong><small>当前为{resolvedTheme === "dark" ? "深色" : "浅色"}</small></span></button><button role="radio" aria-checked={themePreference === "light"} className={themePreference === "light" ? "selected" : ""} onClick={() => setThemePreference("light")}><Sun size={17} /><span><strong>浅色</strong><small>始终使用浅色界面</small></span></button><button role="radio" aria-checked={themePreference === "dark"} className={themePreference === "dark" ? "selected" : ""} onClick={() => setThemePreference("dark")}><Moon size={17} /><span><strong>深色</strong><small>始终使用深色界面</small></span></button></div></article></section><section className="surface settings-card remote-settings"><div className="section-title"><div><h3>远端服务器</h3><p>Bearer Token 只保存到操作系统凭据库，前端不会读回明文。</p></div><StatusBadge>{profiles.length} 个配置</StatusBadge></div><div className="profile-tabs">{profiles.map((profile) => <button key={profile.id} className={selectedRemoteId === profile.id ? "selected" : ""} onClick={() => setSelectedRemoteId(profile.id)} disabled={busy}>{profile.displayName}</button>)}<button onClick={() => { setSelectedRemoteId(""); setRemoteName("个人服务器"); setRemoteUrl("http://127.0.0.1:8787"); setRemoteToken(""); setNamespaces([]); setSelectedNamespaceId(""); setMappingState(null); setWorkspaceMappingState(null); }} disabled={busy}><Plus size={15} />新建远端</button></div><div className="remote-form"><div className="field"><label htmlFor="remote-name-new">配置名称</label><input id="remote-name-new" value={remoteName} onChange={(event) => setRemoteName(event.target.value)} /></div><div className="field"><label htmlFor="remote-url-new">服务器 URL</label><input id="remote-url-new" value={remoteUrl} onChange={(event) => setRemoteUrl(event.target.value)} /></div><div className="field"><label htmlFor="remote-token-new">Bearer Token</label><input id="remote-token-new" type="password" value={remoteToken} onChange={(event) => setRemoteToken(event.target.value)} placeholder={selectedProfile?.credentialConfigured ? "已保存；留空则不修改" : "至少 16 位可见 ASCII 字符"} /></div></div><div className="button-row"><button className="button primary" onClick={() => void saveRemote()} disabled={busy || !remoteName.trim() || !remoteUrl.trim() || (!selectedRemoteId && !remoteToken.trim())}>保存并验证</button><button className="button secondary" onClick={() => void testConnection()} disabled={busy || !selectedRemoteId}>测试连接</button></div>{(selectedProfile?.insecureHttp || remoteUrl.trim().startsWith("http://")) && <div className="inline-alert warning"><AlertTriangle size={17} /><span>当前连接未使用 HTTPS，仅建议在本机或可信内网使用。</span></div>}{connectionMessage && <div className="inline-alert success"><Check size={17} /><span>{connectionMessage}</span></div>}</section><section className="surface settings-card"><div className="section-title"><div><h3>组织会话</h3><p>创建命名空间来分隔不同电脑或用途的会话集合。</p></div><Settings size={20} /></div>{namespacesPanel}</section>{advancedTools}</div>} />
       <Route path="/me" element={<div className="page-stack my-page"><PageIntro title="我的" description="项目主页、个人资料模板和应用更新。" /><section className="surface my-tabs" role="tablist" aria-label="我的"><button type="button" role="tab" aria-selected={myTab === "home"} className={myTab === "home" ? "active" : ""} onClick={() => setMyTab("home")}><UserRound size={16} />主页</button><button type="button" role="tab" aria-selected={myTab === "updates"} className={myTab === "updates" ? "active" : ""} onClick={() => setMyTab("updates")}><Download size={16} />更新{availableUpdate && <b>1</b>}</button></section>{myTab === "home" ? <section className="my-home-grid"><article className="surface personal-card"><div className="section-title"><div><span className="overline">个人资料模板</span><h3>关于作者</h3><p>请按需要直接修改本页中的占位内容。</p></div><UserRound size={21} /></div><dl className="profile-template"><div><dt>昵称</dt><dd>待填写</dd></div><div><dt>邮箱</dt><dd>待填写@example.com</dd></div><div><dt>个人简介</dt><dd>在这里介绍你自己、项目目标或联系方式。</dd></div><div><dt>其他链接</dt><dd>待填写</dd></div></dl></article><article className="surface project-card"><div className="section-title"><div><span className="overline">开源项目</span><h3>Codex Session Sync</h3><p>跨设备同步 Codex 会话的个人自托管工具。</p></div><Server size={21} /></div><div className="project-address"><span>GitHub 地址</span><CopyCode value={PROJECT_URL} /></div><p className="muted-copy">Release、更新说明和安装包均通过该 GitHub 仓库发布。</p></article></section> : <section className="surface update-card"><div className="section-title"><div><span className="overline">应用更新</span><h3>GitHub Releases</h3><p>更新包会先完成签名验证，验证通过才会安装。</p></div><button type="button" className="button secondary small" onClick={() => void checkForUpdate(true)} disabled={updateChecking || updateInstalling}><RefreshCw size={14} />{updateChecking ? "检查中…" : "手动检查"}</button></div>{updateMessage && !availableUpdate && <div className="inline-alert"><Check size={17} /><span>{updateMessage}</span></div>}<UpdateDetails update={availableUpdate} currentVersion={desktopPackage.version} progress={availableUpdate ? updateMessage : null} onInstall={() => void installUpdate()} installing={updateInstalling} /><div className="project-address update-source"><span>更新源</span><CopyCode value={`${PROJECT_URL}/releases/latest`} /></div></section>}</div>} />
       <Route path="*" element={<Navigate to="/overview" replace />} />
     </Routes>
 
     {pendingWorkspaceSync && <div className="dialog-backdrop" role="presentation"><section className="workspace-path-modal" role="dialog" aria-modal="true" aria-label="设置本机项目路径"><div className="workspace-modal-heading"><div><span className="overline">同步前路径检查</span><h2>设置本机项目路径</h2></div><button type="button" className="icon-button" onClick={() => setPendingWorkspaceSync(null)} disabled={busy} aria-label="关闭"><X size={19} /></button></div><p>远端会话引用了当前电脑尚不可用的项目路径。选择统一父目录后仍可逐项修改。</p><div className="migration-summary"><strong>{pendingWorkspaceSync.plan.unmappedPaths.length} 项待设置</strong><span>{pendingWorkspaceSync.plan.mappedPathCount} 项已有映射 · {pendingWorkspaceSync.plan.existingPathCount} 项原路径可用</span></div><WorkspacePathEditor parentDirectory={workspaceEditorParent} drafts={workspaceDrafts} busy={busy} submitLabel="保存路径并继续" onParentChange={(value) => changeEditorParent("sync", value)} onTargetChange={(index, value) => setWorkspaceDrafts((current) => current.map((draft, candidate) => candidate === index ? { ...draft, localPath: value } : draft))} onChooseParent={() => void chooseEditorParent("sync")} onChooseTarget={(index) => void chooseEditorTarget("sync", index)} onSubmit={() => void saveWorkspaceDraftsAndContinue()} onCancel={() => setPendingWorkspaceSync(null)} /></section></div>}
+    {snapshotModeOpen && <div className="dialog-backdrop" role="presentation"><section className="confirm-dialog snapshot-mode-dialog" role="dialog" aria-modal="true"><div className="dialog-copy"><span className="overline">创建本地快照</span><h2>选择快照范围</h2><p>快照只保存到本机，不会直接推送到远端。</p><div className="snapshot-mode-options"><button className="button primary" onClick={() => { setSnapshotModeOpen(false); void start("start_snapshot_job", { codexHome: codexHome.trim(), repositoryRoot: repositoryRoot.trim(), confirmedCodexClosed: true }); }}>完整快照 <small>保存当前 Home 的全部会话</small></button><button className="button secondary" onClick={openSelectionSnapshot}>选择快照 <small>从当前全部会话中任意勾选</small></button></div></div><div className="dialog-actions"><button className="button secondary" onClick={() => setSnapshotModeOpen(false)}>取消</button></div></section></div>}
+    {selectionSnapshotOpen && <div className="dialog-backdrop" role="presentation"><section className="staging-dialog" role="dialog" aria-modal="true"><header><div><span className="overline">选择快照</span><h2>选择要保存的重要会话</h2><p>该列表来自当前 Home 的全部扫描结果，与同步暂存区无关。</p></div><button className="icon-button" onClick={() => setSelectionSnapshotOpen(false)}><X size={18} /></button></header><div className="staging-toolbar"><span>已选择 {selectionSnapshotIds.size} / {report?.threads.length ?? 0}</span><div><button className="button secondary small" onClick={() => setSelectionSnapshotIds(new Set(report?.threads.map((thread) => thread.threadId) ?? []))}>全选</button><button className="button secondary small" onClick={() => setSelectionSnapshotIds(new Set())}>清空</button></div></div><div className="thread-list">{report?.threads.map((thread) => <label className="thread-row staging-thread" key={thread.threadId}><input type="checkbox" checked={selectionSnapshotIds.has(thread.threadId)} onChange={(event) => setSelectionSnapshotIds((current) => { const next = new Set(current); if (event.target.checked) next.add(thread.threadId); else next.delete(thread.threadId); return next; })} /><div><strong>{thread.title || "未命名会话"}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span><small>{thread.archived ? "归档" : "活动"} · {thread.modelProvider ?? "unknown"}</small></div></label>) ?? <p className="muted-copy">尚未扫描本机会话。请先前往“会话”页重新扫描。</p>}</div><footer><button className="button secondary" onClick={() => setSelectionSnapshotOpen(false)}>取消</button><button className="button primary" disabled={busy || selectionSnapshotIds.size === 0} onClick={() => { setSelectionSnapshotOpen(false); void start("start_selection_snapshot_job", { request: { repositoryRoot: repositoryRoot.trim(), codexHome: codexHome.trim(), selectedThreadIds: [...selectionSnapshotIds], confirmedCodexClosed: true } }); }}>创建选择快照</button></footer></section></div>}
+    {snapshotPreview && <div className="dialog-backdrop" role="presentation"><section className="staging-dialog" role="dialog" aria-modal="true"><header><div><span className="overline">只读快照预览</span><h2>{snapshotPreview.threads.length} 个会话</h2><p>{snapshotPreviewIsRemote ? "远端 Revision 已校验下载到本机临时对象缓存；不会改动远端、Tracking 或 Codex Home。点击会话可查看消息。" : "预览不会写入 Codex Home、Tracking 或远端。点击会话可查看消息。"}</p></div><button className="icon-button" onClick={() => { setSnapshotPreview(null); setSnapshotPreviewMessages(null); }}><X size={18} /></button></header>{snapshotPreviewLoading ? <div className="thread-detail-loading"><RefreshCw size={18} />正在读取快照…</div> : <div className="thread-list">{snapshotPreview.threads.map((thread) => <button type="button" className="thread-row" key={thread.threadId} onClick={() => void openSnapshotPreviewThread(thread)}><div><strong>{thread.title || "未命名会话"}</strong><span>{thread.workspace.sourcePath ?? "未记录工作目录"}</span><small>{thread.archived ? "归档" : "活动"}</small></div></button>)}</div>}{snapshotPreviewMessages && <div className="message-list">{snapshotPreviewMessages.messages.map((message) => <article className={`message-card role-${message.role}`} key={message.index}><strong>{message.role === "user" ? "用户" : "助手"}</strong><pre>{message.text}</pre></article>)}</div>}<footer><button className="button secondary" onClick={() => { setSnapshotPreview(null); setSnapshotPreviewMessages(null); }}>关闭</button></footer></section></div>}
     {selectedThread && <div className="dialog-backdrop" role="presentation"><section className="thread-detail-modal" role="dialog" aria-modal="true" aria-label="完整会话"><header><div><span className="overline">会话详情</span><h2>{selectedThread.title || "未命名会话"}</h2><small>{selectedThread.workspace.sourcePath ?? selectedThread.threadId}</small></div><button type="button" className="icon-button" onClick={() => { setSelectedThread(null); setThreadMessages(null); }} aria-label="关闭"><X size={19} /></button></header>{threadMessagesLoading ? <div className="thread-detail-loading"><RefreshCw size={19} /><span>正在读取会话…</span></div> : threadMessages ? <><div className="message-list">{threadMessages.messages.map((message) => <article className={"message-card role-" + message.role} key={message.index}><div><strong>{message.role === "user" ? "用户" : message.role === "assistant" ? "助手" : message.role}</strong><small>{message.timestamp ? new Date(message.timestamp).toLocaleString("zh-CN") : "#" + (message.index + 1)}</small></div><pre>{message.text}</pre></article>)}{threadMessages.messages.length === 0 && <p className="muted-copy">这一页没有可显示的消息。</p>}</div>{threadMessages.warnings.length > 0 && <div className="inline-alert warning"><AlertTriangle size={17} /><span>有 {threadMessages.warnings.length} 行无法解析，其他消息仍已显示。</span></div>}<FolderPager page={threadMessages.page} pageCount={Math.max(1, Math.ceil(threadMessages.totalCount / threadMessages.pageSize))} total={threadMessages.totalCount} onChange={(page) => void openThread(selectedThread, page)} /></> : null}</section></div>}
     <StagingDialog
       plan={stagingPlan}

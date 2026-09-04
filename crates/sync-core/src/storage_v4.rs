@@ -2081,6 +2081,22 @@ pub fn write_v4_snapshot(
     repository_root: &Path,
 ) -> Result<PathBuf> {
     let store = FilesystemContentStoreV4::open(repository_root.to_path_buf())?;
+    let root = build_v4_snapshot_root(snapshot, contents, &store)?;
+    let path = repository_root
+        .join("snapshots")
+        .join(format!("{}.json", snapshot.snapshot_id));
+    write_v4_root(&path, &root)?;
+    Ok(path)
+}
+
+/// Materializes the immutable object graph for a local snapshot without
+/// registering a manifest in `snapshots/`.  Portable treasure export uses
+/// this to keep its short-lived composition root out of local history.
+pub fn build_v4_snapshot_root(
+    snapshot: &LocalSnapshot,
+    contents: &BTreeMap<String, ContentRefV4>,
+    store: &FilesystemContentStoreV4,
+) -> Result<SnapshotRootV4> {
     let mut references = Vec::with_capacity(snapshot.threads.len());
     let mut overlays = BTreeMap::new();
     for thread in &snapshot.threads {
@@ -2117,11 +2133,7 @@ pub fn write_v4_snapshot(
         warning_count: snapshot.warning_count,
     };
     root.validate()?;
-    let path = repository_root
-        .join("snapshots")
-        .join(format!("{}.json", snapshot.snapshot_id));
-    write_v4_root(&path, &root)?;
-    Ok(path)
+    Ok(root)
 }
 
 pub fn load_v4_snapshot(

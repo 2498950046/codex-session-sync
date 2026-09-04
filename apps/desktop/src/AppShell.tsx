@@ -4,6 +4,7 @@ import {
   Activity,
   ChevronRight,
   CloudCog,
+  Gem,
   Home,
   Menu,
   MessagesSquare,
@@ -19,6 +20,7 @@ const navigation = [
   { to: "/overview", label: "概览", icon: Home },
   { to: "/sync", label: "同步", icon: RefreshCw },
   { to: "/sessions", label: "会话", icon: MessagesSquare },
+  { to: "/vault", label: "宝库", icon: Gem },
   { to: "/settings", label: "设置", icon: Settings },
   { to: "/me", label: "我的", icon: UserRound },
 ] as const;
@@ -27,6 +29,7 @@ const titles: Record<string, { title: string; description: string }> = {
   "/overview": { title: "概览", description: "查看同步环境、配置状态和最近结果" },
   "/sync": { title: "同步", description: "安全推送、拉取或切换 Codex 会话" },
   "/sessions": { title: "会话", description: "扫描本机会话并检查兼容性" },
+  "/vault": { title: "宝库", description: "组合本地快照并导出可携带宝藏" },
   "/settings": { title: "设置", description: "配置本机路径、远端服务器、命名空间和高级工具" },
   "/me": { title: "我的", description: "查看软件信息、项目主页和应用更新" },
 };

@@ -58,6 +58,42 @@ export type ImportReport = {
   journalPath: string;
 };
 
+export type SnapshotPreview = {
+  snapshotId: string;
+  threads: ThreadBundle[];
+};
+
+export type TreasureCandidate = {
+  sourceSnapshotId: string;
+  semanticHash: string;
+  title: string;
+  updatedAtMs: number | null;
+};
+
+export type TreasureConflict = { threadId: string; candidates: TreasureCandidate[] };
+
+export type TreasurePreview = {
+  sourceSnapshotIds: string[];
+  threadCount: number;
+  conflictCount: number;
+  conflicts: TreasureConflict[];
+  fingerprint: string;
+};
+
+export type TreasureListItem = {
+  treasureId: string;
+  displayName: string;
+  createdAt: string;
+  path: string;
+  threadCount: number;
+  logicalBytes: number;
+  objectCount: number;
+  fileBytes: number;
+};
+
+export type TreasureExportResult = { treasure: TreasureListItem; preview: TreasurePreview };
+export type TreasureImportResult = { snapshot: SnapshotSummary; treasure: TreasureListItem };
+
 export type ThreadMessage = {
   index: number;
   role: string;
@@ -121,7 +157,7 @@ export type JobState = "running" | "cancelling" | "completed" | "cancelled" | "f
 
 export type JobSnapshot = {
   jobId: string;
-  kind: "scan" | "snapshot" | "validate" | "import" | "provider_sync_preview" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "staging-plan" | "staged-push" | "staged-snapshot" | "pull" | "resolve" | "switch" | "initial-merge-plan" | "initial-merge-apply" | "remap";
+  kind: "scan" | "snapshot" | "selection-snapshot" | "validate" | "import" | "provider_sync_preview" | "provider_sync" | "recovery" | "restore" | "revision-download" | "revision-restore" | "revision-publish" | "push" | "staging-plan" | "staged-push" | "staged-snapshot" | "pull" | "resolve" | "switch" | "initial-merge-plan" | "initial-merge-apply" | "remap" | "treasure-export" | "treasure-validate" | "treasure-import";
   state: JobState;
   progress: OperationProgress;
   cancellable: boolean;

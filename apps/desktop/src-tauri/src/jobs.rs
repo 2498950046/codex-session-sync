@@ -232,6 +232,24 @@ impl JobManager {
         }))
     }
 
+    pub(crate) fn start_repository_exclusive<R, F>(
+        &self,
+        repository: &Path,
+        kind: impl Into<String>,
+        cancellable: bool,
+        operation: F,
+    ) -> Result<JobSnapshot, String>
+    where
+        R: Serialize + Send + 'static,
+        F: FnOnce(OperationControl) -> anyhow::Result<R> + Send + 'static,
+    {
+        let repository_lease = self.try_acquire_repository_exclusive(repository)?;
+        Ok(self.start(kind, cancellable, move |control| {
+            let _repository_lease = repository_lease;
+            operation(control)
+        }))
+    }
+
     pub fn start<R, F>(
         &self,
         kind: impl Into<String>,
