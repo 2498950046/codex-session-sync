@@ -318,7 +318,10 @@ impl JobManager {
                     }
                     Err(error) => {
                         entry.snapshot.state = JobState::Failed;
-                        entry.snapshot.error = Some(error.to_string());
+                        // Keep the full anyhow chain. The final OS error alone
+                        // (for example Windows' `os error 3`) does not identify
+                        // the file or operation that failed.
+                        entry.snapshot.error = Some(format!("{error:#}"));
                         entry.snapshot.cancellable = false;
                     }
                 },
@@ -328,7 +331,9 @@ impl JobManager {
                     } else {
                         JobState::Failed
                     };
-                    entry.snapshot.error = Some(error.to_string());
+                    // Error context contains the affected path and checkout
+                    // stage, so preserve it for the desktop error dialog.
+                    entry.snapshot.error = Some(format!("{error:#}"));
                     entry.snapshot.cancellable = false;
                 }
             }

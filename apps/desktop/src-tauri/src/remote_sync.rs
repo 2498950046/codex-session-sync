@@ -177,10 +177,13 @@ pub fn restore_remote_revision_locally(
             threads,
             warning_count: 0,
         },
-        &detect_configured_provider(codex_home)?,
-    )?;
+        &detect_configured_provider(codex_home)
+            .context("failed to inspect the local Codex provider before initial merge")?,
+    )
+    .context("failed to prepare merged conversations for this computer")?;
     let snapshot = workspace_mapper.materialize_snapshot(&snapshot);
-    let manifest = store_local_snapshot(&snapshot, repository_root)?;
+    let manifest = store_local_snapshot(&snapshot, repository_root)
+        .context("failed to save the merged local snapshot before checkout")?;
     sync_core::checkout_local_snapshot_with_control(
         manifest,
         codex_home,
@@ -1662,8 +1665,10 @@ pub fn apply_initial_namespace_merge(
             &project_roots,
             retain_recovery_backup,
             control,
-        )?;
-    let tracking = TrackingStore::open(repository_root)?;
+        )
+        .context("failed to apply the merged conversations to the local Codex Home")?;
+    let tracking = TrackingStore::open(repository_root)
+        .context("failed to reopen local synchronization tracking after initial merge")?;
     let applied = tracking
         .load(codex_home, remote_id, namespace_id)?
         .context("initial namespace merge completed without tracking state")?;
@@ -2296,6 +2301,126 @@ mod tests {
                 .title,
             "local title"
         );
+    }
+
+    #[test]
+    fn initial_attachment_applies_a_remote_and_local_thread_union_without_pushing() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let token = "test-token-that-is-long-enough-for-auth";
+        let config = sync_server::ServerConfig {
+            bind: "127.0.0.1:0".to_string(),
+            data_dir: temp.path().join("server"),
+            token: token.to_string(),
+            max_object_bytes: 1024 * 1024,
+            max_manifest_bytes: 1024 * 1024,
+        };
+        let (address, task) = runtime.block_on(async {
+            let state = sync_server::AppState::initialize(&config).await.unwrap();
+            let app: Router = sync_server::build_router(state, &config);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, app).await });
+            (address, task)
+        });
+        let client = RemoteClient::new(
+            &format!("http://{address}"),
+            SecretToken::new(token.to_string()).unwrap(),
+        )
+        .unwrap();
+        let namespace = client.create_namespace("Personal".to_string()).unwrap();
+        let remote_id = Uuid::now_v7();
+        let home_a = temp.path().join("home-a");
+        let home_b = temp.path().join("home-b");
+        let repository_a = temp.path().join("repository-a");
+        let repository_b = temp.path().join("repository-b");
+        let mapper = WorkspacePathMapper::default();
+        initialize_home(&home_a);
+        initialize_home(&home_b);
+        insert_fixture_thread(&home_a, "remote-thread");
+        insert_fixture_thread(&home_b, "local-thread");
+
+        let pushed = push_namespace(
+            remote_id,
+            namespace.id,
+            &client,
+            LocalSyncContext::new(
+                &home_a,
+                &repository_a,
+                &mapper,
+                &OperationControl::default(),
+            ),
+        )
+        .unwrap();
+        let remote_head = pushed.head.clone().unwrap();
+
+        let plan = prepare_initial_namespace_merge(
+            remote_id,
+            namespace.id,
+            &client,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &mapper,
+                &OperationControl::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(plan.remote_head, remote_head);
+        assert_eq!(plan.local_thread_count, 1);
+        assert_eq!(plan.remote_thread_count, 1);
+        assert_eq!(plan.merged_thread_count, 2);
+        assert!(plan.conflicts.is_empty());
+
+        let merged = apply_initial_namespace_merge(
+            remote_id,
+            namespace.id,
+            &plan.remote_head,
+            &plan.fingerprint,
+            &[],
+            true,
+            &client,
+            LocalSyncContext::new(
+                &home_b,
+                &repository_b,
+                &mapper,
+                &OperationControl::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(merged.kind, SyncOutcomeKind::Merged);
+        assert_eq!(merged.head.as_deref(), Some(remote_head.as_str()));
+        assert_eq!(
+            client.namespace_head(namespace.id).unwrap().as_deref(),
+            Some(remote_head.as_str())
+        );
+        assert_eq!(
+            sync_core::scan_codex_home(&home_b)
+                .unwrap()
+                .threads
+                .into_iter()
+                .map(|thread| thread.thread_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["local-thread".to_string(), "remote-thread".to_string()])
+        );
+        let tracking = TrackingStore::open(&repository_b).unwrap();
+        assert_eq!(
+            tracking
+                .load(&home_b, remote_id, namespace.id)
+                .unwrap()
+                .unwrap()
+                .integrated_head
+                .as_deref(),
+            Some(remote_head.as_str())
+        );
+
+        task.abort();
+        runtime.block_on(async {
+            let _ = task.await;
+        });
     }
 
     #[test]

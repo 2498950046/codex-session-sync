@@ -312,9 +312,24 @@ fn checkout_local_snapshot_internal(
     let private_root = target_codex_home.join(".codex-session-sync");
     let staging_root = private_root.join("staging").join(&operation_id);
     let local_backup_dir = private_root.join("backups").join(&operation_id);
-    fs::create_dir_all(&repository_backup_dir)?;
-    fs::create_dir_all(&staging_root)?;
-    fs::create_dir_all(&local_backup_dir)?;
+    fs::create_dir_all(&repository_backup_dir).with_context(|| {
+        format!(
+            "failed to create checkout repository backup directory {}",
+            repository_backup_dir.display()
+        )
+    })?;
+    fs::create_dir_all(&staging_root).with_context(|| {
+        format!(
+            "failed to create checkout staging directory {}",
+            staging_root.display()
+        )
+    })?;
+    fs::create_dir_all(&local_backup_dir).with_context(|| {
+        format!(
+            "failed to create checkout local backup directory {}",
+            local_backup_dir.display()
+        )
+    })?;
 
     let directory_swaps = ["sessions", "archived_sessions"]
         .into_iter()
@@ -326,7 +341,12 @@ fn checkout_local_snapshot_internal(
         })
         .collect::<Vec<_>>();
     for swap in &directory_swaps {
-        fs::create_dir_all(&swap.staged)?;
+        fs::create_dir_all(&swap.staged).with_context(|| {
+            format!(
+                "failed to create staged session directory {}",
+                swap.staged.display()
+            )
+        })?;
     }
     let file_swaps = prepare_project_state_swap(
         &target_codex_home,
@@ -356,17 +376,28 @@ fn checkout_local_snapshot_internal(
         retain_recovery_backup,
         error: None,
     };
-    write_checkout_journal(&journal_path, &journal)?;
+    write_checkout_journal(&journal_path, &journal).with_context(|| {
+        format!(
+            "failed to write checkout journal {}",
+            journal_path.display()
+        )
+    })?;
 
     let result = (|| -> Result<()> {
-        stage_rollouts(&snapshot, &repository_root, &staging_root, control)?;
+        stage_rollouts(&snapshot, &repository_root, &staging_root, control)
+            .context("failed to stage merged conversations for local checkout")?;
         control.check_cancelled()?;
         control.report(OperationProgress::indeterminate(
             "checkout_backup",
             "Creating recoverable database backups",
         ));
         let database_dir = repository_backup_dir.join("databases");
-        fs::create_dir_all(&database_dir)?;
+        fs::create_dir_all(&database_dir).with_context(|| {
+            format!(
+                "failed to create checkout database backup directory {}",
+                database_dir.display()
+            )
+        })?;
         let mut databases_to_backup = current.database_paths.clone();
         for database in &catalog_databases {
             if !databases_to_backup.contains(database) {
@@ -375,7 +406,13 @@ fn checkout_local_snapshot_internal(
         }
         for (index, database) in databases_to_backup.iter().enumerate() {
             let backup = database_dir.join(format!("{index}.sqlite"));
-            backup_database(database, &backup)?;
+            backup_database(database, &backup).with_context(|| {
+                format!(
+                    "failed to back up target database {} to {}",
+                    database.display(),
+                    backup.display()
+                )
+            })?;
             journal.database_backups.push(CheckoutDatabaseBackup {
                 target: database.clone(),
                 backup,
@@ -399,14 +436,17 @@ fn checkout_local_snapshot_internal(
         journal.status = CheckoutStatus::Applying;
         journal.updated_at = Utc::now().to_rfc3339();
         write_checkout_journal(&journal_path, &journal)?;
-        apply_directory_swaps(&journal.directory_swaps)?;
-        apply_file_swaps(&journal.file_swaps)?;
+        apply_directory_swaps(&journal.directory_swaps)
+            .context("failed to replace Codex session directories")?;
+        apply_file_swaps(&journal.file_swaps).context("failed to update Codex project state")?;
         replace_databases(
             &current.database_paths,
             &snapshot.threads,
             &target_codex_home,
-        )?;
-        invalidate_local_thread_catalogs(&catalog_databases)?;
+        )
+        .context("failed to update Codex conversation database records")?;
+        invalidate_local_thread_catalogs(&catalog_databases)
+            .context("failed to invalidate Codex local conversation catalog")?;
 
         journal.status = CheckoutStatus::Validating;
         journal.updated_at = Utc::now().to_rfc3339();
@@ -605,7 +645,13 @@ fn stage_rollouts(
             );
         }
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create staged rollout parent directory {} for thread {}",
+                    parent.display(),
+                    thread.thread_id
+                )
+            })?;
         }
         if let Some(storage) = thread.rollout.storage.clone() {
             if repository_root.join("format.json").is_file() {
@@ -664,7 +710,10 @@ fn stage_rollouts(
             copy_verified_object(&source, &target, &thread.rollout.sha256, Some(control))?;
         }
         if !repository_root.join("format.json").is_file()
-            && fs::metadata(&target)?.len() != thread.rollout.byte_length
+            && fs::metadata(&target)
+                .with_context(|| format!("staged rollout is missing: {}", target.display()))?
+                .len()
+                != thread.rollout.byte_length
         {
             bail!("staged rollout has an unexpected byte length");
         }
@@ -1150,7 +1199,12 @@ fn replace_databases(
         transaction.commit()?;
     }
 
-    let mut connection = Connection::open(&primary)?;
+    let mut connection = Connection::open(&primary).with_context(|| {
+        format!(
+            "failed to reopen primary target database {}",
+            primary.display()
+        )
+    })?;
     connection.busy_timeout(std::time::Duration::from_millis(250))?;
     connection.pragma_update(None, "foreign_keys", true)?;
     let columns = thread_table_columns(&connection)?;
